@@ -6,8 +6,12 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
-import { createUsageReader, fetchUsage, parseUsageReport, sanitizeUsageDiagnostic } from "../usage.mjs"
+import { createUsageReader as createReader, fetchCliUsage as fetchUsage, parseUsageReport, sanitizeUsageDiagnostic } from "../usage.mjs"
 import { forgetStoredSignIn } from "../signin.mjs"
+
+// The restricted CLI runner remains the token-renewal path. Keep its process
+// lifecycle/auth regression coverage; HTTP behavior is in quota-http.mjs.
+const createUsageReader = (resolve, options) => createReader(resolve, { ...options, queryUsage: fetchUsage })
 
 const report = groups => ({ status: "SUCCESS", command: { name: "usage", data: { groups } } })
 const group = (buckets, name = "Gemini Models") => ({ name, buckets })

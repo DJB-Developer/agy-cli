@@ -44,15 +44,21 @@ for (const platform of ["linux", "darwin", "win32"]) {
   })
 }
 
-test("Magpie usage returns each account's plan after CLI token renewal; chat stays on ACP", async () => {
+test("Magpie queries per-account HTTP quota/plan after CLI-only token renewal; chat stays on ACP", async () => {
   const calls = []
   let failPlan = false
   await withKit({
     env: { AGY_BRIDGE_STORED_SIGNIN: "" },
     fetch: async (url, init) => {
       calls.push({ url, token: init.headers.Authorization })
+      if (url.endsWith(":retrieveUserQuotaSummary")) {
+        const account = init.headers.Authorization === "Bearer access-a" ? "a" : "b"
+        assert.equal(JSON.parse(init.body).project, `project-${account}`)
+        return Response.json({ groups: [{ displayName: "Gemini Models", buckets: [{ bucketId: "gemini-weekly", remainingFraction: 0.8 }] }] })
+      }
       if (failPlan) return new Response("private upstream error", { status: 403 })
-      return Response.json({ paidTier: { name: init.headers.Authorization === "Bearer access-a" ? "Google AI Pro" : "Google AI Ultra" } })
+      return Response.json({ cloudaicompanionProject: init.headers.Authorization === "Bearer access-a" ? "project-a" : "project-b",
+        paidTier: { name: init.headers.Authorization === "Bearer access-a" ? "Google AI Pro" : "Google AI Ultra" } })
     },
     onSpawn: (_file, args) => {
       if (args.includes("--version")) return { stdout: "1.5.9\n" }
@@ -73,9 +79,11 @@ test("Magpie usage returns each account's plan after CLI token renewal; chat sta
     assert.equal(usageA.plan, "Google AI Pro", usageA.error)
     assert.equal(usageB.plan, "Google AI Ultra", usageB.error)
     assert.equal(duplicateA.plan, usageA.plan)
-    assert.equal(calls.length, 2, "concurrent quota refreshes share one metadata call per account")
+    assert.equal(calls.length, 4, "concurrent quota refreshes share one plan and one quota call per account")
     assert.deepEqual(new Set(calls.map(call => call.token)), new Set(["Bearer access-a", "Bearer access-b"]))
-    assert.ok(calls.every(call => call.url.endsWith(":loadCodeAssist")))
+    assert.ok(calls.every(call => /:loadCodeAssist$|:retrieveUserQuotaSummary$/.test(call.url)))
+    const cliReads = () => kit.otherSpawns.filter(s => s.args.includes("/usage")).length
+    assert.equal(cliReads(), 2, "expired tokens renew through their own CLI profiles")
     failPlan = true
     const failed = await readA()
     assert.equal(failed.plan, undefined, "no stale/other account's plan after failure")
@@ -84,6 +92,7 @@ test("Magpie usage returns each account's plan after CLI token renewal; chat sta
     assert.equal(failed.error, undefined)
     failPlan = false
     assert.equal((await readA()).plan, "Google AI Pro", "metadata failure must not trigger quota/auth backoff")
+    assert.equal(cliReads(), 2, "valid tokens refresh metadata without starting the CLI")
     const before = calls.length
     kit.defaultPrompt = async agent => { await agent.text("CLI reply"); return { stopReason: "end_turn" } }
     const request = await client(kit, authOf(a))
@@ -238,12 +247,23 @@ test("tool-result images steer within each named account's session without cross
 })
 
 test("models and usage are scoped to host-selected auth and conflicting API environment cannot override it", async () => {
-  await withKit({ env: { GEMINI_API_KEY: "global-key", AGY_ADC_AUTH: "1", WSL_INTEROP: "real-wsl" },
+  await withKit({ env: { AGY_BRIDGE_STORED_SIGNIN: "", GEMINI_API_KEY: "global-key", AGY_ADC_AUTH: "1", WSL_INTEROP: "real-wsl" },
+    fetch: async (url, init) => {
+      const a = init.headers.Authorization === "Bearer access-a"
+      if (url.endsWith(":loadCodeAssist")) return Response.json({ cloudaicompanionProject: a ? "project-a" : "project-b" })
+      assert.equal(JSON.parse(init.body).project, a ? "project-a" : "project-b")
+      return Response.json({ groups: [{ displayName: "Gemini Models", buckets: [{ bucketId: "gemini-weekly", remainingFraction: a ? 0.8 : 0.3 }] }] })
+    },
     onSpawn: (_file, args, opts) => {
       if (args.includes("--version")) return { stdout: "1.5.9\n" }
       if (!args.includes("/usage")) return 0
       assert.equal(opts.env.GEMINI_API_KEY, "")
       assert.equal(opts.env.AGY_ADC_AUTH, "")
+      const file = path.join(profileOf(args), "antigravity-cli", "antigravity-oauth-token")
+      const saved = JSON.parse(fs.readFileSync(file, "utf8"))
+      saved.token.access_token = `access-${nameOf(args)}`
+      saved.token.expiry = "2099-01-01T00:00:00Z"
+      fs.writeFileSync(file, JSON.stringify(saved))
       return { stdout: JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups: [{ name: "Gemini Models", buckets: [
         { id: "weekly", remainingFraction: nameOf(args) === "a" ? 0.8 : 0.3 },
       ] }] } } }) }

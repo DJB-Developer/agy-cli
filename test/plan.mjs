@@ -8,9 +8,13 @@ import { readAccessToken } from "../signin.mjs"
 
 test("plans prefer paid names, fall back to current tier, never infer eligible subscriptions", () => {
   assert.equal(planOf({ paidTier: { name: "Google AI Ultra" }, currentTier: { name: "Free" } }), "Google AI Ultra")
-  assert.equal(planOf({ paidTier: { id: "paid" }, currentTier: { name: "Google AI Pro" } }), "Google AI Pro")
-  assert.equal(planOf({ currentTier: { id: "free-tier" } }), "free-tier")
-  for (const data of [null, {}, { allowedTiers: [{ name: "Ultra" }] }, { paidTier: { id: "paid" } },
+  assert.equal(planOf({ paidTier: { id: "g1-ultra-tier" }, currentTier: { name: "Free" } }), "Google AI Ultra")
+  assert.equal(planOf({ paid_tier: { id: "g1-ultra-lite-tier" } }), "Google AI Ultra Lite")
+  assert.equal(planOf({ currentTier: { id: "free-tier" } }), "Free")
+  assert.equal(planOf({ paidTier: { id: "new-tier" } }), "new-tier")
+  assert.equal(planOf({ paidTier: { id: "__proto__" } }), "__proto__")
+  assert.equal(planOf({ paidTier: { id: "constructor" } }), "constructor")
+  for (const data of [null, {}, { allowedTiers: [{ name: "Ultra" }] },
     { currentTier: { name: {}, id: [] } }, { currentTier: { name: "x".repeat(257) } }, { paidTier: { name: "bad\nname" } }]) {
     assert.equal(planOf(data), "")
   }

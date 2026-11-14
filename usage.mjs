@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process"
+import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { agySpawnSpec, childEnv as agyChildEnv } from "./platform.mjs"
-import { cannotSignIn, isDead, noteDead, storedSignIn } from "./signin.mjs"
+import { cannotSignIn, isDead, noteDead, storedSignIn, readAccessToken, readStoredSignIn } from "./signin.mjs"
 import { fetchAccountPlan } from "./plan.mjs"
+import { fetchQuotaSummary } from "./quota-http.mjs"
 
 const DEFAULT_TIMEOUT_MS = 15_000
 const MAX_TIMEOUT_MS = 18_000 // Magpie bounds an auth.usage call to 20 seconds.
@@ -307,7 +309,7 @@ function supportedVersion(output) {
   return major > 1 || major === 1 && (minor > 1 || minor === 1 && patch >= 11)
 }
 
-export async function fetchUsage(agy, {
+export async function fetchCliUsage(agy, {
   env = process.env,
   geminiDir,
   accountName = geminiDir ? path.basename(geminiDir) : "default",
@@ -410,6 +412,100 @@ export async function fetchUsage(agy, {
   }
 }
 
+// Normal quota refreshes use HTTP, without starting any CLI process. If the
+// selected profile's access token expired, let agy's restricted /usage command
+// renew it once. We never exchange refresh tokens or overwrite CLI credentials.
+export async function fetchUsage(agy, {
+  env = process.env, geminiDir, signal, timeoutMs = env.AGY_BRIDGE_USAGE_TIMEOUT_MS,
+  readToken = readAccessToken, renew = fetchCliUsage, fetch: request = fetch,
+  stored, cache = {}, getModels = () => [], diagnostic = line => console.error(line),
+  accountName = geminiDir ? path.basename(geminiDir) : "default", ...options
+} = {}) {
+  const controller = new AbortController()
+  const deadline = Date.now() + timeout(timeoutMs)
+  let stage = "credentials", timer, stop, token = ""
+  let renewed = false
+  const stopped = new Promise((_, reject) => {
+    stop = () => {
+      controller.abort()
+      // HTTP/credential timeouts are not evidence of a revoked login.
+      reject(new UsageError(`Antigravity quota query ${signal?.aborted ? "was cancelled" : "timed out"}.`, { kind: signal?.aborted ? "cancel" : "http-timeout" }))
+    }
+  })
+  signal?.addEventListener("abort", stop, { once: true })
+  timer = setTimeout(stop, Math.max(1, deadline - Date.now()))
+  const credentials = { env, geminiDir }
+  const check = () => { if (controller.signal.aborted) throw new UsageError("Antigravity quota query was cancelled.", { kind: "cancel" }) }
+  const renewToken = async () => {
+    check()
+    const status = stored ?? await readStoredSignIn(credentials)
+    check()
+    if (status?.state !== "present" || !status.canRenew) {
+      throw new UsageError("No usable access token for this account. Sign in with agy and refresh quota again.", { kind: cannotSignIn(status) ? "auth" : "" })
+    }
+    renewed = true
+    stage = "cli-renewal"
+    let failure
+    try {
+      await renew(agy, { ...options, ...credentials, signal: controller.signal,
+        timeoutMs: Math.max(1, deadline - Date.now()), readPlan: async () => "", diagnostic: () => {},
+      })
+    } catch (error) { failure = error }
+    check()
+    token = await readToken(credentials)
+    check()
+    // CLI may have renewed successfully before its own quota/eligibility call
+    // failed. In that case the HTTP path can still report Google's actual reply.
+    if (!token) throw failure || new UsageError("agy did not save a usable access token. Sign in again and refresh quota.")
+  }
+  const query = async () => {
+    if (signal?.aborted) { stop(); return }
+    token = await readToken(credentials)
+    check()
+    if (!token) await renewToken()
+    for (;;) {
+      check()
+      stage = "http"
+      const key = createHash("sha256").update(token).digest("hex")
+      try {
+        const result = await fetchQuotaSummary(token, {
+          fetch: request, signal: controller.signal, project: cache.key === key ? cache.project : "",
+          requestTimeoutMs: Math.min(4000, Math.max(1, deadline - Date.now())),
+        })
+        check()
+        const usage = parseUsageReport({ status: "SUCCESS", command: { name: "usage", data: { groups: result.groups } } }, { models: getModels(agy) })
+        cache.key = key
+        cache.project = result.project
+        if (result.plan) usage.plan = result.plan
+        return usage
+      } catch (error) {
+        // One CLI renewal on an explicitly rejected access token; no loops and
+        // no renewal on 403 (eligibility), 429, timeout, or transport failures.
+        if (error?.status === 401 && !renewed) { await renewToken(); continue }
+        throw error
+      }
+    }
+  }
+  try { return await Promise.race([query(), stopped]) }
+  catch (error) {
+    const wrapped = error instanceof UsageError ? error : new UsageError(error?.message?.startsWith("Antigravity ") || error?.message?.startsWith("Limits not available:") ? error.message : "Antigravity quota query failed. Check network or proxy settings.")
+    const output = error?.output || error?.detail || ""
+    // Also remove the exact access token if an upstream error echoes it without
+    // a recognizable OAuth prefix. Never include request headers in diagnostics.
+    wrapped.detail = sanitizeUsageDiagnostic(token ? String(output).split(token).join("[REDACTED token]") : output)
+    wrapped.source = stage === "cli-renewal" ? "CLI" : "HTTP"
+    if (wrapped.kind !== "cancel") try {
+      diagnostic("[agy-usage] " + JSON.stringify({ event: "usage_failed", account: sanitizeUsageDiagnostic(accountName),
+        stage: error?.stage || stage, error: wrapped.message, detail: wrapped.detail }))
+    } catch {}
+    throw wrapped
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener("abort", stop)
+    controller.abort()
+  }
+}
+
 // A read that failed isn't run again for this long, doubled for each
 // failure in a row, up to BACKOFF_MOST: agy is a process of its own, and one
 // that fails every few minutes all day helps nobody.
@@ -433,48 +529,50 @@ const NEEDS_SIGN_IN = "Sign in again from this account's Sign in in magpie, or r
 //   that stored sign-in dead: agy isn't run again until another is stored.
 // - any other failure isn't run again for backoff(n).
 export function createUsageReader(resolveAgy, options = {}) {
-  const { signIn = () => storedSignIn(), now = () => Date.now(), ...fetchOptions } = options
+  const { signIn = () => storedSignIn({ fresh: true }), now = () => Date.now(), queryUsage = fetchUsage, ...fetchOptions } = options
   const pending = new Map()
+  const cache = {}
   let held = null
   let failedAuth = null
   let saidExpired = false
-  const withDetail = (message, detail) => detail ? `${message}\nCLI error (redacted):\n${detail}` : message
-  const expired = (why, detail) => {
+  const withDetail = (message, detail, source = "CLI") => detail ? `${message}\n${source} error (redacted):\n${detail}` : message
+  const expired = (why, detail, source) => {
     saidExpired = true
-    return { windows: [], error: withDetail(`${why}. ${NEEDS_SIGN_IN}`, detail), signIn: "expired" }
+    return { windows: [], error: withDetail(`${why}. ${NEEDS_SIGN_IN}`, detail, source), signIn: "expired" }
   }
   return async () => {
     let stored
     try { stored = await signIn() } catch { stored = { state: "unknown" } }
     const why = cannotSignIn(stored)
     if (why) return expired(why)
-    if (isDead(stored)) return expired("agy's sign-in no longer works", failedAuth?.fp === stored.fp ? failedAuth.detail : "")
+    if (isDead(stored)) return expired("agy's sign-in no longer works", failedAuth?.fp === stored.fp ? failedAuth.detail : "", failedAuth?.source)
     const key = stored?.state === "present" ? stored.fp : "unknown"
     if (held && held.key === key && now() < held.until) {
       return { windows: [], error: held.error, signIn: held.auth ? "expired" : "kept" }
     }
     try {
       const agy = resolveAgy()
-      if (!pending.has(agy)) {
-        const query = fetchUsage(agy, fetchOptions).finally(() => {
-          if (pending.get(agy) === query) pending.delete(agy)
+      const pendingKey = JSON.stringify([agy, key])
+      if (!pending.has(pendingKey)) {
+        const query = queryUsage(agy, { ...fetchOptions, stored, cache }).finally(() => {
+          if (pending.get(pendingKey) === query) pending.delete(pendingKey)
         })
-        pending.set(agy, query)
+        pending.set(pendingKey, query)
       }
-      const result = { ...structuredClone(await pending.get(agy)), signIn: saidExpired ? "renewed" : "kept" }
+      const result = { ...structuredClone(await pending.get(pendingKey)), signIn: saidExpired ? "renewed" : "kept" }
       held = null
       failedAuth = null
       saidExpired = false
       return result
     } catch (error) {
-      const message = error instanceof UsageError ? withDetail(error.message, error.detail) : "agy usage query failed. Check the CLI and temporary-directory permissions."
+      const message = error instanceof UsageError ? withDetail(error.message, error.detail, error.source) : "agy usage query failed. Check network and credential permissions."
       if (error?.kind === "cancel") return { windows: [], error: message, signIn: "kept" }
       const auth = error?.kind === "auth" || error?.kind === "timeout" && stored?.state === "present" && stored.expired &&
         (!String(error.output ?? "").trim() || SIGN_IN_TALK.test(error.output))
       if (auth && stored?.state === "present") {
         noteDead(stored)
-        failedAuth = { fp: stored.fp, detail: error.detail }
-        return expired("agy's sign-in no longer works", error.detail)
+        failedAuth = { fp: stored.fp, detail: error.detail, source: error.source }
+        return expired("agy's sign-in no longer works", error.detail, error.source)
       }
       const n = held?.key === key ? held.n + 1 : 1
       held = { key, n, until: now() + backoff(n), error: message, auth }

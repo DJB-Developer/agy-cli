@@ -572,6 +572,7 @@ export async function createBridgeKit(options = {}) {
     let module
     if (key === "./usage.mjs") module = sourceModule(USAGE_FILE, "", usageUrl)
     else if (key === "./plan.mjs") module = sourceModule(path.join(REPO_DIR, "plan.mjs"), "", new URL("./plan.mjs", indexUrl).href)
+    else if (key === "./quota-http.mjs") module = sourceModule(path.join(REPO_DIR, "quota-http.mjs"), "", new URL("./quota-http.mjs", indexUrl).href)
     else if (key === "./platform.mjs") module = sourceModule(PLATFORM_FILE, "", platformUrl)
     else if (key === "./array-items.mjs") module = sourceModule(ARRAY_ITEMS_FILE, "", arrayItemsUrl)
     else if (key === "./cloak.mjs") module = sourceModule(CLOAK_FILE, "", cloakUrl)

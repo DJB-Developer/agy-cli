@@ -2,11 +2,16 @@ import { readAccessToken } from "./signin.mjs"
 
 const PLAN_URL = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 
-// Same preference as Antigravity: paid tier's name, current tier's name or ID.
+// Prefer the paid tier (including ID-only responses), as CLIProxyAPI does.
 // Don't infer a subscription from quota sizes or from eligible/allowed tiers.
 export function planOf(load) {
   const named = value => typeof value === "string" && value.trim() && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value) ? value.trim() : ""
-  return named(load?.paidTier?.name) || named(load?.currentTier?.name) || named(load?.currentTier?.id)
+  const paid = load?.paidTier ?? load?.paid_tier
+  const current = load?.currentTier ?? load?.current_tier
+  const tier = named(paid?.id) || named(paid?.name) ? paid : current
+  const id = named(tier?.id)
+  const labels = { "free-tier": "Free", "g1-pro-tier": "Google AI Pro", "g1-ultra-tier": "Google AI Ultra", "g1-ultra-lite-tier": "Google AI Ultra Lite" }
+  return named(tier?.name) || (Object.hasOwn(labels, id) ? labels[id] : id)
 }
 
 // Optional enrichment after CLI /usage has had a chance to renew its token.

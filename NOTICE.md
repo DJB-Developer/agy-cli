@@ -112,3 +112,11 @@ A1–A16、U1–U6 逐项并入。两边都有、且 `acb8d84` 写法更新的�
 的 MIT 实现；Magpie 的按账号 `getAuth` / `context.auth` 接入方式也参考了
 [antigravity 插件](https://github.com/magpie-community/plugins/tree/main/packages/antigravity)。
 本仓采用每个账号独立运行时隔离进程、工具调用、模型缓存和会话状态，保留原默认账号。
+
+## 9. HTTP 套餐与额度查询（0.2.8）
+
+元数据接口、端点回退顺序与分组配额格式参考
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/tree/905e70c48b47b7a1cb4a27dd3abc901e2cdd1e4a)
+及其 [Management Center](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/tree/3d893ec88938c3ceef200a15be6af8cf972564b3)。
+本仓独立实现 HTTP 查询、超时和错误脱敏，继续复用自身模型组路由；未引入其聊天执行器或 OAuth 续期实现。
+CLI `/usage` 运行器仅在需要获取新的 access token 时使用；原 U1–U6 的跨平台进程处理仍用于这一流程。

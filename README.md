@@ -36,7 +36,7 @@ OpenCode、Claude Code 等客户端经由 Magpie 调用 agy 向本插件开放�
   才在字节预算内重放历史。
 - **工具调用**：Antigravity ACP 把工具调用作为回复的 `tool_calls` 结束这一轮。本插件把
   客户端的结果送回同一轮 agy 对话（见下文「工具桥接」）。
-- **额度**：本插件读 agy 自己的 `/usage` 报告；Antigravity ACP 读每次回复带的配额。
+- **额度**：本插件通过 HTTP 查询 Google 的模型组配额；Antigravity ACP 读每次回复带的配额。
 
 ## 工具桥接
 
@@ -94,8 +94,8 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
 
 - Antigravity CLI（`agy`），带 `acp` 子命令。在 Magpie 里登录需要 1.5.0 起的 agy（`agy acp --login`）；更早的版本请先在终端运行一次 `agy` 登录。
   文本与工具调用已在 1.4.12 和 1.5.0 上验证；图片输入需要 1.5.0。
-- 支持 OpenCode 风格 provider 插件的 Magpie。额度查询已在 Magpie 0.1.1599 上验证。
-- agy 版本低于 1.4.12 时，会话会被拒绝（见「工具桥接」）；低于 1.1.11 时，额度查询也会被
+- 支持 OpenCode 风格 provider 插件的 Magpie。
+- agy 版本低于 1.4.12 时，会话会被拒绝（见「工具桥接」）；低于 1.1.11 时，额度查询所需的 CLI 续期也会被
   拒绝，以免旧版本把 `/usage` 当成模型提示词。
 - **自动更新**：插件启动的 agy 进程默认带 `AGY_CLI_DISABLE_AUTO_UPDATE=true`，免得进程池里的
   多个进程同时更新同一个可执行文件。你自己在终端里运行的 agy 不受影响，照常更新。你自己设置了
@@ -110,7 +110,10 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.7。现有账号保留，可继续添加其他账号。
+已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.8。现有账号保留，可继续添加其他账号。
+
+0.2.8 参考 CLIProxyAPI，通过 HTTP 查询套餐和模型组额度，缺失配额时尝试其他端点补全。
+token 过期仍由 agy CLI 续期，聊天继续走 ACP；不需要重新导入已有账号。
 
 0.2.7 同步社区 0.1.49 的会话续接修复：保存会话按实际发送给 CLI 的提示词校验。
 提示词改写规则变更后，受影响的旧保存会话会从客户端历史重建，避免继续恢复旧提示词而反复报 429；
@@ -174,7 +177,7 @@ magpie plugin add @magpie-community/opencode-agy-cli-auth
 无需安装 D-Bus 或 GNOME Keyring，也不要把 token 写进 Compose。
 
 已在无网络、非 root Linux 容器中用真实 agy 1.5.9 验证：两个独立目录的
-`models`、ACP 和 `/usage` 均读取自己的凭据，没有使用默认账号。
+`models`、ACP 和额度查询均读取自己的凭据，没有使用默认账号。
 此测试使用虚构 token 验证存储隔离，没有调用真实账号的模型。
 
 ## 并发
@@ -198,20 +201,23 @@ magpie quota agy-cli --json
 magpie quota refresh agy-cli --json
 ```
 
-额度数据来自所选账号的 agy `/usage` 报告，按模型组列出订阅窗口。
-命名账号使用各自独立的凭据目录查询。没有可测量数据的窗口会显示
-"Limits not available"，而不是 0% 或 100%。
+从 0.2.8 起，参考 CLIProxyAPI 及其管理界面，使用所选账号的有效 access token 直接查询：
 
-从 0.2.5 起，每次成功刷新额度后，还会查询当前账号的套餐，并通过 Magpie 的 `plan`
-字段在账号界面显示。查询方式参考社区 Antigravity 插件：读取 Google `loadCodeAssist`
-返回的付费套餐名称，缺失时使用当前 tier 的名称或 ID；不根据额度大小猜测套餐。
-只复用该账号 CLI 已保存的 access token，不额外刷新或改写凭据，不执行账号开通。
-命名账号、默认账号的原生钥匙串和无桌面 Linux 凭据文件均支持。
+- `loadCodeAssist`：获取该账号的项目和套餐。优先使用付费 tier；没有付费 tier 时使用当前 tier。
+  优先显示接口返回的名称，只有 ID 时识别 Free、Pro、Ultra、Ultra Lite，未知 ID 原样显示。
+- `retrieveUserQuotaSummary`：获取模型组、5 小时/每周窗口、剩余比例和重置时间。
+  按 daily、sandbox、production 顺序尝试；部分响应缺少 Gemini 时继续查询并合并真实配额桶。
 
-套餐查询是额外的元数据请求，读取凭据和网络请求合计最多等待 1.5 秒；不可读、过期、
-接口失败或未提供套餐时省略套餐，保留正常的额度与登录状态。下一次成功刷新额度会重新查询，
-不会借用其他账号的套餐。升级并重新加载插件后，刷新各账号额度即可显示 Google 返回的名称。
-**聊天仍然通过 `agy acp`，额度仍然来自 CLI `/usage`，不会改成 Antigravity 的直接聊天 API。**
+有效 token 时不启动 CLI。token 过期或 HTTP 明确返回 401 时，最多运行一次所选账号的
+受限 `agy /usage` 命令，让 CLI 自己续期，再读取其保存的 access token 重试 HTTP。
+插件不自行交换 refresh token、不改写凭据，也不开通账号。缺失或不可读的凭据不会触发后台登录。
+命名账号、默认账号的原生钥匙串和无桌面 Linux 凭据文件均支持，账号之间不回退借用凭据。
+
+每次刷新重新查询套餐和额度；只有项目标识可在当前 token 下复用。套餐接口失败但已有该账号项目时，
+仍尝试查询额度，省略旧套餐；若首次查询无法获得项目，则明确报错，不编造额度。
+HTTP 单次请求最多 4 秒，凭据读取、CLI 续期和 HTTP 的总预算默认 15 秒、最高 18 秒。
+无可测量数据的窗口显示 "Limits not available"，不会假装为 0% 或 100%。
+**聊天继续通过 `agy acp`，HTTP 只用于套餐和额度元数据。**
 
 从 0.2.4 起，已测量的额度通过 `models` 精确绑定到当前账号模型目录里的模型 ID，
 包括基础名称和 high、low、tiered 等实际列出的变体。Gemini、Claude/GPT 分别计算；
@@ -222,7 +228,7 @@ magpie quota refresh agy-cli --json
 模型映射使用账号已有目录，不额外发起模型调用；新增模型在目录更新后刷新额度即可纳入。
 
 与社区 [Antigravity 插件](https://github.com/magpie-community/plugins/tree/main/packages/antigravity)
-不同，本插件仍通过 CLI 查询组额度，没有额外调用 `fetchAvailableModels` 获取逐模型额度。
+不同，本插件查询 HTTP 配额摘要，没有额外调用 `fetchAvailableModels` 获取逐模型额度。
 因此不能判断报告未列出的独立额度池；无法确认归属的模型不会被绑定到通用 Gemini 组。
 
 升级后重新加载插件，并在提供商页面刷新各账号额度，让 Magpie 替换旧的“仅展示”读数。
@@ -233,8 +239,8 @@ magpie quota refresh agy-cli --json
 登录已过期且无法续期、或 agy 已在这份登录上失败过时，不运行 agy，账号显示登录已过期，直到重新登录。
 其他失败的额度查询等 10 分钟再试，每次翻倍，最长 6 小时。
 
-从 0.2.1 起，每次实际 CLI 额度查询失败，会向日志输出一条 `[agy-usage]` JSON：
-包含账号名称、查询阶段、CLI 版本、退出码，以及脱敏后的原始错误 `detail`。
+每次实际额度查询失败，会向日志输出一条 `[agy-usage]` JSON：
+包含账号名称、查询阶段和脱敏后的原始错误 `detail`。HTTP 失败保留状态码及厂商错误原因。
 会过滤认证头、token、登录 URL 中的敏感内容和邮箱，并限制错误详情长度。
 并发共享查询只记录一次，失败退避期间不会重复记录；成功查询和主动取消不输出错误日志。
 
@@ -244,10 +250,10 @@ magpie quota refresh agy-cli --json
 docker logs --since 10m magpie 2>&1 | grep -F '[agy-usage]'
 ```
 
-从 0.2.2 起，Magpie 界面的额度错误提示也会在 `CLI error (redacted):` 后显示脱敏后的 CLI 原始输出，
+Magpie 界面的额度错误提示会在 `HTTP error (redacted):` 或 `CLI error (redacted):` 后显示脱敏的原始错误，
 最多保留 4096 个字符，超长内容标记为截断。更新并重新加载插件后，刷新报错账号的额度即可查看，
 无需进入容器日志。失败退避期间仍保留错误详情；更换凭据或成功查询后不再显示旧详情。
-只有 CLI 明确报告账号不符合条件或地区不支持时，才显示账号资格相关的结论。
+403、429 和网络超时不会自动把登录标记为失效；界面保留厂商返回的具体原因。
 
 
 ## 环境变量

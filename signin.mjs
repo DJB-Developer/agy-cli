@@ -311,12 +311,15 @@ export function parseStored(raw, now = Date.now()) {
 }
 
 // readStoredSignIn reads agy's stored sign-in on this computer.
-export async function readStoredSignIn({ platform = process.platform, exec = run, now = Date.now(), env = process.env, home = os.homedir() } = {}) {
+export async function readStoredSignIn({ geminiDir, platform = process.platform, exec = run, now = Date.now(), env = process.env, home = os.homedir() } = {}) {
   // tests, and setups this reading doesn't fit, turn it off
   if (env.AGY_BRIDGE_STORED_SIGNIN === "skip") return { state: "unknown" }
   // agy signs in with these instead of a stored Google sign-in
   if (ENV_SIGN_INS.some((name) => env[name])) return { state: "unknown" }
-  const s = await credentialStore(platform, env, home, exec).read()
+  const s = geminiDir
+    ? await fs.readFile(path.join(geminiDir, "antigravity-cli", "antigravity-oauth-token"), "utf8")
+      .then(raw => ({ state: "present", raw }), error => ({ state: error.code === "ENOENT" ? "missing" : "unknown" }))
+    : await credentialStore(platform, env, home, exec).read()
   return s.state === "present" ? parseStored(s.raw, now) : s
 }
 
