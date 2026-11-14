@@ -128,3 +128,14 @@ A1–A16、U1–U6 逐项并入。两边都有、且 `acb8d84` 写法更新的�
 错误信号参考 [CLIProxyAPI 的 TOS 检测](https://github.com/router-for-me/CLIProxyAPI/blob/e96d4c4818851cf0e96d27b2bc8b67379e449d9e/internal/runtime/executor/antigravity_executor_credits.go)：
 只将明确的账号服务停用信号作为持久状态，不把普通 403 等同封禁。本仓独立实现 CLI 错误解析、
 按账号持久化和 Magpie 错误上报；未引入 HTTP 聊天执行器、OAuth 续期或跨账号重试循环。
+
+
+## 11. 上游 0.1.50–0.1.51（本仓 0.2.11）
+
+同步 magpie-community/plugins（MIT）的两项提交：
+
+- [9126c46f97fc5e20b12b416e4aec0b98cb712624](https://github.com/magpie-community/plugins/commit/9126c46f97fc5e20b12b416e4aec0b98cb712624)：工具描述预算及回归测试。
+- [4a64252bd7c85c9fd94a38e5ff0ee82166606352](https://github.com/magpie-community/plugins/commit/4a64252bd7c85c9fd94a38e5ff0ee82166606352)：多模型开场并发、锁内开始回合及回归测试。
+
+作者 @yetone。本仓适配到每账号运行时，保留服务停用检查；另补并发次级进程的同模型重复请求保护、
+双账号双模型工具回传隔离测试。未更换聊天传输或元数据查询方式。

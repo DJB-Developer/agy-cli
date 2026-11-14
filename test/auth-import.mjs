@@ -633,3 +633,43 @@ test("structured suspension in ACP error data blocks the account during session 
     assert.equal((await kit.plugin.auth.usage()).signIn, "expired")
   })
 })
+
+test("concurrent model openings keep each profile's CLI and tool results separate", { timeout: 10000 }, async () => {
+  await withKit({ offeredModels: [
+    ["gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"],
+    ["claude-sonnet-5-5-high", "Claude Sonnet 5.5 (High)"],
+  ] }, async kit => {
+    const accounts = await Promise.all([add(kit, "a"), add(kit, "b")])
+    const clients = await Promise.all(accounts.map(a => client(kit, authOf(a))))
+    let entered = 0, release
+    const ready = new Promise(resolve => { release = resolve })
+    kit.defaultPrompt = async agent => {
+      if (++entered === 4) release()
+      await Promise.race([ready, new Promise(resolve => setTimeout(resolve, 1000))])
+      const result = await agent.tool("Read", { path: `/${nameOf(agent.args)}/${agent.sessionId}` })
+      await agent.text(`${nameOf(agent.args)}:${agent.sessionId}:${result.result.content[0].text}`)
+      return { stopReason: "end_turn" }
+    }
+    const requests = clients.flatMap((ask, i) => ["gemini-3.8-flash", "claude-sonnet-5-5"].map(model => ({
+      ask, account: ["a", "b"][i], body: baseBody({ model }),
+    })))
+    const first = await Promise.all(requests.map(async r => {
+      const response = await r.ask(r.body)
+      assert.equal(response.status, 200)
+      return readSse(response)
+    }))
+    assert.equal(entered, 4, "all four model/profile turns overlap")
+    assert.ok(first.every(reply => reply.stopReason === "tool_use"))
+    assert.equal(new Set(first.map(reply => reply.content.find(block => block.type === "tool_use").id)).size, 4)
+    const done = await Promise.all(requests.map((r, i) =>
+      r.ask(continueWithToolResults(r.body, first[i], () => `private-result-${i}`)).then(readSse)))
+    for (const [i, reply] of done.entries()) {
+      assert.equal(reply.error, null)
+      const text = reply.content.filter(block => block.type === "text").map(block => block.text).join("")
+      assert.ok(text.startsWith(requests[i].account + ":"), text)
+      assert.ok(text.endsWith(`:private-result-${i}`), text)
+      for (let j = 0; j < done.length; j++) if (j !== i) assert.ok(!text.includes(`private-result-${j}`), text)
+    }
+    assert.equal(entered, 4, "tool continuation must reuse its original CLI turn")
+  })
+})

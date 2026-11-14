@@ -150,7 +150,7 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.10 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to 0.2.11 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
 
 0.2.9 restores CLI `/usage` quotas with optional HTTP plan lookup, retaining
 model-group routing and plan ID recognition. Plan failures do not affect quota,
@@ -478,3 +478,19 @@ actual CLI error; no extra inference probes are sent. Manually turn off any acco
 already known to be suspended until a signal has been observed. After a successful
 appeal, stop Magpie/the plugin, remove only that profile's `service-status.json`,
 restart and refresh usage, then re-enable the account in Magpie if needed.
+
+
+## Concurrent openings across models (0.2.11)
+
+Ports community 0.1.50–0.1.51. Magpie's model test sends the same `hi` opening to
+several models at once; these now receive independent agy processes. Acquisition
+and turn start hold the same conversation lock. Duplicate openings for a model
+whose turn is still running remain busy, including secondary concurrent processes.
+Per-account process limits and account isolation remain in force. This fix does
+not replace explicit user and session identities in multi-user chat applications.
+
+Under tool-budget pressure, ordinary property description fragments are dropped
+so tool purposes and complex parameter contracts retain more room. Catalogs that
+fit remain unchanged; tool names and schema structure are preserved. CLI chat,
+CLI quota, optional HTTP plans, model-group routing, the minimal-agent UI option
+and persistent TOS suspension detection are retained.

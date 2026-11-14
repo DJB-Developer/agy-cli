@@ -985,3 +985,63 @@ test("Lmohn39: a try that fails another way still waits for agy's next one", asy
     assert.equal(replyText(parsed), "answer")
   })
 })
+
+// ---------------------------------------------------------------- one opening, several models at once
+
+// magpie's "Test models" sends every model the same smallest request, four at a
+// time: {"model":…,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}.
+// Those share one conversation key, so all but the first were turned away with
+// "this conversation still has an unfinished response" (swang20201 on X: one ✓,
+// three ✗). Each is a conversation of its own and gets an agy of its own.
+test("the same opening sent to several models at once is answered for each", async () => {
+  const ids = ["claude-opus-5-5", "gemini-4-argon", "claude-sonnet-5-5", "gemini-3.8-flash"]
+  await withKit({ offeredModels: [
+    ["gemini-4-argon-high", "Gemini 4 Argon (High)"], ["gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"],
+    ["claude-opus-5-5-high", "Claude Opus 5.5 (High)"], ["claude-sonnet-5-5-high", "Claude Sonnet 5.5 (High)"],
+  ] }, async (kit) => {
+    let arrived = 0
+    let release
+    const allIn = new Promise((resolve) => { release = resolve })
+    kit.defaultPrompt = async (agent) => {
+      // every prompt is held until the last one is in: they overlap, as on a real agy
+      if (++arrived === ids.length) release()
+      await Promise.race([allIn, sleep(2_000)])
+      await agent.text(`answer ${agent.index}`)
+      return { stopReason: "end_turn" }
+    }
+    const responses = await Promise.all(ids.map((model) =>
+      kit.request({ model, max_tokens: 16, messages: [{ role: "user", content: "hi" }] })))
+    const results = await Promise.all(responses.map(async (response) =>
+      response.status === 200 ? readSse(response) : { status: response.status, text: await response.text() }))
+    for (const [i, result] of results.entries()) {
+      assert.equal(result.status, undefined, `${ids[i]}: ${result.text}`)
+      assert.equal(result.stopReason, "end_turn", ids[i])
+    }
+    assert.equal(arrived, ids.length)
+  })
+})
+
+test("resending a concurrent secondary model stays busy instead of starting a third turn", async () => {
+  await withKit({ offeredModels: [
+    ["gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"],
+    ["claude-sonnet-5-5-high", "Claude Sonnet 5.5 (High)"],
+  ] }, async kit => {
+    let release
+    const held = new Promise(resolve => { release = resolve })
+    kit.defaultPrompt = async agent => { await held; await agent.text("answer"); return { stopReason: "end_turn" } }
+    const body = model => ({ model, max_tokens: 16, messages: [{ role: "user", content: "hi" }] })
+    const first = await kit.request(body("gemini-3.8-flash"))
+    const second = await kit.request(body("claude-sonnet-5-5"))
+    try {
+      assert.equal(first.status, 200)
+      assert.equal(second.status, 200)
+      const duplicate = await kit.request(body("claude-sonnet-5-5"))
+      assert.equal(duplicate.status, 503, "same-model resend must remain guarded even on a secondary process")
+      const duplicateFirst = await kit.request(body("gemini-3.8-flash"))
+      assert.equal(duplicateFirst.status, 503)
+    } finally {
+      release()
+      await Promise.all([first, second].map(readSse))
+    }
+  })
+})
