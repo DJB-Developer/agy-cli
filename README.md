@@ -1,7 +1,7 @@
 # agy-cli
 
 本仓库是 [magpie-community/plugins 的 agy-cli](https://github.com/magpie-community/plugins/tree/main/packages/agy-cli) 的独立版本，
-新增了 **refresh_token 直接导入账号**，支持粘贴 `1//...` 原始 token 或账号 JSON。
+新增了 **多账号隔离与 refresh_token 直接导入**，支持粘贴 `1//...` 原始 token 或账号 JSON。
 保留上游 MIT 版权与来源说明；本仓库的改动尚未发布到 npm。
 
 把本机的 Antigravity CLI（`agy`）接成 Magpie 里的一个模型 provider。装好以后，
@@ -103,13 +103,13 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
 
 ## 安装
 
-安装本仓库版本（包含 refresh token 导入和无桌面 Linux / Docker 支持）：
+安装本仓库版本（包含多账号、refresh token 导入和 Linux / Docker 支持）：
 
 ```sh
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-已安装时，在 Magpie 插件页更新这个 GitHub 插件，再重新导入账号。
+已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.0。现有账号保留，可继续添加其他账号。
 以下市场和 npm 命令安装的是上游社区版本，不包含本仓库的改动。
 
 从 Magpie 社区插件市场安装（推荐）：在 Magpie 的 Plugins 页找到「Antigravity (local agy CLI)」点安装，或在终端运行：
@@ -124,46 +124,50 @@ magpie plugin add @magpie-community/opencode-agy-cli-auth
 
 ## 使用
 
-1. 在 Magpie 的 Providers 页找到 `agy-cli` 并点击 Sign in。agy 已经登录时直接完成；
-   没登录时插件运行 agy 自己的 Google 登录（`agy acp --login`），Magpie 打开登录页，
-   登录后把页面显示的授权码（或整个页面地址）粘贴回 Magpie。Magpie 在服务器或 Docker
-   里也一样。登录的有效期是 15 分钟。Google 凭据保存在 agy 使用的系统钥匙串或无桌面 Linux 的凭据文件里；
-   agy 列出账号的模型（`agy models`）后才算登录成功。
-2. 模型名写成 `agy-cli/<模型>`。agy 对同一模型不同思考等级给出的多个模型 ID，
-   在这里会合并成一个模型的多个变体，请求时再映射回对应的 agy ID。
-3. 在客户端里选用这个模型即可。
+1. 在 Magpie 的 Providers 页找到 `agy-cli`，点击 Sign in 添加账号。
+2. 选择 **Add an account (refresh token)**，填写账号名称（如 `personal`、`work`），
+   粘贴 `1//...` 原始 token，或 `{"refresh_token":"…"}` / `{"token":{"refresh_token":"…"}}` JSON。
+   token 必须与 agy 的 OAuth 客户端兼容；不需要跳转网页。
+3. 再次 Sign in、填写另一个名称和 token，即可添加第二个账号。
+   每个账号在 Magpie 中有独立记录，可分别启用、禁用和设置优先级，具体请求调度由 Magpie 负责。
+4. 模型仍写成 `agy-cli/<模型>`，不需要给模型名添加账号前缀。
 
-### 通过 refresh token 导入
+也可以选择 **Add an account with Google**，填写新名称后走网页登录，
+把页面上的授权码粘贴回 Magpie。登录链接等待 15 分钟。
 
-在 Sign in 中选择 **Import an account (refresh token)**，粘贴单个 `refresh_token`，
-也可以粘贴 `{"refresh_token":"…"}` 或 `{"token":{"refresh_token":"…"}}` 格式的 JSON。
-导入无需打开网页登录；token 必须与 agy 使用的 OAuth 客户端兼容。
+### 多账号存储与旧版迁移
 
-插件将凭据写入 agy 使用的存储，由 agy 自己刷新 token 并验证模型列表。
-验证失败时会尝试恢复原登录；恢复失败会明确提示重新登录。Magpie 仍只保存 `agy` 标记。
-这是**替换本机 agy 的当前账号**，不是添加独立的多账号池。请先结束正在运行的请求；
-成功后旧进程和会话续接记录会清理，后续请求使用新账号。
-
-- macOS 使用 Keychain，Windows 使用 Credential Manager。
-- 无桌面的 Linux / Docker（没有 `DBUS_SESSION_BUS_ADDRESS` 和 `XDG_RUNTIME_DIR`）
-  自动使用 agy 的原生凭据文件 `~/.gemini/antigravity-cli/antigravity-oauth-token`，
-  原子写入，权限为 `0600`，不需要 `secret-tool` 或钥匙串服务。
-- 有桌面会话的 Linux 使用 `secret-tool`（通常由 `libsecret-tools` 提供）和已解锁的
-  Secret Service `login` collection。钥匙串不可读时不会偷偷切换到另一份文件账号。
-- 设置了 Gemini/Google API key、ADC 或 Vertex 环境认证时，需要先移除这些设置。
+- 从 0.1.43 升级后，原来的 `agy` 默认账号继续可用，不需要重新导入。
+  **Use the existing CLI account (legacy default)** 用于重新登记这份已有登录。
+- 新账号各有独立的 CLI 目录、凭据、进程池、工具调用状态、会话续接记录、模型列表和额度查询。
+  Magpie 保存 `agy:<账号名称>` 引用，token 由 agy 自己刷新。
+- 名称支持 1–64 位字母、数字、下划线和短横线，统一转成小写；`default` 等保留名不可用。
+  同名账号不会被覆盖；导入失败只清理本次新建的目录，不影响已有账号或正在进行的请求。
+- 删除 Magpie 里的账号记录不会删除磁盘上的凭据。选择 **Use a saved named account**，
+  输入原名称即可重新登记。若需换 token，请先用新名称添加账号并验证，再禁用旧账号。
+- 新账号目录默认位于 `$XDG_CONFIG_HOME/magpie-agy-cli/accounts/<名称>`；
+  未设置 XDG 时为 `~/.config/magpie-agy-cli/accounts/<名称>`。
+  可用 `AGY_BRIDGE_ACCOUNTS_DIR` 指定根目录。token 文件权限为 `0600`，新建账号目录为 `0700`。
+- 新账号统一使用 `--gemini_dir` 和 CLI 的文件凭据模式，无需系统钥匙串或 `secret-tool`；
+  账号子进程不使用宿主的 Gemini/Google API key、ADC 或 Vertex 环境认证。
+  原来的默认账号仍使用原存储和环境配置。
+- 账号文件丢失或不可读时返回登录错误，不会回退到默认账号。
 
 #### 1Panel / Magpie 官方 Docker 镜像
 
-[Magpie 官方镜像](https://github.com/yetone/magpie/blob/main/Dockerfile) 使用 `HOME=/config/home`。保留 Compose 中的
-`magpie-config:/config` 卷即可，凭据文件会保存到
-`/config/home/.gemini/antigravity-cli/antigravity-oauth-token`，容器重建后仍可使用。
-更新本插件后重新导入，不需要在容器中安装 D-Bus 或 GNOME Keyring，也不要把 token 写进 Compose。
-文件存储路径已用 agy 1.5.9 的 Linux 构建在无网络容器中验证：agy 能读取它并进入 token 刷新流程；
-这项测试没有使用真实账号或调用模型。
+保持现有的 `magpie-config:/config` 卷即可，**不需要修改 Compose**。
+[Magpie 官方镜像](https://github.com/yetone/magpie/blob/main/Dockerfile) 设置了 `XDG_CONFIG_HOME=/config`，
+新增账号保存到 `/config/magpie-agy-cli/accounts/<名称>/`，容器重建后仍保留。
+旧默认账号继续使用 `/config/home/.gemini/antigravity-cli/antigravity-oauth-token`。
+无需安装 D-Bus 或 GNOME Keyring，也不要把 token 写进 Compose。
+
+已在无网络、非 root Linux 容器中用真实 agy 1.5.9 验证：两个独立目录的
+`models`、ACP 和 `/usage` 均读取自己的凭据，没有使用默认账号。
+此测试使用虚构 token 验证存储隔离，没有调用真实账号的模型。
 
 ## 并发
 
-- 插件自己的进程池上限由 `AGY_BRIDGE_MAX_PROCS` 决定，默认 16 个 agy 进程。
+- 每个账号的进程池上限由 `AGY_BRIDGE_MAX_PROCS` 决定，默认 16 个 agy 进程。
 - Magpie 的 Providers 页有单独的 Concurrency 设置，可填 0–1000，0 表示不限制。
   你在页面里改的值会覆盖 `package.json` 里 `magpie.maxConcurrency` 的默认声明（16）。
 - 进程池已满、又找不到可以淘汰的进程时，插件返回 HTTP 503。建议两处数值保持一致：
@@ -196,7 +200,8 @@ magpie quota refresh agy-cli --json
 | 变量 | 默认值 | 作用 |
 |---|---|---|
 | `AGY_PATH` | 按 PATH 查找 | 指定 agy 可执行文件 |
-| `AGY_BRIDGE_MAX_PROCS` | 16 | agy 进程池上限 |
+| `AGY_BRIDGE_ACCOUNTS_DIR` | XDG 配置目录下的 `magpie-agy-cli/accounts` | 多账号凭据与状态根目录 |
+| `AGY_BRIDGE_MAX_PROCS` | 16 | 每个账号的 agy 进程池上限 |
 | `AGY_BRIDGE_THINKING` | 开启 | 设为 `0` 关闭思考摘要 |
 | `AGY_BRIDGE_EFFORT` | 未设置 | 强制思考等级：`minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
 | `AGY_BRIDGE_MINIMAL_AGENT` | 关闭 | 设为 `1` 去掉 agy 自带的提示组件，见下文「精简 agent」 |

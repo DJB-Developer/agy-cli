@@ -1,4 +1,4 @@
-import { agyCandidates, spawnAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./platform.mjs"
+import { agyCandidates, spawnAgy as nativeSpawnAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./platform.mjs"
 import { spawn, spawnSync } from "node:child_process"
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
@@ -8,7 +8,7 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
-import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, importRefreshToken, parseRefreshToken, storedSignInNow } from "./signin.mjs"
+import { backgroundBlocked as defaultBackgroundBlocked, cannotSignIn, forgetStoredSignIn as defaultForgetStoredSignIn, isDead, parseRefreshToken, storedSignInNow as defaultStoredSignInNow } from "./signin.mjs"
 import { sanitizePatternFields } from "./re2-pattern.mjs"
 import { startLogin } from "./login.mjs"
 import { ensureGeminiArrayItems } from "./array-items.mjs"
@@ -16,14 +16,37 @@ import { expandToolSchema } from "./tool-schema.mjs"
 import { hint, outgoing, turnsAway } from "./cloak.mjs"
 import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 
+import { DEFAULT_ACCOUNT, accountEnv, accountArgs, accountSignIn, accountName, resolveAccount,
+  accountResult, reserveAccount, writeAccountToken, publishAccount, discardAccount } from "./accounts.mjs"
+
+const runtimeCleanups = new Set()
+process.once("exit", () => { for (const cleanup of runtimeCleanups) cleanup() })
+
+// A runtime owns every mutable bridge object: processes, tool calls, parked
+// sessions, model catalogs and control sockets. No request can see another
+// profile's live session, even when its history or tool IDs are identical.
+function createAccountRuntime(account = DEFAULT_ACCOUNT) {
+// models parses global flags only before its subcommand; ACP has its own
+// parser and takes them after `acp` (verified with native agy 1.5.9).
+const spawnAgy = (file, args, opts = {}) => account.dir ? nativeSpawnAgy(file,
+  args[0] === "acp" ? [...args, ...accountArgs(account)] : [...accountArgs(account), ...args],
+  { ...opts, env: accountEnv(opts.env || process.env, account) }) : nativeSpawnAgy(file, args, opts)
+const storedSignInNow = () => account.dir ? accountSignIn(account) : defaultStoredSignInNow()
+const backgroundBlocked = async opts => {
+  if (!account.dir) return defaultBackgroundBlocked(opts)
+  const signIn = accountSignIn(account)
+  return cannotSignIn(signIn) || (isDead(signIn) ? "agy's sign-in no longer works" : "")
+}
+const forgetStoredSignIn = opts => { if (!account.dir) defaultForgetStoredSignIn(opts) }
+
 const PROVIDER_ID = "agy-cli"
 // Client tools reach the session through a private `nc` placed first on agy's
 // PATH: agy dials `--ide-mcp-port` by running `nc 127.0.0.1 <port>`. That is
 // how agy works, not a documented interface, and it was checked on 1.4.12 and
 // 1.5.0. An older agy is refused with a clear message; a version agy doesn't
 // report is not known to be older, so the session goes ahead.
-export const MIN_AGY_VERSION = "1.4.12"
-export function agyTooOld(version) {
+const MIN_AGY_VERSION = "1.4.12"
+function agyTooOld(version) {
   const parse = value => {
     const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(value ?? "").trim())
     return match ? match.slice(1).map(Number) : null
@@ -136,7 +159,6 @@ const FALLBACK_MODELS = [
 const pool = new Map()
 const parked = new Map()
 const allProcs = new Set()
-let importingAccount = false
 const sessions = new Map()
 const toolCalls = new Map()
 let cachedAgyPath
@@ -183,8 +205,8 @@ function execOnce(file, args, opts = {}) {
   return new Promise((resolve) => {
     let child
     try {
-      const launch = file === "taskkill" ? spawn : spawnAgy
-      const { unrefTimer: _unrefTimer, ...spawnOpts } = opts
+      const launch = file === "taskkill" ? spawn : opts.profile === false ? nativeSpawnAgy : spawnAgy
+      const { unrefTimer: _unrefTimer, profile: _profile, ...spawnOpts } = opts
       child = launch(file, args, {
         stdio: ["ignore", "pipe", "pipe"],
         ...spawnOpts,
@@ -226,7 +248,6 @@ function execOnce(file, args, opts = {}) {
 }
 
 async function listAgyModels(agyPath) {
-  if (importingAccount) return null
   // a listing nobody asked for doesn't run an agy that would start its own
   // Google sign-in (signin.mjs); the catalog it has stays
   if (await backgroundBlocked()) return null
@@ -259,7 +280,7 @@ function parseAgyModels(stdout) {
 // take seconds on a real agy, and the host lists models right after.
 const OFFERED_SIGNIN_WAIT_MS = 3_000
 
-async function probeSignedIn(agy) {
+async function probeSignedIn(agy, { warm = true } = {}) {
   // no sign-in stored, or one agy failed with: `agy models` would start
   // agy's own Google sign-in (on Windows, a browser no shim stops), so the
   // caller goes on to magpie's own sign-in link instead
@@ -270,7 +291,7 @@ async function probeSignedIn(agy) {
     probe.stdout.split("\n").some(line => /^\S+\s+\S/.test(line.trim()))
   if (listed) {
     const list = parseAgyModels(probe.stdout)
-    if (list) {
+    if (list && warm) {
       useAgyPath(agy)
       storeListedCatalog(agy, list, Date.now())
       wantOfferedProbe = true
@@ -931,7 +952,7 @@ async function windowsNcDir() {
       await fs.promises.copyFile(process.execPath, runtime)
     }
     const spec = windowsNcBuild(runtime, MCP_SERVER_PATH, path.join(build, "nc.exe"))
-    const { err, code, timedOut } = await execOnce(spec.file, spec.args, { cwd: build, timeoutMs: WINDOWS_NC_BUILD_TIMEOUT_MS })
+    const { err, code, timedOut } = await execOnce(spec.file, spec.args, { cwd: build, timeoutMs: WINDOWS_NC_BUILD_TIMEOUT_MS, profile: false })
     if (err || timedOut || code !== 0 || !await isFileWithBytes(path.join(build, "nc.exe"))) return null
     await fs.promises.mkdir(dir, { recursive: true })
     await fs.promises.writeFile(path.join(dir, WINDOWS_NC_RUNTIME_FILE), runtimeKey).catch(() => {})
@@ -976,7 +997,7 @@ async function sweepWindowsNcDirs(tmp, keep, runtimeKey = "") {
 // permission rules and `mcp_ide-tools_<name>` as a function. Only agy's own
 // words are read (title, name), never rawInput, which the model writes.
 const IDE_TOOL_NAMED = /^(?:mcp\(ide-tools\/([^()\s]+)\)|(?:mcp\s+)?"?ide-tools\/([^()\s"]+)"?|mcp_ide-tools_(\S+))$/
-export function ideToolOf(toolCall) {
+function ideToolOf(toolCall) {
   for (const value of [toolCall?.title, toolCall?.name, toolCall?.toolName]) {
     if (typeof value !== "string") continue
     // The whole title, never a word in it: a shell command's own text can
@@ -1966,7 +1987,7 @@ class Proc {
       if (model) await this.#setModel(model, selection)
       const stepUsageEnabled = this.stepUsageTrusted &&
         !/^(?:0|false|off|no|disabled)$/i.test(process.env.AGY_BRIDGE_STEP_USAGE || "")
-      turn.stepsFile = stepUsageEnabled ? sessionDbPath(this.sessionId) : null
+      turn.stepsFile = stepUsageEnabled ? sessionDbPath(this.sessionId, account.dir ? { AGY_BRIDGE_CONVERSATIONS_DIR: path.join(account.dir, "antigravity-cli", "conversations") } : process.env) : null
       turn.stepCursor = turn.stepsFile ? modelUsageCursor(turn.stepsFile) : null
       if (turn.stepsFile && turn.stepCursor === null) this.stepUsageTrusted = false
       // Content a cancelled turn never delivered still belongs to the session.
@@ -2494,6 +2515,7 @@ function digest(value) {
 // conversation on disk, and this file maps a conversation to its agy session.
 // It stores only hashes of the history and instructions, never message text.
 function sessionStateFile() {
+  if (account.dir) return path.join(account.dir, "bridge-state", "sessions.json")
   if (process.env.AGY_BRIDGE_STATE_FILE) return process.env.AGY_BRIDGE_STATE_FILE
   const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state")
   return path.join(base, "magpie-agy-bridge", "sessions.json")
@@ -2692,7 +2714,8 @@ async function evictLRU() {
   return true
 }
 
-setInterval(() => { evictIdle().catch(() => {}) }, 60_000).unref()
+const idleTimer = setInterval(() => { evictIdle().catch(() => {}) }, 60_000)
+idleTimer.unref()
 
 const acquireLocks = new Map()
 
@@ -5587,14 +5610,15 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, a
   return proc.startTurn(contentParts, body.messages, model, selection)
 }
 
-export const AntigravityBridgePlugin = async () => {
-  const readUsage = createUsageReader(findAgy)
+const createPlugin = async () => {
+  const readUsage = createUsageReader(findAgy, account.dir ? {
+    signIn: () => accountSignIn(account), env: accountEnv(process.env, account), geminiDir: account.dir,
+  } : {})
   return {
     auth: {
       provider: PROVIDER_ID,
-      single: true,
       // Magpie's usage hook; OpenCode ignores this extension. agy owns auth.
-      usage: async () => importingAccount ? { windows: [], error: "An account import is in progress." } : readUsage(),
+      usage: async () => readUsage(),
       methods: [
         {
           // agy's own Google sign-in (`agy acp --login`): magpie opens its
@@ -5637,53 +5661,12 @@ export const AntigravityBridgePlugin = async () => {
             }
           },
         },
-        {
-          type: "oauth",
-          label: "Import an account (refresh token)",
-          prompts: [{ type: "text", key: "refresh_token", message: "Refresh token or account JSON (replaces agy's local account)" }],
-          authorize: async (inputs) => {
-            let token
-            try { token = parseRefreshToken(inputs?.refresh_token) } catch (error) { return { type: "failed", error: error.message } }
-            const agy = findAgy()
-            if (!agy) return { type: "failed", error: "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli" }
-            return {
-              url: "",
-              instructions: "Importing the account and checking it with agy…",
-              method: "auto",
-              callback: async () => {
-                if (importingAccount) return { type: "failed", error: "An account import is already in progress." }
-                if ([...allProcs].some(proc => proc.turn && !proc.turn.finalized)) {
-                  return { type: "failed", error: "Wait for agy's active requests to finish before importing an account." }
-                }
-                importingAccount = true
-                try {
-                  // Retire processes holding the old account before changing
-                  // the keyring; subsequent requests start with the new one.
-                  await Promise.all([...allProcs].map(proc => { dropFromPool(proc); return proc.stop() }))
-                  forgetOffered()
-                  const result = await importRefreshToken(token, { probe: () => probeSignedIn(agy) })
-                  if (result.error) return { type: "failed", error: result.error }
-                  loadParked()
-                  for (const entry of readStateFile()) unparked.add(entry.key)
-                  parked.clear()
-                  saveParked()
-                  return { type: "success", key: "agy" }
-                } catch {
-                  return { type: "failed", error: "Could not import the account. Finish active requests and try again." }
-                } finally {
-                  importingAccount = false
-                }
-              },
-            }
-          },
-        },
       ],
       loader: async () => {
         return {
           baseURL: "agy://local",
           apiKey: "agy",
           fetch: async (fetchInput, init = {}) => {
-            if (importingAccount) return jsonError(503, "An account import is in progress; try again when it finishes.")
             const requestUrl = typeof fetchInput === "string"
               ? fetchInput
               : fetchInput instanceof URL
@@ -5977,8 +5960,165 @@ function reapOnExit() {
   }
 }
 
-process.once("exit", reapOnExit)
+runtimeCleanups.add(reapOnExit)
+return { createPlugin, findAgy, probeSignedIn, catalogWarming, MIN_AGY_VERSION, agyTooOld, ideToolOf, sanitizeInputSchema,
+  dispose() {
+    clearInterval(idleTimer)
+    reapOnExit()
+    controlServer?.close()
+    runtimeCleanups.delete(reapOnExit)
+  },
+  // TEST_RUNTIME_SEAMS
+}
+}
 
-export { sanitizeInputSchema }
-export default { id: PROVIDER_ID, server: AntigravityBridgePlugin }
+const defaultRuntime = createAccountRuntime()
+export const { MIN_AGY_VERSION, agyTooOld, ideToolOf, sanitizeInputSchema } = defaultRuntime
 
+const runtimes = new Map([["default", defaultRuntime]])
+const plugins = new Map()
+async function pluginFor(account) {
+  const key = account.dir || "default"
+  if (!runtimes.has(key)) runtimes.set(key, createAccountRuntime(account))
+  if (!plugins.has(key)) plugins.set(key, runtimes.get(key).createPlugin())
+  return plugins.get(key)
+}
+
+const namePrompt = { type: "text", key: "name", message: "Account name (e.g. personal or work; existing accounts are never replaced)" }
+const failed = error => ({ type: "failed", error: error.message })
+const accountError = error => new Response(JSON.stringify({ type: "error", error: {
+  type: "authentication_error", message: error.message,
+} }), { status: 401, headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "expired" } })
+
+// Only validate credentials here. Warming a catalog would leave a background
+// ACP probe running while a failed import is being removed.
+async function checkAccount(account) {
+  const runtime = createAccountRuntime(account)
+  try {
+    const agy = runtime.findAgy()
+    if (!agy || !(await runtime.probeSignedIn(agy, { warm: false })).ok) {
+      throw new Error("agy could not use this account. Check the token, its OAuth client, CLI version and network access. Existing accounts were not changed.")
+    }
+    return publishAccount(account)
+  } finally { runtime.dispose() }
+}
+
+export const AntigravityBridgePlugin = async () => {
+  const legacy = await pluginFor(DEFAULT_ACCOUNT)
+  const selected = async getAuth => resolveAccount(typeof getAuth === "function" ? await getAuth() : undefined,
+    { allowMissing: typeof getAuth !== "function" })
+  return {
+    auth: {
+      provider: "agy-cli",
+      // Magpie stores a separate opaque profile reference in each account row.
+      single: false,
+      methods: [
+        { ...legacy.auth.methods[0], label: "Use the existing CLI account (legacy default)" },
+        {
+          type: "oauth", label: "Add an account (refresh token)",
+          prompts: [namePrompt, { type: "text", key: "refresh_token", message: "Refresh token (1//...) or account JSON" }],
+          authorize: async inputs => {
+            let name, token
+            try { name = accountName(inputs?.name); token = parseRefreshToken(inputs?.refresh_token) }
+            catch (error) { return failed(error) }
+            let pending
+            return { url: "", instructions: "Importing a separate account and checking it with agy…", method: "auto",
+              callback: () => pending ||= (async () => {
+                let account
+                try {
+                  account = reserveAccount(name)
+                  writeAccountToken(account, token)
+                  return await checkAccount(account)
+                } catch (error) {
+                  if (account) {
+                    try { discardAccount(account) } catch {
+                      return failed(new Error("The import failed and its incomplete profile could not be removed. Check volume permissions and use a new account name."))
+                    }
+                  }
+                  return failed(new Error(account ? "Could not import this account. Check the refresh token, CLI version, network and volume permissions. Existing accounts were not changed." : error.message))
+                } finally { token = null }
+              })(),
+            }
+          },
+        },
+        {
+          type: "oauth", label: "Add an account with Google", prompts: [namePrompt],
+          authorize: async inputs => {
+            let account
+            try {
+              const agy = defaultRuntime.findAgy()
+              if (!agy) throw new Error("agy CLI not found. Install Antigravity CLI first.")
+              account = reserveAccount(inputs?.name)
+              let cleaned = false
+              const cleanup = () => {
+                if (cleaned) return
+                cleaned = true
+                try { discardAccount(account) } catch {}
+              }
+              const login = await startLogin(agy, { args: accountArgs(account), env: accountEnv(process.env, account), onCancel: cleanup })
+              if (login.error) return failed(new Error("Could not start Google sign-in. Check the CLI version and network, then try again."))
+              let pending
+              return { url: login.url, instructions: "", method: "code",
+                callback: (code, opts = {}) => pending ||= (async () => {
+                  let signedIn = false
+                  try {
+                    if (opts.signal?.aborted) throw new Error("Sign-in cancelled.")
+                    const done = await login.finish(code, opts)
+                    if (done.error) throw new Error("Google sign-in failed or expired. Start a new sign-in.")
+                    signedIn = true
+                    return await checkAccount(account)
+                  } catch (error) {
+                    // Failed/cancelled login children clean up on close, so
+                    // a late native write cannot race a new import of this name.
+                    if (signedIn) cleanup()
+                    else login.cancel()
+                    return failed(error)
+                  }
+                })(),
+              }
+            } catch (error) {
+              if (account) { try { discardAccount(account) } catch {} }
+              return failed(error)
+            }
+          },
+        },
+        {
+          type: "oauth", label: "Use a saved named account", prompts: [namePrompt],
+          authorize: async inputs => {
+            try {
+              const name = accountName(inputs?.name)
+              const account = resolveAccount({ type: "api", key: `agy:${name}` })
+              return { url: "", instructions: "", method: "auto", callback: async () => accountResult(account) }
+            } catch (error) { return failed(error) }
+          },
+        },
+      ],
+      usage: async getAuth => {
+        try { return await (await pluginFor(await selected(getAuth))).auth.usage() }
+        catch (error) { return { windows: [], error: error.message, signIn: "expired" } }
+      },
+      loader: async getAuth => ({
+        baseURL: "agy://local", apiKey: "agy",
+        fetch: async (...args) => {
+          let plugin
+          try { plugin = await pluginFor(await selected(getAuth)) }
+          catch (error) { return accountError(error) }
+          return (await plugin.auth.loader()).fetch(...args)
+        },
+      }),
+    },
+    provider: {
+      ...legacy.provider,
+      warming: () => {
+        const pending = [...runtimes.values()].map(r => r.catalogWarming()).filter(Boolean)
+        return pending.length ? Promise.all(pending) : null
+      },
+      models: async (_provider, context) => {
+        const account = resolveAccount(context?.auth, { allowMissing: context?.auth == null })
+        return (await pluginFor(account)).provider.models()
+      },
+    },
+  }
+}
+
+export default { id: "agy-cli", server: AntigravityBridgePlugin }

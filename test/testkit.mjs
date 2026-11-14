@@ -45,9 +45,14 @@ export const CATALOG_TTL_MS = 5 * 60 * 1000
 const RUNTIME_SPECIFIER = "agy-testkit:runtime"
 const RUNTIME_NAMES = ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "process"]
 const RUNTIME_PRELUDE = `import { ${RUNTIME_NAMES.join(", ")} } from ${JSON.stringify(RUNTIME_SPECIFIER)};\n`
-const TEST_EXPORTS = "\nexport { Turn as __agyTestTurn, allProcs as __agyTestAllProcs, pool as __agyTestPool, " +
-  "execOnce as __agyTestExecOnce, findAgy as __agyTestFindAgy, canonicalBody as __agyTestCanonicalBody, " +
-  "conversationKey as __agyTestConversationKey, renderInitialPromptParts as __agyTestRenderInitialPromptParts, reapOnExit as __agyTestReapOnExit };\n"
+const TEST_SEAMS = "Turn, allProcs, pool, execOnce, findAgy, canonicalBody, conversationKey, renderInitialPromptParts, reapOnExit"
+const TEST_EXPORTS = `
+const { ${TEST_SEAMS} } = defaultRuntime;
+export { Turn as __agyTestTurn, allProcs as __agyTestAllProcs, pool as __agyTestPool,
+  execOnce as __agyTestExecOnce, findAgy as __agyTestFindAgy, canonicalBody as __agyTestCanonicalBody,
+  conversationKey as __agyTestConversationKey, renderInitialPromptParts as __agyTestRenderInitialPromptParts,
+  reapOnExit as __agyTestReapOnExit, runtimes as __agyTestRuntimes };
+`
 const IDENTIFIER_RE = /^[A-Za-z_$][\w$]*$/
 
 if (typeof vm.SourceTextModule !== "function" || typeof vm.SyntheticModule !== "function") {
@@ -130,6 +135,7 @@ function createTimers() {
 
 class FakeStream extends EventEmitter {
   setEncoding() { return this }
+  destroy() {}
 }
 
 class FakeChild extends EventEmitter {
@@ -171,10 +177,10 @@ class FakeChild extends EventEmitter {
   }
 }
 
-function spawnModels(kit, file, args) {
-  kit.modelsSpawns.push({ file, at: kit.clock.now() })
+function spawnModels(kit, file, args, opts) {
+  kit.modelsSpawns.push({ file, args, env: opts.env, at: kit.clock.now() })
   const raw = typeof kit.modelsBehavior === "function"
-    ? kit.modelsBehavior({ file, count: kit.modelsSpawns.length })
+    ? kit.modelsBehavior({ file, args, env: opts.env, count: kit.modelsSpawns.length })
     : kit.modelsBehavior
   const behavior = raw || { hang: true }
   if (behavior.throwSync) throw Object.assign(new Error("spawn EACCES (test)"), { code: "EACCES" })
@@ -255,7 +261,7 @@ class FakeAgy {
       this.sessionId = params.sessionId
       if (this.token) this.control({ kind: "list" })
       const models = { currentModelId: this.kit.initialAgyModel }
-      if (this.kit.offeredModels) models.availableModels = this.kit.offeredModels.map(([modelId, name]) => ({ modelId, name }))
+      if (this.kit.offeredModels) models.availableModels = (typeof this.kit.offeredModels === "function" ? this.kit.offeredModels(this.child.args) : this.kit.offeredModels).map(([modelId, name]) => ({ modelId, name }))
       this.respond(id, { sessionId: this.sessionId, models })
     } else if (method === "session/new") {
       this.sessionId = `fake-session-${++this.kit.sessionSerial}`
@@ -264,7 +270,7 @@ class FakeAgy {
       if (this.token) this.control({ kind: "list" })
       const models = { currentModelId: this.kit.initialAgyModel }
       // What agy offers this client in the session; unset, the session names none.
-      if (this.kit.offeredModels) models.availableModels = this.kit.offeredModels.map(([modelId, name]) => ({ modelId, name }))
+      if (this.kit.offeredModels) models.availableModels = (typeof this.kit.offeredModels === "function" ? this.kit.offeredModels(this.child.args) : this.kit.offeredModels).map(([modelId, name]) => ({ modelId, name }))
       // A real signed-in agy takes ~3s to open a session (#1064).
       if (this.kit.sessionNewDelayMs) setTimeout(() => this.respond(id, { sessionId: this.sessionId, models }), this.kit.sessionNewDelayMs)
       else this.respond(id, { sessionId: this.sessionId, models })
@@ -306,7 +312,8 @@ class FakeAgy {
 
   control(message) {
     const socket = new FakeSocket()
-    this.kit.controlHandler(socket)
+    const handler = this.kit.controlHandlers.get(Number(this.env.AGY_BRIDGE_CONTROL_PORT)) || this.kit.controlHandler
+    handler(socket)
     socket.emit("data", JSON.stringify({ token: this.token, ...message }) + "\n")
     return socket.reply
   }
@@ -315,6 +322,8 @@ class FakeAgy {
     const self = this
     return {
       index,
+      env: this.env,
+      args: this.child.args,
       prompt: params.prompt,
       sessionId: this.sessionId,
       get cancelPending() { return self.cancelPending },
@@ -354,6 +363,7 @@ class FakeSocket extends EventEmitter {
   }
 
   setEncoding() { return this }
+  destroy() {}
   write(data) { this.written += data; return true }
 
   end(data) {
@@ -389,7 +399,7 @@ function builtinModule(name, overrides) {
 }
 
 function sourceModule(file, extraSource, url, transform) {
-  const original = fs.readFileSync(file, "utf8")
+  const original = fs.readFileSync(file, "utf8").replace("// TEST_RUNTIME_SEAMS", `${TEST_SEAMS},`)
   const source = RUNTIME_PRELUDE + (transform ? transform(original) : original) + (extraSource || "")
   return new vm.SourceTextModule(source, {
     identifier: `${pathToFileURL(file).href}?agy-testkit=${++instanceSerial}`,
@@ -434,6 +444,7 @@ export async function createBridgeKit(options = {}) {
     setModels: [],
     acpLog: [],
     controlHandler: null,
+    controlHandlers: new Map(),
     turns: [],
     env: null,
     module: null,
@@ -467,17 +478,22 @@ export async function createBridgeKit(options = {}) {
     },
   })
   const spawn = (file, args = [], opts = {}) => {
-    if (args[0] === "models") return spawnModels(kit, file, args)
+    if (args[0] === "models" || args.at(-1) === "models") return spawnModels(kit, file, args, opts)
     if (args[0] === "acp") {
       const child = new FakeChild(kit, file, args)
       kit.acpSpawns.push({ file, args, env: opts.env })
-      new FakeAgy(kit, child, opts)
+      if (args.includes("--login") && options.onLogin) options.onLogin({ child, file, args, opts })
+      else new FakeAgy(kit, child, opts)
       return child
     }
     kit.otherSpawns.push({ file, args, opts })
     const child = new FakeChild(kit, file, args)
     const code = options.onSpawn ? options.onSpawn(file, args, opts) : 0
-    child.finish(code ?? 0)
+    if (code && typeof code === "object") setImmediate(() => {
+      child.stdout.emit("data", Buffer.from(code.stdout || ""))
+      child.finish(code.code ?? 0)
+    })
+    else child.finish(code ?? 0)
     return child
   }
   const spawnSync = (file, args = [], opts = {}) => {
@@ -515,7 +531,9 @@ export async function createBridgeKit(options = {}) {
     "node:net": {
       createServer(handler) {
         kit.controlHandler = handler
-        return fakeServer
+        const port = 45999 + kit.controlHandlers.size
+        kit.controlHandlers.set(port, handler)
+        return { ...fakeServer, address: () => ({ address: "127.0.0.1", family: "IPv4", port }) }
       },
     },
     "node:os": { homedir: () => home, tmpdir: () => tmp },
@@ -552,6 +570,7 @@ export async function createBridgeKit(options = {}) {
     else if (key === "./login.mjs") module = sourceModule(LOGIN_FILE, "", loginUrl)
     else if (key === "./re2-pattern.mjs") module = sourceModule(RE2_PATTERN_FILE, "", re2Url)
     else if (key === "./step-usage.mjs") module = sourceModule(STEP_USAGE_FILE, "", stepUsageUrl)
+    else if (key === "./accounts.mjs") module = sourceModule(path.join(REPO_DIR, "accounts.mjs"), "", new URL("./accounts.mjs", indexUrl).href)
     else if (key === "./signin.mjs") module = sourceModule(SIGNIN_FILE, "", signinUrl)
     else if (key === "./tool-schema.mjs") module = sourceModule(TOOL_SCHEMA_FILE, "", toolSchemaUrl)
     else if (key.startsWith("node:")) module = builtinModule(key, overrides[key])
@@ -592,6 +611,7 @@ export async function createBridgeKit(options = {}) {
     for (const proc of [...(ns.__agyTestAllProcs || [])]) {
       await proc.stop().catch(() => {})
     }
+    for (const runtime of ns.__agyTestRuntimes.values()) runtime.dispose()
     await kit.finishChildren()
     fs.rmSync(tmp, { recursive: true, force: true })
   }

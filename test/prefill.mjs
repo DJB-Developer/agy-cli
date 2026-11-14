@@ -11,9 +11,9 @@ import { after, test } from "node:test"
 // AGY_BRIDGE_PREFILL=0 stock-behavior toggle.
 const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-prefill-tail-test-"))
 const entry = new URL("../index.mjs", import.meta.url)
-let source = fs.readFileSync(entry, "utf8")
+let source = fs.readFileSync(entry, "utf8").replace("// TEST_RUNTIME_SEAMS", "trailingMessages, prefillRun, assistantTextOf, validateBody, renderTurnMessagesParts, renderInitialPromptParts,")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { trailingMessages, prefillRun, assistantTextOf, validateBody, renderTurnMessagesParts, renderInitialPromptParts };\n")
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nconst { trailingMessages, prefillRun, assistantTextOf, validateBody, renderTurnMessagesParts, renderInitialPromptParts } = defaultRuntime;\nexport { trailingMessages, prefillRun, assistantTextOf, validateBody, renderTurnMessagesParts, renderInitialPromptParts };\n")
 const { trailingMessages, prefillRun, assistantTextOf, validateBody, renderTurnMessagesParts, renderInitialPromptParts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 

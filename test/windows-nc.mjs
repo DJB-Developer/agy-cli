@@ -229,3 +229,19 @@ test("at exit a shim dir this host made is removed", async () => {
     await kit.dispose()
   }
 })
+
+test("a named account applies its profile to agy but never to the Bun shim compiler", async () => {
+  const kit = await windowsKit()
+  try {
+    const flow = await kit.plugin.auth.methods[1].authorize({ name: "work", refresh_token: "1//dummy-work" })
+    const saved = await flow.callback()
+    assert.equal(saved.type, "success", saved.error)
+    const loader = await kit.plugin.auth.loader(async () => ({ ...saved, type: "api" }))
+    const parsed = await readSse(await loader.fetch("agy://local/v1/messages", { method: "POST", body: JSON.stringify(body("named account")) }))
+    assert.equal(parsed.error, null)
+    assert.equal(parsed.stopReason, "end_turn")
+    assert.equal(buildsOf(kit).length, 1)
+    assert.ok(buildsOf(kit).every(s => !s.args.some(a => a.startsWith("--gemini_dir="))))
+    assert.ok(kit.acpSpawns.every(s => s.args.some(a => a.startsWith("--gemini_dir="))))
+  } finally { await kit.dispose() }
+})

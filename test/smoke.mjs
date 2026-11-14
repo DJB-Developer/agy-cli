@@ -551,7 +551,7 @@ process.env.AGY_PATH = wrapper
 
 const { default: pluginDefault } = await import("../index.mjs")
 const plugin = await pluginDefault.server({ client: null, directory: os.tmpdir() }, {})
-const loader = await plugin.auth.loader(async () => ({ key: "agy" }))
+const loader = await plugin.auth.loader(async () => ({ type: "api", key: "agy" }))
 let failures = 0
 let checks = 0
 
@@ -698,7 +698,7 @@ const model = "agy-cli/gemini-test"
 const legacyModel = "agy-cli/gemini-test-low"
 
 {
-  const usage = await plugin.auth.usage(async () => ({ key: "agy" }), {})
+  const usage = await plugin.auth.usage(async () => ({ type: "api", key: "agy" }), {})
   check("auth.usage exposes measured CLI quota", usage.windows?.[0]?.used === 40 && usage.windows[0].name === "Gemini · 7 days")
   check("auth.usage preserves explicit cadence and reset", usage.windows?.[0]?.span === 604800 && usage.windows[0].resetsAt === "2026-10-27T00:00:00.000Z")
   check("auth.usage is display-only and keeps bridge auth", usage.windows?.[0]?.aside === true && usage.signIn === "kept")
@@ -748,7 +748,7 @@ const legacyModel = "agy-cli/gemini-test-low"
   const before = logs().filter(event => event.type === "models").length
   const result = await plugin.auth.methods[0].authorize()
   const probes = logs().filter(event => event.type === "models").slice(before)
-  check("sign-in offers Google's browser flow and refresh-token import", plugin.auth.methods.length === 2 && plugin.auth.methods.every(method => method.type === "oauth"))
+  check("sign-in offers Google's browser flow and refresh-token import", plugin.auth.methods.length === 4 && plugin.auth.methods.every(method => method.type === "oauth"))
   check("signed in to agy already, the sign-in opens nothing", result.url === "" && result.method === "auto")
   check("signed in to agy already, the sign-in saves agy", (await result.callback())?.type === "success")
   check("authorize login probe disables auto update", probes.length === 1 && probes[0].update === "true")
@@ -1230,7 +1230,7 @@ let nativeConv
 
   const { default: imageRestartDefault } = await import("../index.mjs?image-restart")
   const imageRestart = await imageRestartDefault.server({}, {})
-  const imageLoader = await imageRestart.auth.loader(async () => ({ key: "agy" }))
+  const imageLoader = await imageRestart.auth.loader(async () => ({ type: "api", key: "agy" }))
   const resumed = await imageLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(nextTurn(followup, nextEvents, "recall the pictures")) })
   await readSSE(resumed)
   check("a restarted bridge resumes an image conversation", inits().at(-1).resumed && lastOf("user").convId === firstSession)
@@ -1648,7 +1648,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
   check("session state file is private", process.platform === "win32" ? windowsAclPrivate(bridgeStateFile) : (fs.statSync(bridgeStateFile).mode & 0o077) === 0)
   const { default: restartedDefault } = await import("../index.mjs?restart")
   const restarted = await restartedDefault.server({ client: null, directory: os.tmpdir() }, {})
-  const restartedLoader = await restarted.auth.loader(async () => ({ key: "agy" }))
+  const restartedLoader = await restarted.auth.loader(async () => ({ type: "api", key: "agy" }))
   const before = inits().length
   const response = await restartedLoader.fetch("agy://local/messages", {
     method: "POST",
@@ -1661,7 +1661,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
   check("the restart sends only the new message", lastOf("user").text === "MEMORY after restart" && textOf(events).includes("prompts so far 2"), textOf(events))
   const edited = { ...first, messages: [{ role: "user", content: "MEMORY edited history" }, ...nextTurn(first, firstEvents, "x").messages.slice(1)] }
   const { default: againDefault } = await import("../index.mjs?restart-2")
-  const again = await (await againDefault.server({ client: null, directory: os.tmpdir() }, {})).auth.loader(async () => ({ key: "agy" }))
+  const again = await (await againDefault.server({ client: null, directory: os.tmpdir() }, {})).auth.loader(async () => ({ type: "api", key: "agy" }))
   await readSSE(await again.fetch("agy://local/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(edited) }))
   check("a changed history is not resumed", inits().at(-1).resumed === false)
 
@@ -1729,7 +1729,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
     r3.status === 200 && stopOf(e3) === "end_turn" && lastOf("user").convId === init1.convId && lastOf("user").text.includes("bg-42"))
 
   const { default: restartedAtisDefault } = await import("../index.mjs?restart-atis")
-  const restartedAtis = await (await restartedAtisDefault.server({ client: null, directory: os.tmpdir() }, {})).auth.loader(async () => ({ key: "agy" }))
+  const restartedAtis = await (await restartedAtisDefault.server({ client: null, directory: os.tmpdir() }, {})).auth.loader(async () => ({ type: "api", key: "agy" }))
   const turn4 = {
     ...turn3,
     messages: [
@@ -2752,7 +2752,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
   process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = "100"
   const { default: idleDefault } = await import("../index.mjs?self-poll-idle")
   process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = savedToolTimeout
-  const idleLoader = await (await idleDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  const idleLoader = await (await idleDefault.server({}, {})).auth.loader(async () => ({ type: "api", key: "agy" }))
   const events = []
   const write = process.stderr.write
   const now = Date.now

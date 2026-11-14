@@ -95,3 +95,10 @@ A1–A16、U1–U6 逐项并入。两边都有、且 `acb8d84` 写法更新的�
 3. **内部状态不变**：会话停车文件仍在 `magpie-agy-bridge/sessions.json`，已有会话可以续接。
 4. **切换顺序**：先安装新包，确认新 provider 能返回 200，再逐个改模型名；旧包最后移除。
    本仓内不执行切换操作。
+## 8. 独立仓库多账号实现（0.2.0）
+
+多账号的 `--gemini_dir` 目录与 `WSL_INTEROP` 文件凭据模式参考了
+[DylanLIiii/opencode-antigravity-bridge](https://github.com/DylanLIiii/opencode-antigravity-bridge)
+的 MIT 实现；Magpie 的按账号 `getAuth` / `context.auth` 接入方式也参考了
+[antigravity 插件](https://github.com/magpie-community/plugins/tree/main/packages/antigravity)。
+本仓采用每个账号独立运行时隔离进程、工具调用、模型缓存和会话状态，保留原默认账号。

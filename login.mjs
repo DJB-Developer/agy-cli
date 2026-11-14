@@ -18,7 +18,7 @@ export const LOGIN_FINISH_MS = 60_000
 
 const SIGN_IN_LINK = /https:\/\/accounts\.google\.com\/[^\s"'<>]+/
 
-let pending = null
+const pending = new Map()
 
 // lastLine is the last thing agy said, for an error.
 function lastLine(text) {
@@ -32,24 +32,25 @@ function stop(child) {
 }
 
 // startLogin starts agy's sign-in and resolves with its link, or with why
-// it couldn't start. A second sign-in ends the first's agy.
-export function startLogin(agy, { waitMs = LOGIN_WAIT_MS, startMs = LOGIN_START_MS } = {}) {
-  if (pending) {
-    stop(pending)
-    pending = null
-  }
+// it couldn't start. A second sign-in for the same profile ends the first's
+// agy; different profiles may sign in concurrently.
+export function startLogin(agy, { waitMs = LOGIN_WAIT_MS, startMs = LOGIN_START_MS, args = [], env, onCancel = () => {} } = {}) {
+  const key = args.join("\0")
+  if (pending.has(key)) stop(pending.get(key))
   return new Promise((resolve) => {
     let child
     try {
-      child = spawnAgy(agy, ["acp", "--login"], { cwd: os.tmpdir(), stdio: ["pipe", "pipe", "pipe"] })
+      child = spawnAgy(agy, ["acp", "--login", ...args], { cwd: os.tmpdir(), stdio: ["pipe", "pipe", "pipe"], ...(env ? { env } : {}) })
     } catch (err) {
+      onCancel()
       resolve({ error: `couldn't run agy: ${err.message}` })
       return
     }
-    pending = child
+    pending.set(key, child)
     let out = ""
     let settled = false
     let exited = null
+    let finishing = false
     const waiters = []
     const settle = (value) => {
       if (settled) return
@@ -66,7 +67,7 @@ export function startLogin(agy, { waitMs = LOGIN_WAIT_MS, startMs = LOGIN_START_
     const read = (data) => {
       out += data
       const link = SIGN_IN_LINK.exec(out)?.[0]
-      if (link) settle({ url: link, finish })
+      if (link) settle({ url: link, finish, cancel: () => stop(child) })
     }
     child.stdout?.setEncoding("utf8")
     child.stderr?.setEncoding("utf8")
@@ -74,13 +75,17 @@ export function startLogin(agy, { waitMs = LOGIN_WAIT_MS, startMs = LOGIN_START_
     child.stderr?.on("data", read)
     child.stdin?.on("error", () => {})
     child.on("error", (err) => {
+      clearTimeout(waitTimer)
+      if (pending.get(key) === child) pending.delete(key)
+      onCancel()
       exited = { code: null, err }
       for (const w of waiters.splice(0)) w()
       settle({ error: `couldn't run agy: ${err.message}` })
     })
     child.on("close", (code) => {
       clearTimeout(waitTimer)
-      if (pending === child) pending = null
+      if (pending.get(key) === child) pending.delete(key)
+      if (code !== 0 || !finishing) onCancel()
       exited = exited ?? { code }
       for (const w of waiters.splice(0)) w()
       // agy before 1.5 has no --login: it prints acp's usage and exits
@@ -93,6 +98,10 @@ export function startLogin(agy, { waitMs = LOGIN_WAIT_MS, startMs = LOGIN_START_
     // finish hands agy the code (or the page's address) and waits for it
     // to trade it. It says why when the sign-in didn't take.
     async function finish(code, { signal, finishMs = LOGIN_FINISH_MS } = {}) {
+      if (signal?.aborted) {
+        stop(child)
+        return { error: "sign-in cancelled" }
+      }
       const value = String(code ?? "").trim()
       if (!value || /[\r\n]/.test(value)) {
         stop(child)
@@ -101,6 +110,7 @@ export function startLogin(agy, { waitMs = LOGIN_WAIT_MS, startMs = LOGIN_START_
       if (exited) {
         return { error: "this sign-in is over (its link waits 15 minutes); start it again" }
       }
+      finishing = true
       const before = out.length
       const done = new Promise((resolve) => waiters.push(resolve))
       let timer
@@ -118,7 +128,7 @@ export function startLogin(agy, { waitMs = LOGIN_WAIT_MS, startMs = LOGIN_START_
         clearTimeout(timer)
         signal?.removeEventListener?.("abort", onAbort)
       }
-      if (exited.code === 0) return { ok: true, said: lastLine(out.slice(before)) }
+      if (exited?.code === 0) return { ok: true, said: lastLine(out.slice(before)) }
       const said = lastLine(out.slice(before)) || lastLine(out)
       if (/invalid_grant/.test(said)) {
         return { error: `Google turned the code away: it was mistyped, used already, or from another sign-in page. Start the sign-in again. (${said})` }

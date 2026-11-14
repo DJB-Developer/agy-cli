@@ -226,6 +226,7 @@ function supportedVersion(output) {
 
 export async function fetchUsage(agy, {
   env = process.env,
+  geminiDir,
   timeoutMs = env.AGY_BRIDGE_USAGE_TIMEOUT_MS,
   maxOutputBytes = MAX_OUTPUT_BYTES,
   signal,
@@ -267,7 +268,7 @@ export async function fetchUsage(agy, {
     })
     if (version.code !== 0) throw commandFailure(version.stderr)
     if (!supportedVersion(version.stdout)) throw new UsageError("agy usage reports require a verified agy version 1.1.11 or later. Update the CLI.")
-    const result = await run(agy, ["-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`], options)
+    const result = await run(agy, [...(geminiDir ? [`--gemini_dir=${geminiDir}`] : []), "-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`], options)
     if (result.code !== 0) throw commandFailure(result.stderr + "\n" + result.stdout)
     return parseUsageReport(result.stdout)
   } finally {

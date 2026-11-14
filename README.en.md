@@ -1,7 +1,7 @@
 # agy-cli
 
 This standalone version of [magpie-community/plugins agy-cli](https://github.com/magpie-community/plugins/tree/main/packages/agy-cli)
-adds **account import using a refresh_token**, accepting a raw `1//...` token or account JSON.
+adds **isolated multiple accounts and refresh_token import**, accepting a raw `1//...` token or account JSON.
 Upstream MIT notices and attribution are retained. These changes have not been published to npm.
 
 Turn the local Antigravity CLI (`agy`) into a model provider inside Magpie. Once
@@ -143,13 +143,13 @@ turn); the models a client gets remain agy's decision.
 
 ## Install
 
-Install this repository's version, including refresh-token import and headless Linux / Docker support:
+Install this repository's version, including multiple accounts, refresh-token import and Linux / Docker support:
 
 ```sh
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin on Magpie's Plugins page, then import again.
+If already installed, update this GitHub plugin to 0.2.0 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
 The marketplace and npm commands below install the upstream community version, without this repository's changes.
 
 From the Magpie community plugins: find "Antigravity (local agy CLI)" on
@@ -167,59 +167,58 @@ After installing, sign in from Magpie; no terminal needed.
 
 ## Usage
 
-1. Open Magpie's Providers page, find `agy-cli`, and click Sign in. If agy is
-   signed in already, that's all. If not, the plugin runs agy's own Google
-   sign-in (`agy acp --login`): Magpie opens the sign-in page, and you paste the
-   code the page shows (or the page's whole address) back into Magpie. This
-   works with Magpie on a server or in Docker too. The sign-in waits 15
-   minutes. Google credentials stay in agy's system keyring or its headless Linux credential file; the plugin
-   counts the sign-in as done only once
-   `agy models` lists the account's models.
-2. Refer to models as `agy-cli/<model>`. When agy lists separate model IDs
-   for different thinking levels, they are grouped here as variants of one model,
-   and each request is mapped back to the matching agy ID.
-3. Pick the model in your client as usual.
+1. Open Sign in for `agy-cli` on Magpie's Providers page.
+2. Choose **Add an account (refresh token)**, enter a name such as `personal` or
+   `work`, and paste a raw `1//...` token or JSON containing `refresh_token`
+   (also accepts `token.refresh_token`). The token must match agy's OAuth client.
+3. Repeat with another name to add another account. Each gets a separate Magpie
+   account record; Magpie controls enablement, priority and request scheduling.
+4. Keep using `agy-cli/<model>`; model IDs do not need account prefixes.
 
-### Import with a refresh token
+**Add an account with Google** creates an independent profile through browser
+sign-in instead. Enter a new name, open the link, then paste the authorization
+code back into Magpie. Links wait 15 minutes.
 
-Choose **Import an account (refresh token)** under Sign in and paste one
-`refresh_token`, or JSON shaped as `{"refresh_token":"…"}` or
-`{"token":{"refresh_token":"…"}}`. No browser sign-in is needed. The token
-must be compatible with agy's OAuth client.
+### Account isolation and upgrades
 
-The plugin writes the credential to agy's own storage, then lets agy refresh
-it and verify its model list. If verification fails, it attempts to restore the
-previous sign-in; a failed restore explicitly asks you to sign in again. Magpie
-still stores only the `agy` marker. This **replaces the local CLI's current
-account**, rather than adding an independent account to a pool. Finish active
-requests first. On success, old processes and saved session-resume records are
-cleared so subsequent requests use the new account.
-
-- macOS uses Keychain; Windows uses Credential Manager.
-- Headless Linux / Docker (neither `DBUS_SESSION_BUS_ADDRESS` nor `XDG_RUNTIME_DIR`
-  set) automatically uses agy's native file at
-  `~/.gemini/antigravity-cli/antigravity-oauth-token`, written atomically with
-  owner-only `0600` permissions. No `secret-tool` or keyring daemon is needed.
-- Desktop Linux uses `secret-tool` (usually in `libsecret-tools`) and an unlocked
-  Secret Service `login` collection. An unreadable desktop keyring never silently
-  switches to a different file account.
-- Remove Gemini/Google API key, ADC or Vertex environment authentication before
-  importing a refresh token.
+- The existing `agy` default account from 0.1.43 keeps working after upgrading.
+  **Use the existing CLI account (legacy default)** registers that login again.
+- Each named account owns its CLI credentials, process pool, tool calls, resumable
+  sessions, model catalog and usage reader. Magpie stores an `agy:<name>` reference;
+  agy refreshes the actual token.
+- Names use 1–64 letters, digits, underscores or hyphens and are normalized to
+  lowercase. Reserved names such as `default` are rejected. Existing names cannot
+  be overwritten. Failed imports remove only the newly created profile.
+- Removing a Magpie account record does not delete its local credentials.
+  **Use a saved named account** registers the profile again. To replace a token,
+  add it under a new name, verify it, then disable the old account.
+- Profiles live under `$XDG_CONFIG_HOME/magpie-agy-cli/accounts/<name>`, or
+  `~/.config/magpie-agy-cli/accounts/<name>` when XDG is unset. Override the root
+  with `AGY_BRIDGE_ACCOUNTS_DIR`. Credentials are mode `0600`; newly created account
+  directories are mode `0700`.
+- Named accounts use `--gemini_dir` and native file storage without a keyring.
+  Their subprocesses do not inherit Gemini/Google API key, ADC or Vertex auth.
+  The default account retains its original storage and environment behavior.
+- Missing or unreadable selected credentials fail closed, without using the
+  default account.
 
 #### 1Panel / official Magpie Docker image
 
-The [official Magpie image](https://github.com/yetone/magpie/blob/main/Dockerfile) sets `HOME=/config/home`. Keep the existing
-`magpie-config:/config` volume: credentials persist at
-`/config/home/.gemini/antigravity-cli/antigravity-oauth-token` across container
-recreation. Update this plugin and import again; installing D-Bus or GNOME Keyring
-is unnecessary, and the token does not belong in Compose.
-The native file path was verified with agy 1.5.9 on Linux in a container without
-network access: agy read the file and attempted a token refresh. No real account
-or model call was used for this check.
+Keep the existing `magpie-config:/config` volume; **no Compose change is needed**.
+The [official image](https://github.com/yetone/magpie/blob/main/Dockerfile) sets
+`XDG_CONFIG_HOME=/config`, so new profiles persist under
+`/config/magpie-agy-cli/accounts/<name>/`. The legacy default remains at
+`/config/home/.gemini/antigravity-cli/antigravity-oauth-token`.
+No D-Bus or GNOME Keyring installation is needed. Do not put tokens in Compose.
+
+Verified with native agy 1.5.9 in a non-root Linux container without network access:
+`models`, ACP and `/usage` read the selected profile for both accounts rather than
+using the default credential. This used dummy tokens to verify storage isolation,
+not real model calls.
 
 ## Concurrency
 
-- The plugin's own pool is capped by `AGY_BRIDGE_MAX_PROCS`, which defaults to 16
+- Each account's pool is capped by `AGY_BRIDGE_MAX_PROCS`, which defaults to 16
   agy processes.
 - Magpie's Providers page has its own Concurrency field that accepts 0 to 1000,
   where 0 means no limit. A value set there overrides the default of 16 that the
@@ -261,7 +260,8 @@ usage reads wait 10 minutes before the next try, doubling up to 6 hours.
 | Name | Default value | What it does |
 |---|---|---|
 | `AGY_PATH` | PATH lookup | Path to the agy executable |
-| `AGY_BRIDGE_MAX_PROCS` | 16 | Maximum number of agy processes in the pool |
+| `AGY_BRIDGE_ACCOUNTS_DIR` | `magpie-agy-cli/accounts` under the XDG config directory | Root for named profiles and state |
+| `AGY_BRIDGE_MAX_PROCS` | 16 | Maximum agy processes per account |
 | `AGY_BRIDGE_THINKING` | on | Set to `0` to stop forwarding thought summaries |
 | `AGY_BRIDGE_EFFORT` | unset | Force a thinking level: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` |
 | `AGY_BRIDGE_MINIMAL_AGENT` | off | Set to `1` to drop agy's own prompt components; see "Minimal agent" below |

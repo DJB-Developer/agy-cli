@@ -9,13 +9,13 @@ import { baseBody, createBridgeKit, readSse } from "./testkit.mjs"
 // Expose private seams from an isolated copy, without adding production exports.
 const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-convkey-test-"))
 const entry = new URL("../index.mjs", import.meta.url)
-let source = fs.readFileSync(entry, "utf8")
+let source = fs.readFileSync(entry, "utf8").replace("// TEST_RUNTIME_SEAMS", "conversationKey, stripVolatileOpening, stripVolatileSystem, isContinuedOpening, openingTextOf, sameInstructions, historyKey, takeParked, park, instructionsIdentity,")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
 process.env.AGY_BRIDGE_STATE_FILE = path.join(workspace, "sessions.json")
 process.env.HOME = workspace
 fs.writeFileSync(
   path.join(workspace, "bridge.mjs"),
-  source + "\nexport { conversationKey, stripVolatileOpening, stripVolatileSystem, isContinuedOpening, openingTextOf, sameInstructions, historyKey, takeParked, park, instructionsIdentity };\n",
+  source + "\nconst { conversationKey, stripVolatileOpening, stripVolatileSystem, isContinuedOpening, openingTextOf, sameInstructions, historyKey, takeParked, park, instructionsIdentity } = defaultRuntime;\nexport { conversationKey, stripVolatileOpening, stripVolatileSystem, isContinuedOpening, openingTextOf, sameInstructions, historyKey, takeParked, park, instructionsIdentity };\n",
 )
 const {
   conversationKey,

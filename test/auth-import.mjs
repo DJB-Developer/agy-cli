@@ -2,102 +2,278 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import fs from "node:fs"
 import path from "node:path"
-import { baseBody, createBridgeKit, readSse } from "./testkit.mjs"
+import { baseBody, continueWithToolResults, createBridgeKit, readSse, MESSAGES_URL, modelsOutput } from "./testkit.mjs"
 
-async function withKeyring(fn) {
-  let raw = null
-  const writes = []
-  const kit = await createBridgeKit({
-    platform: "darwin",
-    storedSignIn: "missing",
-    onExecFile: async (file, args, input) => {
-      assert.equal(file, "/usr/bin/security")
-      if (args[0] === "-i") {
-        writes.push(input)
-        raw = input.match(/ -w (\S+)\n$/)[1]
-        return { code: 0 }
-      }
-      if (args[0] === "delete-generic-password") { raw = null; return { code: 0 } }
-      assert.equal(args[0], "find-generic-password")
-      return { code: raw === null ? 44 : 0, stdout: raw ?? "" }
-    },
-  })
-  try { await fn(kit, { writes, get raw() { return raw } }) } finally { await kit.dispose() }
+const profileOf = args => args.find(arg => arg.startsWith("--gemini_dir="))?.slice("--gemini_dir=".length)
+const nameOf = args => path.basename(profileOf(args) || "default")
+const rootOf = kit => path.join(kit.home, ".config", "magpie-agy-cli", "accounts")
+const fileOf = (kit, name) => path.join(rootOf(kit), name, "antigravity-cli", "antigravity-oauth-token")
+const authOf = result => ({ ...result, type: "api" })
+async function add(kit, name, token = `1//test-${name}`) {
+  const started = await kit.plugin.auth.methods[1].authorize({ name, refresh_token: token })
+  assert.equal(started.method, "auto", started.error)
+  return started.callback()
+}
+async function client(kit, auth) {
+  const loaded = await kit.plugin.auth.loader(typeof auth === "function" ? auth : async () => auth)
+  return body => loaded.fetch(MESSAGES_URL, { method: "POST", body: JSON.stringify(body) })
+}
+async function withKit(options, fn) {
+  const kit = await createBridgeKit(options)
+  try { await fn(kit) } finally { await kit.dispose() }
 }
 
-test("import auth method verifies with agy, returns only its marker, and retires old sessions", async () => {
-  await withKeyring(async (kit, store) => {
+for (const platform of ["linux", "darwin", "win32"]) {
+  test(`${platform}: two token imports keep separate private credentials and never access the keyring`, async () => {
+    await withKit({ platform, onExecFile: () => assert.fail("named profiles must never access the keyring") }, async kit => {
+      assert.equal(kit.plugin.auth.single, false)
+      const [a, b] = await Promise.all([add(kit, "personal"), add(kit, "work", '{"token":{"refresh_token":"1//test-work"}}')])
+      assert.deepEqual(a, { type: "success", key: "agy:personal", metadata: { email: "personal" } })
+      assert.equal(b.key, "agy:work")
+      assert.equal(JSON.parse(fs.readFileSync(fileOf(kit, "personal"))).token.refresh_token, "1//test-personal")
+      assert.equal(JSON.parse(fs.readFileSync(fileOf(kit, "work"))).token.refresh_token, "1//test-work")
+      assert.equal(fs.statSync(fileOf(kit, "work")).mode & 0o777, 0o600)
+      assert.equal(fs.statSync(path.dirname(fileOf(kit, "work"))).mode & 0o777, 0o700)
+      assert.equal(kit.modelsSpawns.length, 2)
+      assert.ok(kit.modelsSpawns.every(s => s.args[0].startsWith("--gemini_dir=") && s.args[1] === "models"))
+      assert.deepEqual(new Set(kit.modelsSpawns.map(s => nameOf(s.args))), new Set(["personal", "work"]))
+      assert.ok(kit.modelsSpawns.every(s => s.env.WSL_INTEROP === "1"))
+      assert.equal(kit.acpSpawns.length, 0, "import validation must not leave background probes")
+      assert.equal(kit.execFiles.length, 0)
+    })
+  })
+}
+
+test("failed and duplicate imports leave existing accounts and live requests untouched", async () => {
+  await withKit({}, async kit => {
+    assert.equal((await add(kit, "existing")).type, "success")
+    const previous = fs.readFileSync(fileOf(kit, "existing"), "utf8")
+    const active = { turn: { finalized: false } }
+    kit.module.__agyTestAllProcs.add(active)
+    try {
+      assert.equal((await add(kit, "other")).type, "success", "adding an account is safe while the default account is busy")
+      assert.match((await add(kit, "existing", "replacement-token")).error, /already exists/)
+      kit.modelsBehavior = { code: 1, stdout: "", stderr: "must-not-leak-the-token" }
+      const failed = await add(kit, "broken", "must-not-leak-the-token")
+      assert.equal(failed.type, "failed")
+      assert.doesNotMatch(failed.error, /must-not-leak/)
+      assert.equal(fs.existsSync(path.join(rootOf(kit), "broken")), false)
+      assert.equal(fs.readFileSync(fileOf(kit, "existing"), "utf8"), previous)
+    } finally { kit.module.__agyTestAllProcs.delete(active) }
+  })
+})
+
+test("invalid names/tokens fail before IO, and a callback cannot import twice", async () => {
+  await withKit({}, async kit => {
     const method = kit.plugin.auth.methods[1]
-    assert.equal(method.type, "oauth")
-    assert.equal(method.prompts[0].key, "refresh_token")
-    const initial = await method.authorize({ refresh_token: '{"token":{"refresh_token":"first-account"}}' })
-    assert.equal(initial.url, "")
-    assert.equal(initial.method, "auto")
-    const importing = initial.callback()
-    assert.equal((await kit.request(baseBody())).status, 503)
-    assert.match((await kit.plugin.auth.usage()).error, /in progress/)
-    assert.match((await initial.callback()).error, /already in progress/)
-    assert.deepEqual(await importing, { type: "success", key: "agy" })
+    for (const name of ["", "../outside", "a/b", "default", "CON", "a.b"]) {
+      assert.equal((await method.authorize({ name, refresh_token: "1//test" })).type, "failed")
+    }
+    assert.equal((await method.authorize({ name: "test", refresh_token: "{}" })).type, "failed")
+    assert.equal(kit.modelsSpawns.length, 0)
+    const pending = await method.authorize({ name: "test", refresh_token: "1//test" })
+    const [first, again] = await Promise.all([pending.callback(), pending.callback()])
+    assert.deepEqual(first, again)
     assert.equal(kit.modelsSpawns.length, 1)
-    assert.ok(kit.acpSpawns.every(spawn => !spawn.args.includes("--login")))
+    const duplicate = await Promise.all([add(kit, "race"), add(kit, "race")])
+    assert.equal(duplicate.filter(r => r.type === "success").length, 1)
+  })
+})
+
+test("identical concurrent conversations and tool continuations stay in their account's process", async () => {
+  await withKit({}, async kit => {
+    const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
+    const [requestA, requestB] = await Promise.all([client(kit, authOf(a)), client(kit, authOf(b))])
+    const replies = new Map()
     kit.defaultPrompt = async agent => {
-      await agent.text("ok")
+      const name = nameOf(agent.args)
+      const result = await agent.tool("Read", { path: `/${name}` })
+      replies.set(name, result.result.content[0].text)
+      await agent.text(`${name}:${agent.sessionId}`)
       return { stopReason: "end_turn" }
     }
-    assert.equal((await readSse(await kit.request(baseBody()))).error, null)
-    const oldProcesses = [...kit.module.__agyTestAllProcs]
-    assert.ok(oldProcesses.length > 0)
-    const second = await method.authorize({ refresh_token: "second-account" })
-    assert.deepEqual(await second.callback(), { type: "success", key: "agy" })
-    assert.ok(oldProcesses.every(proc => proc.dead))
-    const state = JSON.parse(fs.readFileSync(path.join(kit.env.XDG_STATE_HOME, "magpie-agy-bridge", "sessions.json"), "utf8"))
-    assert.deepEqual(state.entries, [])
-    assert.equal(store.writes.length, 2)
+    const body = baseBody()
+    const [firstA, firstB] = await Promise.all([requestA(body).then(readSse), requestB(body).then(readSse)])
+    assert.equal(firstA.stopReason, "tool_use")
+    assert.equal(firstB.stopReason, "tool_use")
+    const [doneA, doneB] = await Promise.all([
+      requestA(continueWithToolResults(body, firstA, () => "result-a")).then(readSse),
+      requestB(continueWithToolResults(body, firstB, () => "result-b")).then(readSse),
+    ])
+    assert.equal(doneA.error, null)
+    assert.equal(doneB.error, null)
+    assert.equal(replies.get("a"), "result-a")
+    assert.equal(replies.get("b"), "result-b")
+    assert.match(doneA.content.find(b => b.type === "text").text, /^a:/)
+    assert.match(doneB.content.find(b => b.type === "text").text, /^b:/)
+    const sessions = ["a", "b"].map(name => JSON.parse(fs.readFileSync(path.join(rootOf(kit), name, "bridge-state", "sessions.json"))))
+    assert.notDeepEqual(sessions[0].entries, sessions[1].entries)
+    const procs = [...kit.module.__agyTestRuntimes.values()].flatMap(r => [...r.allProcs])
+    assert.equal(procs.length, 2)
+    assert.notEqual(procs[0].sessionId, procs[1].sessionId)
+    assert.notEqual(procs[0].child.args.find(a => a.startsWith("--gemini_dir=")), procs[1].child.args.find(a => a.startsWith("--gemini_dir=")))
   })
 })
 
-test("import failure restores sign-in and never reports success from a failed model listing", async () => {
-  await withKeyring(async (kit, store) => {
-    kit.modelsBehavior = { stdout: "", stderr: "first-account", code: 1 }
-    const started = await kit.plugin.auth.methods[1].authorize({ refresh_token: "first-account" })
-    const result = await started.callback()
+test("models and usage are scoped to host-selected auth and conflicting API environment cannot override it", async () => {
+  await withKit({ env: { GEMINI_API_KEY: "global-key", AGY_ADC_AUTH: "1", WSL_INTEROP: "real-wsl" },
+    onSpawn: (_file, args, opts) => {
+      if (args.includes("--version")) return { stdout: "1.5.9\n" }
+      if (!args.includes("/usage")) return 0
+      assert.equal(opts.env.GEMINI_API_KEY, "")
+      assert.equal(opts.env.AGY_ADC_AUTH, "")
+      return { stdout: JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups: [{ name: "Quota", buckets: [
+        { id: "weekly", remainingFraction: nameOf(args) === "a" ? 0.8 : 0.3 },
+      ] }] } } }) }
+    },
+  }, async kit => {
+    const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
+    kit.modelsBehavior = ({ args }) => ({ stdout: modelsOutput([[`gemini-account-${nameOf(args)}-high`, `Account ${nameOf(args)}`]]) })
+    kit.offeredModels = args => [[`gemini-account-${nameOf(args)}-high`, `Account ${nameOf(args)}`]]
+    const [modelsA, modelsB] = await Promise.all([
+      kit.plugin.provider.models({}, { auth: authOf(a) }), kit.plugin.provider.models({}, { auth: authOf(b) }),
+    ])
+    assert.ok(modelsA["gemini-account-a-high"])
+    assert.equal(modelsA["gemini-account-b-high"], undefined)
+    assert.ok(modelsB["gemini-account-b-high"])
+    const [usageA, usageB] = await Promise.all([
+      kit.plugin.auth.usage(async () => authOf(a)), kit.plugin.auth.usage(async () => authOf(b)),
+    ])
+    assert.equal(usageA.windows[0]?.used, 20, usageA.error)
+    assert.equal(usageB.windows[0]?.used, 70, usageB.error)
+    assert.ok(kit.modelsSpawns.every(s => s.env.WSL_INTEROP === "real-wsl" && !s.env.GEMINI_API_KEY))
+  })
+})
+
+test("missing/invalid selected accounts fail closed, and getAuth is re-read for each request", async () => {
+  await withKit({}, async kit => {
+    const a = await add(kit, "a")
+    let auth = authOf(a)
+    const request = await client(kit, () => auth)
+    kit.defaultPrompt = async agent => { await agent.text(nameOf(agent.args)); return { stopReason: "end_turn" } }
+    assert.equal((await request(baseBody())).status, 200)
+    const count = kit.acpSpawns.length
+    fs.unlinkSync(fileOf(kit, "a"))
+    assert.equal((await request(baseBody())).status, 401)
+    assert.equal(kit.acpSpawns.length, count)
+    assert.equal((await kit.plugin.auth.usage(async () => auth)).signIn, "expired")
+    await assert.rejects(kit.plugin.provider.models({}, { auth }), /missing|unreadable/)
+    auth = { type: "api", key: "agy:%2e%2e%2foutside" }
+    assert.equal((await request(baseBody())).status, 401)
+    auth = null
+    assert.equal((await request(baseBody())).status, 401)
+    auth = { type: "api", key: "agy" }
+    const legacy = await readSse(await request(baseBody()))
+    assert.equal(legacy.error, null)
+    assert.equal(legacy.content[0].text, "default")
+    assert.ok(kit.acpSpawns.some(s => !profileOf(s.args)))
+  })
+})
+
+test("named Google sign-in saves its own profile and saved-account registration needs no new login", async () => {
+  await withKit({ onLogin: ({ child, args, opts }) => {
+    assert.equal(opts.env.WSL_INTEROP, "1")
+    setImmediate(() => child.stdout.emit("data", "https://accounts.google.com/o/oauth2/auth?test=1\n"))
+    child.onStdin = code => {
+      assert.equal(code, "test-code\n")
+      const file = path.join(profileOf(args), "antigravity-cli", "antigravity-oauth-token")
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      fs.writeFileSync(file, JSON.stringify({ token: { refresh_token: "1//browser-test" } }))
+      child.finish(0)
+    }
+  } }, async kit => {
+    const flow = await kit.plugin.auth.methods[2].authorize({ name: "browser" })
+    assert.match(flow.url, /^https:\/\/accounts.google.com/)
+    const result = await flow.callback("test-code")
+    assert.equal(result.key, "agy:browser", result.error)
+    const saved = await kit.plugin.auth.methods[3].authorize({ name: "browser" })
+    assert.deepEqual(await saved.callback(), result)
+    assert.equal(kit.acpSpawns.filter(s => s.args.includes("--login")).length, 1)
+  })
+})
+
+test("another account cannot consume a live tool result, even with the original call ID and history", async () => {
+  await withKit({}, async kit => {
+    const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
+    const requestA = await client(kit, authOf(a))
+    const requestB = await client(kit, authOf(b))
+    let replyA
+    kit.defaultPrompt = async agent => {
+      if (nameOf(agent.args) === "a") replyA = await agent.tool("Read", { path: "/a" })
+      await agent.text(nameOf(agent.args))
+      return { stopReason: "end_turn" }
+    }
+    const body = baseBody()
+    const first = await readSse(await requestA(body))
+    const next = continueWithToolResults(body, first, () => "private-result")
+    const replayB = await readSse(await requestB(next))
+    assert.equal(replayB.error, null)
+    assert.equal(replayB.content[0].text, "b")
+    assert.equal(replyA, undefined, "B must not deliver a result to A's MCP socket")
+    const doneA = await readSse(await requestA(next))
+    assert.equal(doneA.error, null)
+    assert.equal(replyA.result.content[0].text, "private-result")
+  })
+})
+
+test("a restarted host resumes only the selected profile's saved session", async () => {
+  await withKit({ sessionResume: true }, async kit => {
+    const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
+    kit.defaultPrompt = async agent => { await agent.text("same-answer"); return { stopReason: "end_turn" } }
+    const body = baseBody({ tools: [] })
+    const requestA = await client(kit, authOf(a)), requestB = await client(kit, authOf(b))
+    const [firstA, firstB] = await Promise.all([requestA(body).then(readSse), requestB(body).then(readSse)])
+    const saved = Object.fromEntries(["a", "b"].map(name => [name,
+      JSON.parse(fs.readFileSync(path.join(rootOf(kit), name, "bridge-state", "sessions.json"))).entries[0].sessionId,
+    ]))
+    assert.notEqual(saved.a, saved.b)
+    await withKit({ sessionResume: true, env: { AGY_BRIDGE_ACCOUNTS_DIR: rootOf(kit), AGY_PATH: kit.agyPath } }, async restarted => {
+      restarted.defaultPrompt = async agent => { await agent.text(agent.sessionId); return { stopReason: "end_turn" } }
+      for (const [result, first, name] of [[b, firstB, "b"], [a, firstA, "a"]]) {
+        const request = await client(restarted, authOf(result))
+        const continued = { ...body, messages: [...body.messages, { role: "assistant", content: first.content }, { role: "user", content: "continue" }] }
+        const done = await readSse(await request(continued))
+        assert.equal(done.error, null)
+        assert.equal(done.content[0].text, saved[name])
+      }
+      assert.deepEqual(restarted.acpLog.filter(e => e.method === "session/resume").map(e => e.params.sessionId), [saved.b, saved.a])
+    })
+  })
+})
+
+test("cancelling a named browser login stops only that profile and removes its unpublished credentials", async () => {
+  await withKit({ onLogin: ({ child }) => {
+    setImmediate(() => child.stdout.emit("data", "https://accounts.google.com/o/oauth2/auth?test=cancel\n"))
+  } }, async kit => {
+    const [first, second] = await Promise.all([
+      kit.plugin.auth.methods[2].authorize({ name: "first" }),
+      kit.plugin.auth.methods[2].authorize({ name: "second" }),
+    ])
+    assert.ok(first.url && second.url)
+    const controller = new AbortController()
+    controller.abort()
+    const result = await first.callback("unused-code", { signal: controller.signal })
     assert.equal(result.type, "failed")
-    assert.match(result.error, /previous sign-in was restored/)
-    assert.doesNotMatch(result.error, /first-account/)
-    assert.equal(store.raw, null)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(fs.existsSync(path.join(rootOf(kit), "first")), false)
+    assert.equal(fs.existsSync(path.join(rootOf(kit), "second")), true)
+    assert.equal([...kit.children].filter(c => c.args.includes("--login")).length, 1)
+    await second.callback("unused-code", { signal: controller.signal })
   })
 })
 
-test("invalid input does not run agy or touch the system keyring", async () => {
-  await withKeyring(async (kit, store) => {
-    assert.equal((await kit.plugin.auth.methods[1].authorize({ refresh_token: "{}" })).type, "failed")
-    assert.equal(kit.execFiles.length, 0)
-    assert.equal(kit.modelsSpawns.length, 0)
-    assert.equal(store.writes.length, 0)
+test("a late browser close cannot delete a new import after its error cleanup", async () => {
+  await withKit({ onLogin: ({ child }) => {
+    setImmediate(() => child.stdout.emit("data", "https://accounts.google.com/o/oauth2/auth?test=error\n"))
+  } }, async kit => {
+    const flow = await kit.plugin.auth.methods[2].authorize({ name: "retry" })
+    assert.ok(flow.url)
+    const old = [...kit.children].find(child => child.args.includes("--login"))
+    old.emit("error", new Error("test login failure"))
+    assert.equal(fs.existsSync(path.join(rootOf(kit), "retry")), false)
+    assert.equal((await add(kit, "retry")).type, "success")
+    old.finish(1)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(fs.existsSync(fileOf(kit, "retry")), true)
   })
-})
-
-test("an active request prevents account replacement", async () => {
-  await withKeyring(async (kit, store) => {
-    const proc = { turn: { finalized: false } }
-    kit.module.__agyTestAllProcs.add(proc)
-    try {
-      const started = await kit.plugin.auth.methods[1].authorize({ refresh_token: "next-account" })
-      assert.match((await started.callback()).error, /active requests/)
-      assert.equal(store.writes.length, 0)
-    } finally { kit.module.__agyTestAllProcs.delete(proc) }
-  })
-})
-
-test("headless Linux auth entry imports without executing a keyring command", async () => {
-  const kit = await createBridgeKit({ platform: "linux", env: { AGY_BRIDGE_STORED_SIGNIN: "" },
-    onExecFile: async () => assert.fail("headless import must not call secret-tool") })
-  try {
-    const started = await kit.plugin.auth.methods[1].authorize({ refresh_token: "1//docker-test" })
-    assert.deepEqual(await started.callback(), { type: "success", key: "agy" })
-    const file = path.join(kit.home, ".gemini", "antigravity-cli", "antigravity-oauth-token")
-    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).token.refresh_token, "1//docker-test")
-    assert.equal(kit.execFiles.length, 0)
-    assert.equal(kit.modelsSpawns.length, 1)
-  } finally { await kit.dispose() }
 })
