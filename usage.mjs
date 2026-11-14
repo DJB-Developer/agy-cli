@@ -8,9 +8,57 @@ import { cannotSignIn, isDead, noteDead, storedSignIn } from "./signin.mjs"
 const DEFAULT_TIMEOUT_MS = 15_000
 const MAX_TIMEOUT_MS = 18_000 // Magpie bounds an auth.usage call to 20 seconds.
 const MAX_OUTPUT_BYTES = 1024 * 1024
+const DIAGNOSTIC_LIMIT = 4096
+
+// CLI output may include OAuth URLs, credentials or an account email. Keep
+// diagnostic wording, but never intentionally copy those values into logs.
+const SECRET_FIELD = /^(?:authorization|proxy[-_]?authorization|cookie|set[-_]?cookie|(?:access|refresh|id|session)[-_]?token|token|(?:api[-_]?)?key|client[-_]?secret|secret|password|credential|code|code[-_]?verifier|state)$/i
+const diagnosticCode = value => /^(?:[1-5]\d{2}|OK|Cancelled|Unknown|InvalidArgument|DeadlineExceeded|NotFound|AlreadyExists|PermissionDenied|ResourceExhausted|FailedPrecondition|Aborted|OutOfRange|Unimplemented|Internal|Unavailable|DataLoss|Unauthenticated)$/i.test(String(value))
+
+function redactUsageText(output) {
+  return String(output)
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
+    .replace(/\b(?:https?|socks5?):\/\/[^\s<>"']+/gi, url => {
+      try { return `[URL ${new URL(url).hostname}]` } catch { return "[URL]" }
+    })
+    .replace(/\b(?:authorization|proxy[-_]?authorization|set[-_]?cookie|cookie)["']?\s*[:=][^\r\n]*/gi, "[REDACTED header]")
+    .replace(/\b(?:Bearer|Basic)\s+[^\s,"';]+/gi, "[REDACTED auth]")
+    .replace(/(["']?\b(?:access[-_]?token|refresh[-_]?token|id[-_]?token|session[-_]?token|token|api[-_]?key|key|client[-_]?secret|secret|password|credential|code|code[-_]?verifier|state)["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)/gi,
+      (match, prefix, value) => /^["']?code["']?\s*[:=]/i.test(prefix) && diagnosticCode(value.replace(/^["']|["']$/g, "")) ? match : `${prefix}[REDACTED]`)
+    .replace(/(?:1\/\/|ya29\.|AIza|sk-)[A-Za-z0-9._~+\/-]+/g, "[REDACTED token]")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?/g, "[REDACTED jwt]")
+    .replace(/[A-Za-z0-9_+/-]{40,}={0,2}/g, "[REDACTED opaque value]")
+    .replace(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[A-Z0-9.-]{1,253}\.[A-Z]{2,63}/gi, "[REDACTED email]")
+}
+
+export function sanitizeUsageDiagnostic(value) {
+  const scrub = (value, depth = 0) => {
+    if (depth > 12) return "[truncated]"
+    if (Array.isArray(value)) return value.map(item => scrub(item, depth + 1))
+    if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) =>
+      [key, SECRET_FIELD.test(key) && !(key.toLowerCase() === "code" && diagnosticCode(item)) ? "[REDACTED]" : scrub(item, depth + 1)]))
+    if (typeof value !== "string") return value
+    // Error messages can themselves embed serialized JSON credentials.
+    try {
+      const parsed = JSON.parse(value)
+      if (parsed && typeof parsed === "object") return JSON.stringify(scrub(parsed, depth + 1))
+      if (typeof parsed === "string") return scrub(parsed, depth + 1)
+    } catch {}
+    return redactUsageText(value)
+  }
+  const raw = String(value ?? "")
+  let output
+  try { output = JSON.stringify(scrub(JSON.parse(raw))) } catch {
+    // stderr text followed by a JSON report is not one JSON document.
+    output = raw.split("\n").map(line => scrub(line)).join("\n")
+  }
+  // Redact before truncating, so a clipped credential cannot evade matching.
+  return output.length > DIAGNOSTIC_LIMIT ? output.slice(0, DIAGNOSTIC_LIMIT) + "… [truncated]" : output.trim()
+}
 
 // kind: "auth" (agy says it needs a sign-in), "timeout" (output: what agy
-// had printed by then, never shown), "cancel", or none.
+// had printed by then, logged only after redaction), "cancel", or none.
 class UsageError extends Error {
   constructor(message, { kind = "", output = "" } = {}) {
     super(message)
@@ -32,7 +80,8 @@ function commandFailure(output) {
   const eligibility = /eligibility check failed|not eligible|unsupported (?:country|region)|does not support google tos/i.test(output)
   const network = /\b(?:eof|timeout|timed out|deadline exceeded|no such host|connection (?:refused|reset)|network|proxy|tls|ssl|certificate)\b/i.test(output)
   if (network) return new UsageError(`agy usage ${eligibility ? "eligibility check " : ""}failed on a network request. Check network or proxy settings.`)
-  if (eligibility) return new UsageError("agy reports that this account is not eligible for Antigravity.")
+  if (/not eligible|unsupported (?:country|region)|does not support google tos/i.test(output)) return new UsageError("agy reports that this account is not eligible for Antigravity.")
+  if (eligibility) return new UsageError("agy's account eligibility check failed. See the agy-usage log for details.")
   return new UsageError("agy could not read usage. Run `agy` in a terminal to check its status.")
 }
 
@@ -165,6 +214,9 @@ function run(file, args, { cwd, env, deadline, signal, maxOutputBytes, onTreeKil
     const finish = (error, result) => {
       if (settled) return
       settled = true
+      if (error instanceof UsageError && !error.output && error.kind !== "cancel") {
+        error.output = Buffer.concat(stderr).toString("utf8") + "\n" + Buffer.concat(stdout).toString("utf8")
+      }
       clearTimeout(timer)
       clearTimeout(treeKillTimer)
       clearTimeout(fallbackKillTimer)
@@ -227,6 +279,8 @@ function supportedVersion(output) {
 export async function fetchUsage(agy, {
   env = process.env,
   geminiDir,
+  accountName = geminiDir ? path.basename(geminiDir) : "default",
+  diagnostic = line => console.error(line),
   timeoutMs = env.AGY_BRIDGE_USAGE_TIMEOUT_MS,
   maxOutputBytes = MAX_OUTPUT_BYTES,
   signal,
@@ -236,6 +290,9 @@ export async function fetchUsage(agy, {
   const deadline = Date.now() + timeout(timeoutMs)
   const directory = await fs.mkdtemp(path.join(tempRoot, "magpie-agy-usage-"))
   let pendingTreeKill = null
+  let stage = "setup"
+  let result = null
+  let cliVersion = null
   try {
     await fs.chmod(directory, 0o700)
     const agentDir = path.join(directory, ".agents", "agents", "magpie-usage")
@@ -262,15 +319,34 @@ export async function fetchUsage(agy, {
     })
     const options = { cwd: directory, env: childEnv, deadline, signal, maxOutputBytes, onTreeKill: p => { pendingTreeKill = p } }
     // --version needs no sign-in, so its hang is never read as one
+    stage = "version"
     const version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) }).catch((error) => {
-      if (error?.kind === "timeout") throw new UsageError(error.message)
+      if (error?.kind === "timeout") throw new UsageError(error.message, { output: error.output })
       throw error
     })
+    result = version
     if (version.code !== 0) throw commandFailure(version.stderr)
     if (!supportedVersion(version.stdout)) throw new UsageError("agy usage reports require a verified agy version 1.1.11 or later. Update the CLI.")
-    const result = await run(agy, [...(geminiDir ? [`--gemini_dir=${geminiDir}`] : []), "-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`], options)
+    cliVersion = version.stdout.trim()
+    stage = "usage"
+    result = null
+    result = await run(agy, [...(geminiDir ? [`--gemini_dir=${geminiDir}`] : []), "-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`], options)
     if (result.code !== 0) throw commandFailure(result.stderr + "\n" + result.stdout)
     return parseUsageReport(result.stdout)
+  } catch (error) {
+    if (error?.kind !== "cancel") {
+      // This boundary runs once per actual CLI query, including a shared
+      // query's failure. Cached backoff responses never repeat the log.
+      try {
+        diagnostic("[agy-usage] " + JSON.stringify({
+          event: "usage_failed", account: sanitizeUsageDiagnostic(accountName), stage,
+          cliVersion, exitCode: result?.code ?? null,
+          error: error instanceof UsageError ? error.message : "Could not query agy usage.",
+          detail: sanitizeUsageDiagnostic(error?.output || (result ? `${result.stderr}\n${result.stdout}` : "")),
+        }))
+      } catch {} // Diagnostic failures must not change auth or query behavior.
+    }
+    throw error
   } finally {
     for (let attempt = 0; attempt < 4; attempt++) {
       try {

@@ -109,7 +109,7 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.0。现有账号保留，可继续添加其他账号。
+已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.1。现有账号保留，可继续添加其他账号。
 以下市场和 npm 命令安装的是上游社区版本，不包含本仓库的改动。
 
 从 Magpie 社区插件市场安装（推荐）：在 Magpie 的 Plugins 页找到「Antigravity (local agy CLI)」点安装，或在终端运行：
@@ -186,14 +186,30 @@ magpie quota agy-cli --json
 magpie quota refresh agy-cli --json
 ```
 
-额度数据来自 agy 自己的 `/usage` 报告，显示的是当前 agy 登录账号的订阅窗口，按模型组
-分别列出。额度查询由 agy 完成，查询的始终是 agy 当前登录的账号。没有可测量数据的窗口会显示
+额度数据来自所选账号的 agy `/usage` 报告，按模型组列出订阅窗口。
+命名账号使用各自独立的凭据目录查询。没有可测量数据的窗口会显示
 "Limits not available"，而不是 0% 或 100%。
 
 未登录的 agy 一运行就会在浏览器里打开 Google 登录页，所以插件在为额度或模型列表运行 agy 之前，
 先看系统钥匙串（macOS）、凭据管理器（Windows）、Secret Service（桌面 Linux）或原生凭据文件（无桌面 Linux）里 agy 存的登录，只读有没有、何时到期。没有登录、
 登录已过期且无法续期、或 agy 已在这份登录上失败过时，不运行 agy，账号显示登录已过期，直到重新登录。
 其他失败的额度查询等 10 分钟再试，每次翻倍，最长 6 小时。
+
+从 0.2.1 起，每次实际 CLI 额度查询失败，会向日志输出一条 `[agy-usage]` JSON：
+包含账号名称、查询阶段、CLI 版本、退出码，以及脱敏后的原始错误 `detail`。
+会过滤认证头、token、登录 URL 中的敏感内容和邮箱，并限制错误详情长度。
+并发共享查询只记录一次，失败退避期间不会重复记录；成功查询和主动取消不输出错误日志。
+
+1Panel 可查看 `magpie` 容器日志，或在服务器运行：
+
+```sh
+docker logs --since 10m magpie 2>&1 | grep -F '[agy-usage]'
+```
+
+更新插件后刷新报错账号的额度，再查看对应 `account` 的 `detail`。
+仅“资格检查失败”的错误会提示查看日志；只有 CLI 明确报告账号不符合条件或地区不支持时，
+才显示账号资格相关的结论。
+
 
 ## 环境变量
 

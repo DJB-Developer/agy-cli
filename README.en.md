@@ -149,7 +149,7 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.0 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to 0.2.1 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
 The marketplace and npm commands below install the upstream community version, without this repository's changes.
 
 From the Magpie community plugins: find "Antigravity (local agy CLI)" on
@@ -242,9 +242,8 @@ magpie quota agy-cli --json
 magpie quota refresh agy-cli --json
 ```
 
-The numbers come from agy's own `/usage` report for whichever account is signed
-in to the CLI, broken down by model group. Usage queries run through agy and
-always report the account agy is signed in to. A window with no
+The numbers come from the selected account's agy `/usage` report, broken down
+by model group. Named accounts query through their own credential directories. A window with no
 measurable data shows "Limits not available" rather than a fake 0% or 100%.
 
 A signed-out agy opens Google's sign-in page in the browser when it runs, so
@@ -254,6 +253,24 @@ reads whether one is there and when it ends. With none, with one that has ended
 and can't be renewed, or with one agy already failed on, agy is not run: the
 account shows its sign-in has expired until you sign in again. Other failed
 usage reads wait 10 minutes before the next try, doubling up to 6 hours.
+
+Since 0.2.1, each failed CLI usage query emits one `[agy-usage]` JSON log entry
+with the account name, query stage, CLI version, exit code and redacted original
+error in `detail`. Credentials, authentication headers, sensitive URL contents
+and email addresses are filtered; diagnostic length is bounded. Shared concurrent
+queries log once, and backoff reads do not repeat the log. Successful queries and
+intentional cancellations do not produce error logs.
+
+Check the `magpie` container logs in 1Panel, or run on the server:
+
+```sh
+docker logs --since 10m magpie 2>&1 | grep -F '[agy-usage]'
+```
+
+After updating, refresh the affected account's quota and inspect its `account`
+and `detail` fields. A generic eligibility-check failure now asks you to check
+the log instead of asserting that the account is ineligible.
+
 
 ## Environment variables
 

@@ -6,7 +6,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
-import { createUsageReader, fetchUsage, parseUsageReport } from "../usage.mjs"
+import { createUsageReader, fetchUsage, parseUsageReport, sanitizeUsageDiagnostic } from "../usage.mjs"
 import { forgetStoredSignIn } from "../signin.mjs"
 
 const report = groups => ({ status: "SUCCESS", command: { name: "usage", data: { groups } } })
@@ -181,7 +181,10 @@ const record = {
 }
 fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(record) + "\n")
 const mode = process.env.TEST_MODE
-if (mode === "version-hang" && version || mode === "hang" && !version) setInterval(() => {}, 1000)
+if (mode === "version-hang" && version || mode === "hang" && !version) {
+  if (process.env.TEST_ERROR) console.error(process.env.TEST_ERROR)
+  setInterval(() => {}, 1000)
+}
 else if (version) {
   console.log(process.env.TEST_VERSION || "1.3.5")
 } else if (mode === "fail") {
@@ -656,4 +659,114 @@ test("missing executables and filesystem failures do not leak local paths", asyn
   const result = await createUsageReader(() => f.executable, { ...f.options, tempRoot: f.executable })()
   assert.ok(result.error)
   assert.doesNotMatch(result.error, /agy-usage-test-/)
+})
+
+test("diagnostics redact credentials and URLs while retaining the original eligibility reason", () => {
+  const secrets = ["short-refresh", "short-access", "short-id", "oauth-code-value", "session-cookie", "header-credential"]
+  const original = [
+    '\x1b[31mEligibility check failed: rpc error: code = PermissionDenied desc = unsupported country CN\x1b[0m',
+    '{"refresh_token":"short-refresh","accessToken":"short-access","id_token":"short-id"}',
+    'Authorization: Bearer header-credential',
+    'Cookie: sid=session-cookie; other=private',
+    'https://person:password@example.com/callback?code=oauth-code-value&state=private',
+    'user=person@example.com refresh_token=1//bare-token ya29.bare-token',
+    'code = Unauthenticated',
+  ].join('\n')
+  const safe = sanitizeUsageDiagnostic(original)
+  assert.match(safe, /unsupported country CN/)
+  assert.match(safe, /code = PermissionDenied/)
+  assert.match(safe, /code = Unauthenticated/)
+  assert.match(safe, /URL example.com/)
+  for (const secret of [...secrets, 'person@example.com', 'person:password', '1//bare-token', 'ya29.bare-token']) assert.ok(!safe.includes(secret), secret)
+  assert.ok(!safe.includes('\x1b'))
+  const json = sanitizeUsageDiagnostic(JSON.stringify({ code: 403, error: { message: 'not eligible', token: { refresh_token: 'nested-value' } }, password: 'password-value' }))
+  assert.match(json, /403/)
+  assert.match(json, /not eligible/)
+  assert.doesNotMatch(json, /nested-value|password-value/)
+})
+
+test("diagnostics redact before truncating, bound output, and remove standalone JWTs", () => {
+  const rawToken = '1//' + 'z'.repeat(5000)
+  const rawJwt = 'eyJhbGciOiJub25lIn0.eyJlbWFpbCI6InByaXZhdGUifQ.signature'
+  const safe = sanitizeUsageDiagnostic('prefix\nrefresh_token=' + rawToken + '\n' + rawJwt + '\n' + 'failed: '.repeat(1000))
+  assert.ok(safe.length < 4150)
+  assert.match(safe, /truncated/)
+  assert.doesNotMatch(safe, /zzz|eyJhbGci|signature/)
+  assert.doesNotMatch(sanitizeUsageDiagnostic("eyJ" + "a".repeat(60) + ".e30.private-signature"), /e30|private-signature/)
+})
+
+test("diagnostics log one redacted failure per shared CLI query, not per waiter or backoff read", async t => {
+  const lines = []
+  const f = await fixture(t, { TEST_MODE: "fail", TEST_ERROR: 'Eligibility check failed: rpc error: code = PermissionDenied desc = unsupported country CN\nrefresh_token="private-refresh-value"' })
+  let clock = 1_000_000
+  const read = createUsageReader(() => f.executable, { ...f.options, accountName: "work", now: () => clock, diagnostic: line => lines.push(line) })
+  const results = await Promise.all([read(), read(), read()])
+  assert.equal(lines.length, 1)
+  assert.ok(lines[0].startsWith('[agy-usage] '))
+  const entry = JSON.parse(lines[0].slice('[agy-usage] '.length))
+  assert.equal(entry.account, "work")
+  assert.equal(entry.stage, "usage")
+  assert.equal(entry.cliVersion, "1.3.5")
+  assert.equal(entry.exitCode, 1)
+  assert.match(entry.detail, /unsupported country CN/)
+  assert.doesNotMatch(lines[0], /private-refresh-value/)
+  assert.ok(results.every(result => result.signIn === "kept" && !result.error.includes("CN")))
+  await read()
+  assert.equal(lines.length, 1)
+  clock += 6 * 60 * 60 * 1000
+  await read()
+  assert.equal(lines.length, 2)
+  await f.assertClean()
+})
+
+test("diagnostics retain errors inside a JSON stdout report even with exit code zero", async t => {
+  const f = await fixture(t, { TEST_REPORT: JSON.stringify({ status: "FAILED", error: "Eligibility check failed: additional verification required", refresh_token: "private-json-value" }) })
+  const lines = []
+  const result = await createUsageReader(() => f.executable, { ...f.options, geminiDir: path.join(f.options.tempRoot, "personal"), diagnostic: line => lines.push(line) })()
+  assert.match(result.error, /eligibility check failed/)
+  assert.equal(result.signIn, "kept")
+  const entry = JSON.parse(lines[0].slice('[agy-usage] '.length))
+  assert.equal(entry.account, "personal")
+  assert.equal(entry.exitCode, 0)
+  assert.match(entry.detail, /additional verification required/)
+  assert.doesNotMatch(entry.detail, /private-json-value/)
+})
+
+test("diagnostics include output captured before timeout and do not change query errors", { timeout: 10000 }, async t => {
+  const f = await fixture(t, { TEST_MODE: "hang", TEST_ERROR: "Eligibility check failed: retrying\nAuthorization: Bearer private-timeout-value" })
+  const lines = []
+  await assert.rejects(fetchUsage(f.executable, { ...f.options, timeoutMs: 6000, diagnostic: line => lines.push(line) }), /timed out/)
+  assert.equal(lines.length, 1)
+  const entry = JSON.parse(lines[0].slice('[agy-usage] '.length))
+  assert.equal(entry.stage, "usage")
+  assert.equal(entry.exitCode, null)
+  assert.match(entry.detail, /retrying/)
+  assert.doesNotMatch(entry.detail, /private-timeout-value/)
+  await f.assertClean()
+})
+
+test("diagnostics stay silent on successful queries and logging failures cannot break the usage reader", async t => {
+  const f = await fixture(t)
+  const lines = []
+  await fetchUsage(f.executable, { ...f.options, diagnostic: line => lines.push(line) })
+  assert.deepEqual(lines, [])
+  f.env.TEST_MODE = "fail"
+  const result = await createUsageReader(() => f.executable, { ...f.options, diagnostic: () => { throw new Error("logger unavailable") } })()
+  assert.match(result.error, /could not read usage/)
+  assert.equal(result.signIn, "kept")
+})
+
+
+test("diagnostics redact credentials inside JSON-encoded error strings after stderr text", () => {
+  const output = "Warning: eligibility check failed\n" + JSON.stringify({ error: JSON.stringify({ refresh_token: "tiny-private-value", message: "verification required" }) })
+  const safe = sanitizeUsageDiagnostic(output)
+  assert.match(safe, /verification required/)
+  assert.doesNotMatch(safe, /tiny-private-value/)
+})
+
+test("diagnostics bound large unbroken CLI output without expensive email matching", () => {
+  for (const input of ['x'.repeat(1024 * 1024), 'a.'.repeat(512 * 1024), 'eyJ'.repeat(350000)]) {
+    const safe = sanitizeUsageDiagnostic(input)
+    assert.ok(safe.length < 4150)
+  }
 })
