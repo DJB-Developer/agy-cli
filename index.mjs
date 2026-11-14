@@ -13,6 +13,7 @@ import { sanitizePatternFields } from "./re2-pattern.mjs"
 import { startLogin } from "./login.mjs"
 import { ensureGeminiArrayItems } from "./array-items.mjs"
 import { expandToolSchema } from "./tool-schema.mjs"
+import { fitTools } from "./tool-budget.mjs"
 import { hint, outgoing, turnsAway } from "./cloak.mjs"
 import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 
@@ -20,6 +21,7 @@ import { DEFAULT_ACCOUNT, accountEnv, accountArgs, accountSignIn, accountName, r
   accountResult, reserveAccount, writeAccountToken, publishAccount, discardAccount } from "./accounts.mjs"
 
 const runtimeCleanups = new Set()
+export const IMAGE_FOLLOWS = "[The image this tool returned is attached to the next message.]"
 process.once("exit", () => { for (const cleanup of runtimeCleanups) cleanup() })
 
 // Magpie owns persistence and supplies a live getter. Older hosts/OpenCode
@@ -139,13 +141,34 @@ const STEP_USAGE_WAIT_MS = 1_000
 const STEP_USAGE_SAME_GEN_WAIT_MS = 75
 const STEP_USAGE_POLL_MS = 25
 // agy reports an upstream failure as an ordinary message chunk followed by end_turn.
-const AGENT_ERROR_MARKER = "\n⚠ Agent execution terminated due to error.\n"
-const AGENT_ERROR_CORE = AGENT_ERROR_MARKER.trim()
+// 1.5.8 words a connection that failed every retry, and a spent credit
+// balance, on their own (#1136). 1.5.9 ends a turn whose every retry got 429
+// with the upstream status itself (#1151).
+const AGENT_ERROR_MARKERS = [
+  "\n⚠ Agent execution terminated due to error.\n",
+  "\n⚠ There was a network issue connecting to the server, please try again.\n",
+  "\n⚠ Your AI credits balance is too low to continue.\n",
+  "\n⚠ RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n",
+]
+const AGENT_ERROR_CORES = AGENT_ERROR_MARKERS.map((marker) => marker.trim())
+const CREDITS_CORE = AGENT_ERROR_CORES[2]
+// agy 1.5.8 writes each failed attempt of a model call into the reply as one
+// line, then tries again in the same turn (#1136). The line is agy's.
+const ATTEMPT_CORE = "⚠ API error (attempt "
+const ATTEMPT_MARKER = "\n" + ATTEMPT_CORE
+const ATTEMPT_LINE = /^⚠ API error \(attempt \d+\): ?(.*)$/
+// The bare 429 Antigravity answers a system prompt it turns away, whatever
+// quota is left. agy 1.5.9 retries it in the same turn with a banner each
+// time, and only ends the turn after its last retry: to the client the turn
+// hung (Lmohn39 on X, pi through agy-cli, 11-14). A banner with it ends the
+// turn at once, as the 429 ending would.
+const refused429 = (detail) => /code 429\b/i.test(detail) && /resource has been exhausted/i.test(detail)
 // agy writes this into the reply when the model's first call came back with
 // neither text nor tool calls, then calls the model again in the same turn.
 // It is agy's, not the model's, and the turn goes on (#1124).
 const RETRY_MARKER = "\n⚠ Model produced invalid output.\n"
 const RETRY_CORE = RETRY_MARKER.trim()
+const HOLD_MAX = Math.max(...AGENT_ERROR_MARKERS.map((marker) => marker.length)) - 1
 const FORWARD_THINKING = process.env.AGY_BRIDGE_THINKING !== "0"
 
 // Until `agy models` answers. Gemini only: agy's ACP server decides which other
@@ -1163,6 +1186,10 @@ class Turn {
     this.agentError = false
     this.heldText = ""
     this.textTail = ""
+    this.openBanner = -1
+    this.attemptDetail = ""
+    this.refusedDetail = ""
+    this.agentErrorCore = ""
     this.timer = null
     this.cleanupTimer = null
     this.logOffset = 0
@@ -1190,6 +1217,14 @@ class Turn {
   }
 
   registerResponse(body) {
+    // Only the current step's body is read again (a late prompt's estimate).
+    // An earlier one is dropped here: a tool loop sending screenshots kept
+    // every request's parsed body, 20MB+ each, for the whole turn (plugins#1137).
+    const previous = this.currentResponse
+    if (previous) {
+      previous.body = null
+      previous.contentSnapshot = null
+    }
     const estimate = this.proc.estimatePromptTokens(body)
     const pending = this.pendingPromptStep
     const step = {
@@ -1327,23 +1362,38 @@ class Turn {
 
   // Withholds agy's error marker, or a possible prefix of it, until it can be
   // classified. agy's own marker ends the prompt; one that more text follows
-  // was the model quoting it (#1052). agy's retry banner is dropped where it
-  // starts a line (#1124).
+  // was the model quoting it (#1052). agy's retry banners are dropped where
+  // they start a line (#1124, #1136); one whose line hasn't ended is held.
   pushText(chunk) {
     if (this.done || this.agentError) return
+    this.pushHeld(chunk)
+    if (this.refusedDetail && !this.done) {
+      this.heldText = ""
+      this.proc.refuseTurn(this, this.refusedDetail)
+    }
+  }
+
+  pushHeld(chunk) {
     let text = this.dropRetryBanner(this.heldText + chunk)
     this.heldText = ""
-    const marker = text.lastIndexOf(AGENT_ERROR_CORE)
-    if (marker >= 0 && !text.slice(marker + AGENT_ERROR_CORE.length).trim()) {
-      const start = text[marker - 1] === "\n" ? marker - 1 : marker
-      this.heldText = text.slice(start)
-      text = text.slice(0, start)
-      this.emitText(text)
+    if (this.openBanner >= 0) {
+      this.heldText = text.slice(this.openBanner)
+      this.emitText(text.slice(0, this.openBanner))
       return
     }
-    for (let keep = Math.min(text.length, AGENT_ERROR_MARKER.length - 1); keep > 0; keep--) {
+    for (const core of AGENT_ERROR_CORES) {
+      const marker = text.lastIndexOf(core)
+      if (marker >= 0 && !text.slice(marker + core.length).trim()) {
+        const start = text[marker - 1] === "\n" ? marker - 1 : marker
+        this.heldText = text.slice(start)
+        this.emitText(text.slice(0, start))
+        return
+      }
+    }
+    for (let keep = Math.min(text.length, HOLD_MAX); keep > 0; keep--) {
       const tail = text.slice(-keep)
-      if (AGENT_ERROR_MARKER.startsWith(tail) || (RETRY_MARKER.startsWith(tail) && keep > 1)) {
+      if (AGENT_ERROR_MARKERS.some((marker) => marker.startsWith(tail)) ||
+        (keep > 1 && (RETRY_MARKER.startsWith(tail) || ATTEMPT_MARKER.startsWith(tail)))) {
         this.heldText = tail
         text = text.slice(0, -keep)
         break
@@ -1352,26 +1402,39 @@ class Turn {
     this.emitText(text)
   }
 
-  // Removes agy's retry banner, with its leading and one trailing newline,
-  // wherever it starts a line. Text that only quotes it mid-line is kept.
-  // Until the turn's text is flushed, a banner that ends the buffer is left
-  // for pushText to hold, so its newline in the next chunk goes with it.
+  // Removes agy's retry banners, each with its leading and one trailing
+  // newline, wherever one starts a line. Text that only quotes one mid-line is
+  // kept. Until the turn's text is flushed, a banner that ends the buffer is
+  // left in place and openBanner says where, so pushText holds it and its
+  // newline in the next chunk goes with it.
   dropRetryBanner(text, final = false) {
-    let at = text.indexOf(RETRY_CORE)
-    while (at >= 0) {
+    this.openBanner = -1
+    let from = 0
+    for (;;) {
+      const at = nextBanner(text, from)
+      if (at < 0) return text
       const lineStart = at > 0 ? text[at - 1] === "\n" : this.textTail === "" || this.textTail === "\n"
       if (!lineStart) {
-        at = text.indexOf(RETRY_CORE, at + 1)
+        from = at + 1
         continue
       }
       const start = at > 0 ? at - 1 : at
-      let end = at + RETRY_CORE.length
-      if (end === text.length && !final) break
+      const attempt = !text.startsWith(RETRY_CORE, at)
+      let end = attempt ? text.indexOf("\n", at) : at + RETRY_CORE.length
+      if (end < 0) end = text.length
+      if (end === text.length && !final) {
+        // agy waits before its next try with the line still open
+        const open = attempt ? ATTEMPT_LINE.exec(text.slice(at, end))?.[1]?.trim() : ""
+        if (open && refused429(open)) this.refusedDetail ||= open
+        this.openBanner = start
+        return text
+      }
+      if (attempt) this.attemptDetail = ATTEMPT_LINE.exec(text.slice(at, end))?.[1]?.trim() || this.attemptDetail
+      if (attempt && refused429(this.attemptDetail)) this.refusedDetail ||= this.attemptDetail
       if (text[end] === "\n") end++
       text = text.slice(0, start) + text.slice(end)
-      at = text.indexOf(RETRY_CORE, start)
+      from = start
     }
-    return text
   }
 
   emitText(text) {
@@ -1382,8 +1445,10 @@ class Turn {
 
   // The prompt ended: a marker still held was agy's own.
   endText() {
-    if (this.heldText.includes(AGENT_ERROR_CORE)) {
+    const core = AGENT_ERROR_CORES.find((core) => this.heldText.includes(core))
+    if (core) {
       this.agentError = true
+      this.agentErrorCore = core
       this.heldText = ""
     }
   }
@@ -1783,7 +1848,16 @@ class Proc {
     // the server marks it always loaded; tools with larger schemas were left out
     // and the model could not reach them (#989). Every client-declared tool is
     // one the client means the model to see.
-    return this.tools.map((tool) => ({ ...tool, _meta: { ...tool._meta, [ALWAYS_LOAD]: true } }))
+    //
+    // agy holds them all in a 20,000-token budget and drops whole tools,
+    // the largest first, past it; fitTools shortens their descriptions
+    // instead, so every tool stays (plugins#1140). The trimmed list is kept
+    // per catalog: agy asks again on every tools/list_changed.
+    if (this.fittedFor !== this.toolsSignature) {
+      this.fitted = fitTools(this.tools.map((tool) => ({ ...tool, _meta: { ...tool._meta, [ALWAYS_LOAD]: true } })))
+      this.fittedFor = this.toolsSignature
+    }
+    return this.fitted
   }
 
   addWatcher(socket) {
@@ -1948,8 +2022,10 @@ class Proc {
   async steerInSession(turn, results, history) {
     if (this.dead || this.stopping || this.retiring || this.turn !== turn || turn.steering || turn.done ||
       turn.finalized || !Array.isArray(history)) return false
-    // An image in a result is replayed in the prompt, as before.
-    if (results.some((item) => item.result.content.some((part) => part.type !== "text"))) return false
+    // agy offloads an image in an MCP result to a file the model can't open,
+    // so the call is answered with its text and the image goes in the
+    // steer's prompt (withoutAnswered keeps it there).
+    results = results.map((item) => ({ ...item, result: textOnlyResult(item.result) }))
     const deliveringLiveMcp = results.some(({ call }) =>
       (!call.deferred && !call.mcpResponded && call.ready && !turn.done) ||
       (call.deferred && !call.result && turn.awaitCalls.some((waiter) => waiter.target === call)))
@@ -2072,7 +2148,14 @@ class Proc {
   }
 
   async #agentError(turn) {
-    const detail = await lastAgentError(this.logPath, turn.logOffset)
+    const core = turn.agentErrorCore
+    // A failed connection is in the reply's last attempt line, not the log's
+    // executor error (#1136).
+    const detail = await lastAgentError(this.logPath, turn.logOffset) || turn.attemptDetail ||
+      (core && core !== AGENT_ERROR_CORES[0] ? core.replace(/^⚠ /, "") : "")
+    if (core === CREDITS_CORE) {
+      return new AgentTurnError(`agy bridge: Antigravity AI credits balance is too low to continue${detail ? ": " + detail : ""}`, "rate_limit_error")
+    }
     return this.#formatAgentError(detail)
   }
 
@@ -2088,7 +2171,7 @@ class Proc {
     }
     if (/QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|code 429\b/i.test(detail)) {
       return new AgentTurnError(
-        `agy bridge: Antigravity quota or rate limit reached${detail ? ": " + detail : ""}`,
+        `agy bridge: Antigravity quota or rate limit reached${detail ? ": " + detail : ""}${refused429(detail) ? " — Antigravity answers this same bare 429 to a system prompt it turns away whatever quota is left, so if quota is left it is not a quota and waiting won't help: something in this agent's system prompt is being matched" : ""}`,
         "rate_limit_error",
       )
     }
@@ -2115,6 +2198,16 @@ class Proc {
     timer.unref?.()
     turn.settled.then(() => clearTimeout(timer))
     return true
+  }
+
+  // A try Antigravity answered with the bare 429 ends the turn now, with the
+  // same error as agy's own 429 ending, instead of after agy's retries: the
+  // process goes, as on a timeout, since agy is still retrying in it.
+  refuseTurn(turn, detail) {
+    if (this.turn !== turn || turn.done) return
+    turn.fail(this.#formatAgentError(detail))
+    dropFromPool(this)
+    this.stop().catch(() => {})
   }
 
   timeoutTurn(turn, error) {
@@ -2414,6 +2507,20 @@ function resultText(result) {
   return (result?.content || []).map((part) => part?.type === "text" ? part.text : "[image returned by tool]").join("\n\n")
 }
 
+function resultHasImage(result) {
+  return (result?.content || []).some((part) => part?.type === "image")
+}
+
+// A tool result as agy gets it over MCP: agy writes an MCP image to a file
+// ("[Resource offloaded to file://…/media_0.jpg]") and the model never sees
+// it, so each image is left out with a line saying where it went.
+function textOnlyResult(result) {
+  if (!resultHasImage(result)) return result
+  const content = result.content.filter((part) => part?.type !== "image")
+  content.push({ type: "text", text: IMAGE_FOLLOWS })
+  return { ...result, content }
+}
+
 function renderLateResults(calls) {
   const parts = ["Client tool calls that were still running have finished. Their real results:"]
   for (const call of calls) {
@@ -2498,13 +2605,23 @@ async function lastAgentError(file, offset) {
   }
   let found = ""
   for (const line of text.split("\n")) {
-    const match = /\] (?:agent executor error|failed to construct executor): (.+)$/.exec(line)
+    const match = /\] (?:agent executor error|failed to construct executor|inference connection failed[^:]*): (.+)$/.exec(line) ||
+      /\] (?:Run|CallWithRetry): attempt \d+ failed \((.+)\), retrying in /.exec(line)
     if (match) found = match[1]
   }
   if (!found) return ""
   const cut = found.lastIndexOf("generating and executing: ")
   if (cut >= 0) found = found.slice(cut + "generating and executing: ".length)
   return found.trim().slice(0, 1000)
+}
+
+// Where the next retry banner of either kind starts, from `from` on.
+function nextBanner(text, from) {
+  const retry = text.indexOf(RETRY_CORE, from)
+  const attempt = text.indexOf(ATTEMPT_CORE, from)
+  if (retry < 0) return attempt
+  if (attempt < 0) return retry
+  return Math.min(retry, attempt)
 }
 
 function dropFromPool(proc) {
@@ -3549,7 +3666,13 @@ function historyKey(messages) {
         ids.set(block.id, ordinal)
         value = { type: "tool_use", id: ordinal, name: block.name, input: block.input ?? {} }
       } else if (block.type === "tool_result") {
-        value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...toolResult(block) }
+        const result = toolResult(block)
+        // An image a tool returned is keyed by its hash, as a user's image
+        // is, not copied whole into the key on every round-trip (plugins#1137).
+        const content = result.content.map((part) => part.type === "image"
+          ? { type: "image", mimeType: part.mimeType, sha256: digest(part.data) }
+          : part)
+        value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...result, content }
       } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use" ||
         block.type === "container_upload" || SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
         value = { type: block.type, name: block.name || "", content: renderServerAssistantBlock(block) }
@@ -5578,10 +5701,16 @@ function streamResponse(proc, turn, body, signal) {
 
 // Tool results a kept session already holds (answered to its live MCP calls
 // when the user steered) are not sent again in the steer's prompt.
+// An answered result's images are the exception: the call got its text only
+// (textOnlyResult), so its images go in the prompt, under the result's id.
 function withoutAnswered(messages, answered) {
   if (!answered?.size) return messages
   return messages.map((message) => message.role === "user" && Array.isArray(message.content)
-    ? { ...message, content: message.content.filter((block) => !(block?.type === "tool_result" && answered.has(block.tool_use_id))) }
+    ? { ...message, content: message.content.flatMap((block) => {
+      if (!(block?.type === "tool_result" && answered.has(block.tool_use_id))) return [block]
+      const images = Array.isArray(block.content) ? block.content.filter((part) => part?.type === "image") : []
+      return images.length ? [{ ...block, content: images }] : []
+    }) }
     : message)
 }
 
@@ -5807,6 +5936,10 @@ const createPlugin = async () => {
                     }
                   }
                   if (!interrupted) proc.validateResults(results)
+                  // An image over MCP reaches agy's model as a path it can't
+                  // read, so a result with one takes the steer's way: the call
+                  // gets the text, the next prompt the image.
+                  const imageResult = proc.supportsImages && results.some((item) => resultHasImage(item.result))
                   const directIdsMatch = matches.every((item) => item.match?.call?.id === item.block.tool_use_id)
                   const historyMatches = directIdsMatch
                     ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
@@ -5814,7 +5947,7 @@ const createPlugin = async () => {
                   // A steer keeps the live session, so agy's prompt cache holds: the
                   // calls are answered with their real results, the step is
                   // cancelled, and the steer goes in as the next prompt.
-                  if (interrupted && historyMatches && !proc.toolsGrew(tools) && proc.workDir === workDir &&
+                  if ((interrupted || imageResult) && historyMatches && !proc.toolsGrew(tools) && proc.workDir === workDir &&
                     proc.minimalAgent === acquireOpts.minimalAgent &&
                     sameInstructions(proc.instructions, instructions) &&
                     await proc.steerInSession(turn, rawResults, trailingMessages(body).history)) {
@@ -5824,7 +5957,7 @@ const createPlugin = async () => {
                         .filter((item) => !item.call.deferred || item.call.lateDelivered)
                         .map((item) => item.block.tool_use_id),
                     )
-                  } else if (interrupted || !historyMatches || proc.toolsGrew(tools) ||
+                  } else if (interrupted || imageResult || !historyMatches || proc.toolsGrew(tools) ||
                     proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
                     // A changed context, a tool catalog that grew, or a
                     // user-interrupted tool turn needs a new session. Replay the

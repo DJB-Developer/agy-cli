@@ -165,6 +165,78 @@ test("identical concurrent conversations and tool continuations stay in their ac
   })
 })
 
+test("a bare 429 stops only the failing account while another account's tool turn continues", { timeout: 5000 }, async () => {
+  await withKit({}, async kit => {
+    const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
+    const [requestA, requestB] = await Promise.all([client(kit, authOf(a)), client(kit, authOf(b))])
+    kit.defaultPrompt = async agent => {
+      if (nameOf(agent.args) === "a") {
+        await agent.text("\n⚠ API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).")
+        await new Promise(() => {})
+      }
+      const result = await agent.tool("Read", { path: "/b" })
+      await agent.text(result.result.content[0].text)
+      return { stopReason: "end_turn" }
+    }
+    const body = baseBody()
+    const firstB = await readSse(await requestB(body))
+    const procB = [...kit.module.__agyTestRuntimes.values()].flatMap(r => [...r.allProcs])
+      .find(proc => nameOf(proc.child.args) === "b")
+    const failed = await readSse(await requestA(body))
+    assert.equal(failed.error?.type, "rate_limit_error")
+    assert.equal(procB.dead, false)
+    assert.equal(procB.stopping, false)
+    const doneB = await readSse(await requestB(continueWithToolResults(body, firstB, () => "only-b-result")))
+    assert.equal(doneB.error, null)
+    assert.equal(doneB.content.find(part => part.type === "text").text, "only-b-result")
+    assert.equal(kit.acpSpawns.filter(spawn => nameOf(spawn.args) === "b").length, 1)
+    const liveA = [...kit.module.__agyTestRuntimes.values()].flatMap(r => [...r.pool.values()])
+      .filter(proc => nameOf(proc.child.args) === "a")
+    assert.equal(liveA.length, 0, "failed account's process is dropped from its own pool")
+  })
+})
+
+test("tool-result images steer within each named account's session without crossing profiles", { timeout: 10000 }, async () => {
+  await withKit({ supportsImages: true }, async kit => {
+    const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
+    const requests = await Promise.all([client(kit, authOf(a)), client(kit, authOf(b))])
+    const sessions = new Map(), delivered = new Map(), images = new Map()
+    kit.defaultPrompt = async agent => {
+      const name = nameOf(agent.args)
+      const image = agent.prompt.find(part => part.type === "image")
+      if (image) {
+        assert.equal(agent.sessionId, sessions.get(name))
+        images.set(name, image.data)
+        await agent.text(`image-for-${name}`)
+        return { stopReason: "end_turn" }
+      }
+      sessions.set(name, agent.sessionId)
+      agent.update({ sessionUpdate: "tool_call", toolCallId: "image-read", status: "in_progress" })
+      const reply = await agent.tool("Read", { path: `/${name}.png` })
+      delivered.set(name, reply.result.content)
+      agent.update({ sessionUpdate: "tool_call_update", toolCallId: "image-read", status: "completed" })
+      await agent.waitCancel()
+      return { stopReason: "cancelled" }
+    }
+    const body = baseBody()
+    const first = await Promise.all(requests.map(request => request(body).then(readSse)))
+    const names = ["a", "b"]
+    const done = await Promise.all(requests.map((request, i) => request(continueWithToolResults(body, first[i], () => [
+      { type: "text", text: `read-${names[i]}` },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: Buffer.from(`image-${names[i]}`).toString("base64") } },
+    ])).then(readSse)))
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i]
+      assert.equal(done[i].error, null)
+      assert.equal(done[i].content.find(part => part.type === "text").text, `image-for-${name}`)
+      assert.equal(images.get(name), Buffer.from(`image-${name}`).toString("base64"))
+      assert.deepEqual(delivered.get(name), [{ type: "text", text: `read-${name}` }, { type: "text", text: kit.module.IMAGE_FOLLOWS }])
+      assert.equal(kit.acpSpawns.filter(spawn => nameOf(spawn.args) === name).length, 1)
+    }
+    assert.notEqual(sessions.get("a"), sessions.get("b"))
+  })
+})
+
 test("models and usage are scoped to host-selected auth and conflicting API environment cannot override it", async () => {
   await withKit({ env: { GEMINI_API_KEY: "global-key", AGY_ADC_AUTH: "1", WSL_INTEROP: "real-wsl" },
     onSpawn: (_file, args, opts) => {

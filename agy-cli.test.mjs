@@ -27,6 +27,7 @@ for (const [name, mocks] of [
   ["catalog.mjs", false],
   ["step-usage.mjs", false],
   ["tool-schema.mjs", false],
+  ["tool-budget.mjs", false],
   ["usage-settlement.mjs", false],
   ["steer-in-session.mjs", false],
   ["repeat-batch.mjs", false],

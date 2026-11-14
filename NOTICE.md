@@ -5,6 +5,14 @@
 本仓库为 `DJB-Developer/agy-cli`，基于 `magpie-community/plugins` 的
 `packages/agy-cli`（提交 `09c05dfa9f3f6fc89d2d172faf475bbeed70f3c4`）。
 新增 refresh token 导入账号、钥匙串验证与失败恢复，以及相关测试和文档。
+0.2.6 另行同步社区 agy-cli 0.1.43–0.1.48 的六个提交：
+`5613a1259a5a1aff1b75b0facb9a8006784be27f`、
+`dac97267369a40e45980a7da04b424ebe231581f`、
+`6e0cecb2a0bcaa3bb041a033baab1e333ca55df4`、
+`6646797e15da35c041332c58326432b862bdd225`、
+`3db6dcfa8587600f8f10d34bbb8b77de3304da98`、
+`a617ecfd4224def48a5975e18224495968971781`。
+这些修复适配到本仓的账号独立运行时，保留本仓登录、额度、套餐及界面配置功能。
 下文保留上游的历史来源记录；其中包名、版本和仓库描述属于上游记录。
 
 本包（`@magpie-community/opencode-agy-cli-auth`，版本 0.1.0）源自 Antigravity 桥接插件
