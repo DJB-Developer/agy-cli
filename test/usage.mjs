@@ -282,7 +282,7 @@ else if (version) {
   return {
     executable, env,
     // agy's stored sign-in can't be read here (signin.mjs is tested on its own)
-    options: { env, tempRoot: directory, signIn: async () => ({ state: "unknown" }) },
+    options: { env, tempRoot: directory, signIn: async () => ({ state: "unknown" }), readPlan: async () => "" },
     async logs() { return (await fs.readFile(logPath, "utf8")).trim().split("\n").map(line => JSON.parse(line)) },
     // Every pid to see gone after a kill: the spawned children, and the agy
     // each one ran that got as far as logging (on Windows a grandchild under

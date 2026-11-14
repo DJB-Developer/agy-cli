@@ -282,18 +282,21 @@ export async function importRefreshToken(input, { probe, platform = process.plat
   }
 }
 
-// parseStored is what a stored value says, "unknown" when it isn't the
-// shape agy writes.
-export function parseStored(raw, now = Date.now()) {
+function storedValue(raw) {
   let value = String(raw ?? "").trim()
-  const fp = createHash("sha256").update(value).digest("hex").slice(0, 32)
   if (value.startsWith("go-keyring-base64:")) {
     value = Buffer.from(value.slice("go-keyring-base64:".length), "base64").toString("utf8")
   } else if (value.startsWith("go-keyring-encoded:")) {
     value = Buffer.from(value.slice("go-keyring-encoded:".length), "hex").toString("utf8")
   }
-  let stored
-  try { stored = JSON.parse(value) } catch { return { state: "unknown" } }
+  try { return JSON.parse(value) } catch { return null }
+}
+
+// parseStored is what a stored value says, "unknown" when it isn't the
+// shape agy writes.
+export function parseStored(raw, now = Date.now()) {
+  const fp = createHash("sha256").update(String(raw ?? "").trim()).digest("hex").slice(0, 32)
+  const stored = storedValue(raw)
   // a Gemini API key needs no Google sign-in
   if (typeof stored?.api_key === "string" && stored.api_key !== "") return { state: "unknown" }
   const token = stored?.token
@@ -315,6 +318,23 @@ export async function readStoredSignIn({ platform = process.platform, exec = run
   if (ENV_SIGN_INS.some((name) => env[name])) return { state: "unknown" }
   const s = await credentialStore(platform, env, home, exec).read()
   return s.state === "present" ? parseStored(s.raw, now) : s
+}
+
+// Metadata queries reuse only the access token agy has already stored. Never
+// refresh or write credentials here, and never fall back from a named profile
+// to the computer's default account. Keep secrets out of sign-in status objects.
+export async function readAccessToken({ geminiDir, platform = process.platform, exec = run, now = Date.now(), env = process.env, home = os.homedir() } = {}) {
+  if (env.AGY_BRIDGE_STORED_SIGNIN === "skip" || ENV_SIGN_INS.some(name => env[name])) return ""
+  try {
+    const s = geminiDir
+      ? { state: "present", raw: await fs.readFile(path.join(geminiDir, "antigravity-cli", "antigravity-oauth-token"), "utf8") }
+      : await credentialStore(platform, env, home, exec).read()
+    if (s.state !== "present") return ""
+    const status = parseStored(s.raw, now)
+    if (status.state !== "present" || status.expired) return ""
+    const access = storedValue(s.raw)?.token?.access_token
+    return typeof access === "string" && /^\S+$/.test(access) ? access : ""
+  } catch { return "" }
 }
 
 // cannotSignIn is why a stored sign-in can't serve agy without a new

@@ -43,7 +43,7 @@ export const COUNT_TOKENS_URL = "agy://local/v1/messages/count_tokens"
 export const CATALOG_TTL_MS = 5 * 60 * 1000
 
 const RUNTIME_SPECIFIER = "agy-testkit:runtime"
-const RUNTIME_NAMES = ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "process"]
+const RUNTIME_NAMES = ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "process", "fetch"]
 const RUNTIME_PRELUDE = `import { ${RUNTIME_NAMES.join(", ")} } from ${JSON.stringify(RUNTIME_SPECIFIER)};\n`
 const TEST_SEAMS = "Turn, allProcs, pool, execOnce, findAgy, canonicalBody, conversationKey, renderInitialPromptParts, reapOnExit"
 const TEST_EXPORTS = `
@@ -545,6 +545,7 @@ export async function createBridgeKit(options = {}) {
     this.setExport("setInterval", timers.setInterval)
     this.setExport("clearInterval", timers.clearInterval)
     this.setExport("process", fakeProcess)
+    this.setExport("fetch", options.fetch || (() => { throw new Error("Network disabled in testkit") }))
   }, { identifier: RUNTIME_SPECIFIER })
   const cache = new Map([[RUNTIME_SPECIFIER, runtime]])
   const indexUrl = pathToFileURL(path.join(REPO_DIR, "index.mjs")).href
@@ -564,6 +565,7 @@ export async function createBridgeKit(options = {}) {
     if (cache.has(key)) return cache.get(key)
     let module
     if (key === "./usage.mjs") module = sourceModule(USAGE_FILE, "", usageUrl)
+    else if (key === "./plan.mjs") module = sourceModule(path.join(REPO_DIR, "plan.mjs"), "", new URL("./plan.mjs", indexUrl).href)
     else if (key === "./platform.mjs") module = sourceModule(PLATFORM_FILE, "", platformUrl)
     else if (key === "./array-items.mjs") module = sourceModule(ARRAY_ITEMS_FILE, "", arrayItemsUrl)
     else if (key === "./cloak.mjs") module = sourceModule(CLOAK_FILE, "", cloakUrl)

@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { agySpawnSpec, childEnv as agyChildEnv } from "./platform.mjs"
 import { cannotSignIn, isDead, noteDead, storedSignIn } from "./signin.mjs"
+import { fetchAccountPlan } from "./plan.mjs"
 
 const DEFAULT_TIMEOUT_MS = 15_000
 const MAX_TIMEOUT_MS = 18_000 // Magpie bounds an auth.usage call to 20 seconds.
@@ -316,6 +317,7 @@ export async function fetchUsage(agy, {
   signal,
   tempRoot = os.tmpdir(),
   getModels = () => [],
+  readPlan = fetchAccountPlan,
 } = {}) {
   if (!agy) throw new UsageError("agy CLI not found. Install it and run `agy` once to sign in.")
   const deadline = Date.now() + timeout(timeoutMs)
@@ -363,7 +365,14 @@ export async function fetchUsage(agy, {
     result = null
     result = await run(agy, [...(geminiDir ? [`--gemini_dir=${geminiDir}`] : []), "-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`], options)
     if (result.code !== 0) throw commandFailure(result.stderr + "\n" + result.stdout)
-    return parseUsageReport(result.stdout, { models: getModels(agy) })
+    const usage = parseUsageReport(result.stdout, { models: getModels(agy) })
+    // Plan lookup is optional and must never invalidate working CLI quotas or
+    // sign-in. It uses this profile's freshly stored token, not another login.
+    try {
+      const plan = await readPlan({ env, geminiDir, signal })
+      if (plan) usage.plan = plan
+    } catch {}
+    return usage
   } catch (error) {
     if (error?.kind !== "cancel") {
       let detail = ""

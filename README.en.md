@@ -149,7 +149,7 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.4 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to 0.2.5 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
 The marketplace and npm commands below install the upstream community version, without this repository's changes.
 
 From the Magpie community plugins: find "Antigravity (local agy CLI)" on
@@ -245,6 +245,22 @@ magpie quota refresh agy-cli --json
 The numbers come from the selected account's agy `/usage` report, broken down
 by model group. Named accounts query through their own credential directories. A window with no
 measurable data shows "Limits not available" rather than a fake 0% or 100%.
+
+Since 0.2.5, each successful quota refresh also queries the selected account's
+subscription and returns Magpie's `plan` field for display on the account.
+Like the community Antigravity plugin, this reads Google's `loadCodeAssist`
+paid tier name, falling back to the current tier name or ID. Quota sizes never
+imply a plan. It reuses only that account's CLI-stored access token, without
+refreshing or rewriting credentials or onboarding the account. Named profiles,
+the default account's native keyring, and headless Linux credential files are supported.
+
+This additional metadata query allows at most 1.5 seconds for credential reads
+and HTTP combined. Missing/expired credentials, API failures, or an absent plan
+omit the plan while preserving successful quotas and sign-in state. The next
+successful quota refresh queries it again; another account's plan is never used.
+Update and reload the plugin, then refresh each account's quota to display the
+name returned by Google. **Chat still runs through `agy acp`, and quotas through
+CLI `/usage`; this does not switch chat to Antigravity's direct API.**
 
 Since 0.2.4, measured windows carry an exact `models` allowlist from the selected
 account's catalog, including base aliases and listed high, low, tiered or other

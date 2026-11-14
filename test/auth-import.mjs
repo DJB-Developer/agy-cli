@@ -44,6 +44,56 @@ for (const platform of ["linux", "darwin", "win32"]) {
   })
 }
 
+test("Magpie usage returns each account's plan after CLI token renewal; chat stays on ACP", async () => {
+  const calls = []
+  let failPlan = false
+  await withKit({
+    env: { AGY_BRIDGE_STORED_SIGNIN: "" },
+    fetch: async (url, init) => {
+      calls.push({ url, token: init.headers.Authorization })
+      if (failPlan) return new Response("private upstream error", { status: 403 })
+      return Response.json({ paidTier: { name: init.headers.Authorization === "Bearer access-a" ? "Google AI Pro" : "Google AI Ultra" } })
+    },
+    onSpawn: (_file, args) => {
+      if (args.includes("--version")) return { stdout: "1.5.9\n" }
+      if (!args.includes("/usage")) return 0
+      const file = path.join(profileOf(args), "antigravity-cli", "antigravity-oauth-token")
+      const stored = JSON.parse(fs.readFileSync(file, "utf8"))
+      stored.token.access_token = `access-${nameOf(args)}`
+      stored.token.expiry = "2099-01-01T00:00:00Z"
+      fs.writeFileSync(file, JSON.stringify(stored))
+      return { stdout: JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups: [{ name: "Gemini Models", buckets: [
+        { id: "weekly", remainingFraction: 0.8 },
+      ] }] } } }) }
+    },
+  }, async kit => {
+    const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
+    const readA = () => kit.plugin.auth.usage(async () => authOf(a))
+    const [usageA, usageB, duplicateA] = await Promise.all([readA(), kit.plugin.auth.usage(async () => authOf(b)), readA()])
+    assert.equal(usageA.plan, "Google AI Pro", usageA.error)
+    assert.equal(usageB.plan, "Google AI Ultra", usageB.error)
+    assert.equal(duplicateA.plan, usageA.plan)
+    assert.equal(calls.length, 2, "concurrent quota refreshes share one metadata call per account")
+    assert.deepEqual(new Set(calls.map(call => call.token)), new Set(["Bearer access-a", "Bearer access-b"]))
+    assert.ok(calls.every(call => call.url.endsWith(":loadCodeAssist")))
+    failPlan = true
+    const failed = await readA()
+    assert.equal(failed.plan, undefined, "no stale/other account's plan after failure")
+    assert.equal(failed.windows[0].used, 20)
+    assert.equal(failed.signIn, "kept")
+    assert.equal(failed.error, undefined)
+    failPlan = false
+    assert.equal((await readA()).plan, "Google AI Pro", "metadata failure must not trigger quota/auth backoff")
+    const before = calls.length
+    kit.defaultPrompt = async agent => { await agent.text("CLI reply"); return { stopReason: "end_turn" } }
+    const request = await client(kit, authOf(a))
+    const reply = await readSse(await request(baseBody()))
+    assert.equal(reply.content[0].text, "CLI reply")
+    assert.ok(kit.acpSpawns.some(spawn => nameOf(spawn.args) === "a" && spawn.args.includes("acp")))
+    assert.equal(calls.length, before, "chat must not call the plan or direct inference API")
+  })
+})
+
 test("failed and duplicate imports leave existing accounts and live requests untouched", async () => {
   await withKit({}, async kit => {
     assert.equal((await add(kit, "existing")).type, "success")

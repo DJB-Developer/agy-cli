@@ -109,7 +109,7 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.4。现有账号保留，可继续添加其他账号。
+已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.5。现有账号保留，可继续添加其他账号。
 以下市场和 npm 命令安装的是上游社区版本，不包含本仓库的改动。
 
 从 Magpie 社区插件市场安装（推荐）：在 Magpie 的 Plugins 页找到「Antigravity (local agy CLI)」点安装，或在终端运行：
@@ -189,6 +189,17 @@ magpie quota refresh agy-cli --json
 额度数据来自所选账号的 agy `/usage` 报告，按模型组列出订阅窗口。
 命名账号使用各自独立的凭据目录查询。没有可测量数据的窗口会显示
 "Limits not available"，而不是 0% 或 100%。
+
+从 0.2.5 起，每次成功刷新额度后，还会查询当前账号的套餐，并通过 Magpie 的 `plan`
+字段在账号界面显示。查询方式参考社区 Antigravity 插件：读取 Google `loadCodeAssist`
+返回的付费套餐名称，缺失时使用当前 tier 的名称或 ID；不根据额度大小猜测套餐。
+只复用该账号 CLI 已保存的 access token，不额外刷新或改写凭据，不执行账号开通。
+命名账号、默认账号的原生钥匙串和无桌面 Linux 凭据文件均支持。
+
+套餐查询是额外的元数据请求，读取凭据和网络请求合计最多等待 1.5 秒；不可读、过期、
+接口失败或未提供套餐时省略套餐，保留正常的额度与登录状态。下一次成功刷新额度会重新查询，
+不会借用其他账号的套餐。升级并重新加载插件后，刷新各账号额度即可显示 Google 返回的名称。
+**聊天仍然通过 `agy acp`，额度仍然来自 CLI `/usage`，不会改成 Antigravity 的直接聊天 API。**
 
 从 0.2.4 起，已测量的额度通过 `models` 精确绑定到当前账号模型目录里的模型 ID，
 包括基础名称和 high、low、tiered 等实际列出的变体。Gemini、Claude/GPT 分别计算；
