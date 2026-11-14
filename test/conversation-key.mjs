@@ -9,13 +9,13 @@ import { baseBody, createBridgeKit, readSse } from "./testkit.mjs"
 // Expose private seams from an isolated copy, without adding production exports.
 const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-convkey-test-"))
 const entry = new URL("../index.mjs", import.meta.url)
-let source = fs.readFileSync(entry, "utf8").replace("// TEST_RUNTIME_SEAMS", "conversationKey, stripVolatileOpening, stripVolatileSystem, isContinuedOpening, openingTextOf, sameInstructions, historyKey, takeParked, park, instructionsIdentity, Turn,")
+let source = fs.readFileSync(entry, "utf8").replace("// TEST_RUNTIME_SEAMS", "conversationKey, stripVolatileOpening, stripVolatileSystem, isContinuedOpening, openingTextOf, sameInstructions, historyKey, takeParked, park, instructionsIdentity, digest, Turn,")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
 process.env.AGY_BRIDGE_STATE_FILE = path.join(workspace, "sessions.json")
 process.env.HOME = workspace
 fs.writeFileSync(
   path.join(workspace, "bridge.mjs"),
-  source + "\nconst { conversationKey, stripVolatileOpening, stripVolatileSystem, isContinuedOpening, openingTextOf, sameInstructions, historyKey, takeParked, park, instructionsIdentity, Turn } = defaultRuntime;\nexport { conversationKey, stripVolatileOpening, stripVolatileSystem, isContinuedOpening, openingTextOf, sameInstructions, historyKey, takeParked, park, instructionsIdentity, Turn };\n",
+  source + "\nconst { conversationKey, stripVolatileOpening, stripVolatileSystem, isContinuedOpening, openingTextOf, sameInstructions, historyKey, takeParked, park, instructionsIdentity, digest, Turn } = defaultRuntime;\nexport { conversationKey, stripVolatileOpening, stripVolatileSystem, isContinuedOpening, openingTextOf, sameInstructions, historyKey, takeParked, park, instructionsIdentity, digest, Turn };\n",
 )
 const {
   conversationKey,
@@ -28,6 +28,7 @@ const {
   takeParked,
   park,
   instructionsIdentity,
+  digest,
   Turn,
 } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
@@ -364,6 +365,33 @@ test("takeParked uses the same instruction stripping, so a clock change still re
     instructionsIdentity("Rules.\nCurrent date: 2026-11-10\n"),
     instructionsIdentity("Rules.\nCurrent date: 2026-11-11\n"),
   )
+})
+
+test("#1151: a parked session is keyed on the instructions as agy was sent them", () => {
+  // A session agy opened before a line was reworded keeps the line, so a
+  // version that rewords it must not resume that session.
+  const convKey = "test-parked-sent"
+  const history = [{ role: "user", content: STABLE }, { role: "assistant", content: "ok" }]
+  const instructions = "You are a coding agent running in the Codex CLI, a terminal-based coding assistant.\nRules.\n"
+  const proc = {
+    convKey,
+    sessionId: "sess-sent",
+    expectedMessages: history,
+    instructions,
+    workDir: "/tmp/agy-park-test",
+    hasSentFirstTurn: true,
+    historyInvalid: false,
+    turn: null,
+    dead: false,
+    canPark() { return true },
+  }
+  park(proc)
+  const entry = JSON.parse(fs.readFileSync(process.env.AGY_BRIDGE_STATE_FILE, "utf8")).entries.find((e) => e.key === convKey)
+  const sent = "You're a coding agent running in the Codex CLI, a terminal-based coding assistant.\nRules.\n"
+  assert.equal(entry.instructionsHash, digest(instructionsIdentity(sent)))
+  assert.notEqual(entry.instructionsHash, digest(instructionsIdentity(instructions)))
+  const resumed = takeParked(convKey, { workDir: "/tmp/agy-park-test", instructions, history })
+  assert.equal(resumed?.sessionId, "sess-sent", "the same instructions still resume")
 })
 
 async function withKit(options, fn) {

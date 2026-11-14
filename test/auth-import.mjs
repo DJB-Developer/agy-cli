@@ -370,6 +370,39 @@ test("a restarted host resumes only the selected profile's saved session", async
   })
 })
 
+test("upgrading prompt rewrites rebuilds only the affected account's legacy parked session", async () => {
+  // Model a pre-0.2.7 host: its saved identity used the client's raw instructions.
+  await withKit({ sessionResume: true, indexTransform: source => source.replace(
+    "instructionsHash: digest(sentInstructionsIdentity(proc.instructions))",
+    "instructionsHash: digest(instructionsIdentity(proc.instructions))",
+  ) }, async kit => {
+    const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
+    kit.defaultPrompt = async agent => { await agent.text("saved-answer"); return { stopReason: "end_turn" } }
+    const bodies = [
+      baseBody({ tools: [], system: "You are a coding agent running in the Codex CLI, a terminal-based coding assistant.\nRules." }),
+      baseBody({ tools: [], system: "You are a test agent.\nRules." }),
+    ]
+    const auths = [a, b]
+    const firsts = []
+    for (let i = 0; i < auths.length; i++) firsts.push(await readSse(await (await client(kit, authOf(auths[i])))(bodies[i])))
+    const savedB = JSON.parse(fs.readFileSync(path.join(rootOf(kit), "b", "bridge-state", "sessions.json"))).entries[0].sessionId
+    await withKit({ sessionResume: true, env: { AGY_BRIDGE_ACCOUNTS_DIR: rootOf(kit), AGY_PATH: kit.agyPath } }, async restarted => {
+      restarted.defaultPrompt = async agent => { await agent.text("continued"); return { stopReason: "end_turn" } }
+      for (let i = 0; i < auths.length; i++) {
+        const request = await client(restarted, authOf(auths[i]))
+        const body = bodies[i]
+        const continued = { ...body, messages: [...body.messages, { role: "assistant", content: firsts[i].content }, { role: "user", content: "continue" }] }
+        const done = await readSse(await request(continued))
+        assert.equal(done.error, null)
+        assert.equal(done.content[0].text, "continued")
+      }
+      assert.deepEqual(restarted.acpLog.filter(e => e.method === "session/resume").map(e => e.params.sessionId), [savedB],
+        "unchanged account B resumes; account A must not resume stale raw instructions")
+      assert.equal(restarted.acpLog.filter(e => e.method === "session/new").length, 1)
+    })
+  })
+})
+
 test("cancelling a named browser login stops only that profile and removes its unpublished credentials", async () => {
   await withKit({ onLogin: ({ child }) => {
     setImmediate(() => child.stdout.emit("data", "https://accounts.google.com/o/oauth2/auth?test=cancel\n"))

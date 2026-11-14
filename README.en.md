@@ -151,7 +151,13 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.6 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to 0.2.7 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+
+0.2.7 ports community 0.1.49's resume fix: saved sessions are checked against
+the instructions actually sent to the CLI. After prompt rewrites change, affected
+old sessions rebuild from client history instead of resuming stale instructions
+that keep failing with 429. Instructions requiring no rewrite can still resume.
+Checks remain isolated per account and still reject a different Minimal Agent mode.
 
 0.2.6 ports the six community agy-cli fixes from 0.1.43 through 0.1.48:
 network/credit/429 error handling, tool-loop memory cleanup, tool images sent
