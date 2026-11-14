@@ -9,6 +9,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
 import { createServiceStatus, isServiceSuspension, SUSPENSION_MESSAGE, TOS_MESSAGE } from "./service-status.mjs"
+import { createMagpieQuarantine } from "./quarantine.mjs"
 import { backgroundBlocked as defaultBackgroundBlocked, cannotSignIn, forgetStoredSignIn as defaultForgetStoredSignIn, isDead, parseRefreshToken, storedSignInNow as defaultStoredSignInNow } from "./signin.mjs"
 import { sanitizePatternFields } from "./re2-pattern.mjs"
 import { startLogin } from "./login.mjs"
@@ -28,6 +29,7 @@ process.once("exit", () => { for (const cleanup of runtimeCleanups) cleanup() })
 // Magpie owns persistence and supplies a live getter. Older hosts/OpenCode
 // retain the environment fallback; a saved UI false overrides an env true.
 let readMinimalAgentOption = null
+let readAutoDisableOption = null
 const minimalAgent = () => readMinimalAgentOption
   ? readMinimalAgentOption() === true
   : process.env.AGY_BRIDGE_MINIMAL_AGENT === "1"
@@ -36,7 +38,11 @@ const minimalAgent = () => readMinimalAgentOption
 // sessions, model catalogs and control sockets. No request can see another
 // profile's live session, even when its history or tool IDs are identical.
 function createAccountRuntime(account = DEFAULT_ACCOUNT) {
-const serviceStatus = createServiceStatus(path.join(path.dirname(sessionStateFile()), "service-status.json"))
+const quarantine = createMagpieQuarantine({ user: account.name,
+  enabled: () => readAutoDisableOption !== null && readAutoDisableOption() !== false })
+const serviceStatus = createServiceStatus(path.join(path.dirname(sessionStateFile()), "service-status.json"), {
+  onSuspended: () => { quarantine.ensure() }, routingNote: quarantine.note,
+})
 // models parses global flags only before its subcommand; ACP has its own
 // parser and takes them after `acp` (verified with native agy 1.5.9).
 const spawnAgy = (file, args, opts = {}) => account.dir ? nativeSpawnAgy(file,
@@ -6146,6 +6152,7 @@ function jsonError(status, message, code, { extra, headers, noRetry = false } = 
     JSON.stringify({
       type: "error",
       error: { type: status === 403 ? "permission_error" : status === 400 ? "invalid_request_error" : "api_error",
+        ...(status === 403 ? { status } : {}),
         ...(code ? { code } : {}), message: String(message || "unknown error"), ...(extra ?? {}) },
     }),
     { status, headers: { "Content-Type": "application/json",
@@ -6156,6 +6163,7 @@ function jsonError(status, message, code, { extra, headers, noRetry = false } = 
 // On Windows child.kill() ends agy alone and leaves the cmd.exe and nc it
 // started, so one taskkill /T ends every tree before the workspaces go.
 function reapOnExit() {
+  quarantine.dispose()
   const windows = process.platform === "win32"
   const pids = []
   for (const proc of allProcs) {
@@ -6227,6 +6235,8 @@ async function checkAccount(account) {
 export const AntigravityBridgePlugin = async (input = {}) => {
   readMinimalAgentOption = typeof input.magpie?.option === "function"
     ? () => input.magpie.option("agy-cli", "minimal_agent") : null
+  readAutoDisableOption = typeof input.magpie?.option === "function"
+    ? () => input.magpie.option("agy-cli", "auto_disable_suspended") : null
   const legacy = await pluginFor(DEFAULT_ACCOUNT)
   const selected = async getAuth => resolveAccount(typeof getAuth === "function" ? await getAuth() : undefined,
     { allowMissing: typeof getAuth !== "function" })
@@ -6242,6 +6252,13 @@ export const AntigravityBridgePlugin = async (input = {}) => {
         description: "Remove agy's default prompt components; keep client instructions and bridge tool guidance. Applies to new turns; running requests finish unchanged.",
         descriptions: { zh: "去掉 agy 默认提示组件，保留客户端系统提示词和插件工具说明。保存后从新的对话轮次生效，正在执行的请求会继续完成。" },
         default: process.env.AGY_BRIDGE_MINIMAL_AGENT === "1",
+      }, {
+        key: "auto_disable_suspended",
+        label: "Automatically disable TOS-blocked accounts",
+        labels: { zh: "自动关闭被封禁账号", "zh-TW": "自動關閉被停權帳號" },
+        description: "Use the local Magpie web account toggle after explicit TOS denial. Requires the existing MAGPIE_WEB_KEY and web listener on port 3430. Credentials are kept; recovery is manual.",
+        descriptions: { zh: "明确检测到 TOS 封禁后，通过容器内 3430 端口的管理接口关闭该账号。复用已有 MAGPIE_WEB_KEY，保留账号凭据，解封后需手动恢复。接口失败时仍在插件内拦截，并显示原因。" },
+        default: true,
       }],
       methods: [
         { ...legacy.auth.methods[0], label: "Use the existing CLI account (legacy default)" },

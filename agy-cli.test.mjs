@@ -22,6 +22,7 @@ for (const [name, mocks] of [
   ["plan.mjs", false],
   ["signin.mjs", false],
   ["service-status.mjs", false],
+  ["quarantine.mjs", false],
   ["auth-import.mjs", false],
   ["plugin-options.mjs", false],
   ["headless-signin.mjs", false],

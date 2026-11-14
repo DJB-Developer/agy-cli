@@ -2,7 +2,7 @@ import fs from "node:fs"
 import path from "node:path"
 
 export const TOS_MESSAGE = "This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product."
-export const SUSPENSION_MESSAGE = `Antigravity service suspended (403 / TOS_VIOLATION): ${TOS_MESSAGE}`
+export const SUSPENSION_MESSAGE = `Antigravity account disabled (403 / TOS_VIOLATION): ${TOS_MESSAGE}`
 
 // Only inspect CLI errors or metadata HTTP 403s, never prompts or ordinary
 // answer text. A generic 403, region restriction, expired token or exhausted
@@ -27,13 +27,13 @@ export function isServiceSuspension(value, depth = 0) {
 // A profile is immutable after import. Keep its service state independently
 // of OAuth token fingerprints: refreshing tokens does not restore service.
 // Recovery is explicit, after an appeal: stop the plugin and remove this file.
-export function createServiceStatus(file) {
+export function createServiceStatus(file, { onSuspended = () => {}, routingNote = () => "" } = {}) {
   let suspended = false
   try { suspended = JSON.parse(fs.readFileSync(file, "utf8"))?.reason === "TOS_VIOLATION" } catch {}
   return {
-    get: () => suspended,
+    get: () => { if (suspended) onSuspended(); return suspended },
     mark() {
-      if (suspended) return
+      if (suspended) { onSuspended(); return }
       suspended = true
       const tmp = `${file}.${process.pid}.tmp`
       try {
@@ -44,7 +44,8 @@ export function createServiceStatus(file) {
         try { fs.rmSync(tmp, { force: true }) } catch {}
         console.error("[agy-service] Could not persist suspension; this runtime remains blocked. Check state directory permissions.")
       }
+      onSuspended()
     },
-    usage: () => ({ windows: [], error: SUSPENSION_MESSAGE, signIn: "expired" }),
+    usage: () => ({ windows: [], error: [SUSPENSION_MESSAGE, routingNote()].filter(Boolean).join("\n"), signIn: "expired" }),
   }
 }

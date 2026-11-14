@@ -150,7 +150,7 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.12 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to 0.2.13 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
 
 0.2.9 restores CLI `/usage` quotas with optional HTTP plan lookup, retaining
 model-group routing and plan ID recognition. Plan failures do not affect quota,
@@ -464,8 +464,8 @@ Whole responses return HTTP 403. Streams emit `permission_error` with numeric
 assistant text. Current Magpie can fail over to another available account before
 answer content is sent. For another provider after all accounts fail, configure a
 fallback model in a Magpie routing group and request that group. Seamless switching
-after partial output is not guaranteed. Keep Magpie updated for its agy-cli
-suspension recognition and stream-status handling.
+after partial output is not guaranteed. Older Magpie protocol translation can lose
+the numeric stream status; automatic account disabling below does not rely on it.
 
 The mark persists in `<profile>/bridge-state/service-status.json`, or beside the
 legacy default profile's `sessions.json`. It stores only a reason code and detection
@@ -512,3 +512,29 @@ This is a lightweight check, not proof of inference access: if only the chat end
 refuses an account, quota/plan refresh may not expose it. Successful metadata queries
 do not display a verified chat status or clear a persisted suspension. CLI eligibility
 and region errors retain their reasons without being labelled TOS bans.
+
+## Automatic routing quarantine (0.2.13)
+
+The **Automatically disable TOS-blocked accounts** plugin switch defaults to on.
+After explicit TOS denial, the profile stays blocked locally and the plugin calls
+the existing `POST http://127.0.0.1:3430/api/login/off` asynchronously using the
+container's existing `MAGPIE_WEB_KEY`. This is the same account toggle as the UI,
+not credential deletion or a direct edit to Magpie files. Magpie continues to own
+account selection, session affinity, concurrency, quota routing and attribution.
+Chat and quotas still use agy CLI; plans still use HTTP.
+
+This targets `magpie web` on port 3430 with a fixed web key, including the inspected
+v0.1.3078 API. Requests only go to loopback, bypass vendor proxies, never follow
+redirects and never print the key. Reload the plugin and refresh quotas to handle
+previously marked named profiles. Concurrent detections coalesce; failures retry
+on later checks at most once a minute; success is held for five minutes. Usage
+errors show the outcome. Missing keys, another port, legacy default profiles and
+API failures leave the local CLI guard active and request manual account disable.
+
+v0.1.3078 refuses to disable the last enabled account; another enabled account
+with a valid sign-in must exist. With none available, requests fail locally or use
+a configured routing-group fallback. Switching after partial output is not
+guaranteed. Old 402 rest history may remain, but a disabled account leaves future
+routing. Recovery is manual after a successful appeal: remove the service-state
+file as described above and re-enable the account. Turning this switch off leaves
+only local blocking, not automatic changes to Magpie's enabled-account list.

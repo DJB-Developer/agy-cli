@@ -532,6 +532,7 @@ export async function createBridgeKit(options = {}) {
     address() { return { address: "127.0.0.1", family: "IPv4", port: 45999 } },
   }
   const overrides = {
+    "node:http": options.httpRequest ? { request: options.httpRequest } : {},
     "node:child_process": { spawn, spawnSync, execFile },
     "node:net": {
       createServer(handler) {
@@ -572,6 +573,7 @@ export async function createBridgeKit(options = {}) {
     let module
     if (key === "./usage.mjs") module = sourceModule(USAGE_FILE, "", usageUrl)
     else if (key === "./service-status.mjs") module = sourceModule(path.join(REPO_DIR, "service-status.mjs"), "", new URL("./service-status.mjs", indexUrl).href)
+    else if (key === "./quarantine.mjs") module = sourceModule(path.join(REPO_DIR, "quarantine.mjs"), "", new URL("./quarantine.mjs", indexUrl).href)
     else if (key === "./plan.mjs") module = sourceModule(path.join(REPO_DIR, "plan.mjs"), "", new URL("./plan.mjs", indexUrl).href)
     else if (key === "./platform.mjs") module = sourceModule(PLATFORM_FILE, "", platformUrl)
     else if (key === "./array-items.mjs") module = sourceModule(ARRAY_ITEMS_FILE, "", arrayItemsUrl)

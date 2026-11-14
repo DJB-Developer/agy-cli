@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import fs from "node:fs"
 import path from "node:path"
+import { EventEmitter } from "node:events"
 import { baseBody, continueWithToolResults, createBridgeKit, readSse, MESSAGES_URL, modelsOutput } from "./testkit.mjs"
 
 const profileOf = args => args.find(arg => arg.startsWith("--gemini_dir="))?.slice("--gemini_dir=".length)
@@ -489,6 +490,56 @@ test("Magpie's named-account quota hook exposes the original error with credenti
 })
 
 const TOS_MESSAGE = "This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product."
+test("quota-detected TOS automatically turns off that Magpie account and keeps its credentials", async () => {
+  const calls = []
+  await withKit({
+    env: { MAGPIE_WEB_KEY: "test-only-admin-key-123456" },
+    pluginInput: { magpie: { option: (_provider, key) => key === "auto_disable_suspended" } },
+    httpRequest: (options, callback) => {
+      const req = new EventEmitter()
+      req.destroy = () => {}
+      req.end = body => {
+        calls.push({ options, body: JSON.parse(body) })
+        setImmediate(() => {
+          const res = Object.assign(new EventEmitter(), { statusCode: 200, resume() {} })
+          callback(res)
+        })
+      }
+      return req
+    },
+    onSpawn: (_file, args) => {
+      if (args.includes("--version")) return { stdout: "1.5.9\n" }
+      if (args.includes("/usage")) return { stdout: JSON.stringify({ status: "ERROR", error: TOS_MESSAGE }) }
+      return 0
+    },
+  }, async kit => {
+    const [a, b] = await Promise.all([add(kit, "blocked"), add(kit, "healthy")])
+    const read = () => kit.plugin.auth.usage(async () => authOf(a))
+    const usage = await read()
+    assert.equal(usage.signIn, "expired")
+    assert.match(usage.error, /TOS_VIOLATION/)
+    assert.equal(calls.length, 1)
+    assert.deepEqual(calls[0].body, { agent: "plugin:agy-cli", user: "blocked" })
+    assert.equal(calls[0].options.hostname, "127.0.0.1")
+    assert.equal(calls[0].options.port, 3430)
+    assert.equal(calls[0].options.path, "/api/login/off")
+    await new Promise(resolve => setImmediate(resolve))
+    assert.match((await read()).error, /is disabled in Magpie routing/)
+    const request = await client(kit, authOf(a))
+    const before = kit.acpSpawns.length
+    const denied = await request(baseBody())
+    assert.equal(denied.status, 403)
+    assert.equal((await denied.json()).error.status, 403)
+    assert.equal(kit.acpSpawns.length, before)
+    assert.equal(calls.length, 1)
+    assert.ok(fs.existsSync(fileOf(kit, "blocked")), "disable is not credential deletion")
+    kit.defaultPrompt = async agent => { await agent.text("healthy reply"); return { stopReason: "end_turn" } }
+    const next = await client(kit, authOf(b))
+    assert.equal((await readSse(await next(baseBody()))).content[0].text, "healthy reply")
+    assert.equal(calls.length, 1, "healthy account must never be disabled")
+  })
+})
+
 test("TOS warning becomes a permission error, persists per account, and never becomes a successful reply", async () => {
   await withKit({}, async kit => {
     const [a, b] = await Promise.all([add(kit, "suspended"), add(kit, "healthy")])
@@ -507,7 +558,7 @@ test("TOS warning becomes a permission error, persists per account, and never be
     assert.match(error.message, /violation of Terms of Service/)
     const usage = await kit.plugin.auth.usage(async () => authOf(a))
     assert.match(usage.error, /violation of Terms of Service/)
-    assert.equal(usage.signIn, "expired", "host must remove suspended credentials from rotation")
+    assert.equal(usage.signIn, "expired", "report unusable sign-in separately from routing quarantine")
     const before = kit.acpSpawns.length
     assert.equal((await requestA(baseBody())).status, 403)
     assert.equal(kit.acpSpawns.length, before, "do not start another CLI for suspended account")
