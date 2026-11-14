@@ -17,7 +17,6 @@ delete process.env.AGY_CLI_DISABLE_AUTO_UPDATE
 delete process.env.AGY_BRIDGE_MINIMAL_AGENT
 process.env.FAKE_AGY_LOG = logPath
 process.env.FAKE_AGY_STATE = stateDir
-process.env.AGY_BRIDGE_ACCOUNTS_DIR = path.join(here, "accounts")
 const bridgeStateFile = path.join(stateDir, "bridge-sessions.json")
 process.env.AGY_BRIDGE_STATE_FILE = bridgeStateFile
 process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "1000"
@@ -699,38 +698,18 @@ const model = "agy-cli/gemini-test"
 const legacyModel = "agy-cli/gemini-test-low"
 
 {
-  const dir = path.join(process.env.AGY_BRIDGE_ACCOUNTS_DIR, "quota-smoke")
-  fs.mkdirSync(path.join(dir, "antigravity-cli"), { recursive: true })
-  fs.writeFileSync(path.join(dir, ".ready"), "1\n")
-  fs.writeFileSync(path.join(dir, "antigravity-cli", "antigravity-oauth-token"), JSON.stringify({ token: { access_token: "smoke-access", expiry: "2099-01-01T00:00:00Z" } }))
-  const realFetch = globalThis.fetch
-  const skip = process.env.AGY_BRIDGE_STORED_SIGNIN
-  process.env.AGY_BRIDGE_STORED_SIGNIN = ""
-  const httpCalls = []
-  globalThis.fetch = async (url, init) => {
-    httpCalls.push(url)
-    check("quota HTTP uses selected profile", init.headers.Authorization === "Bearer smoke-access")
-    return Response.json(url.endsWith(":loadCodeAssist") ? { cloudaicompanionProject: "smoke-project", paidTier: { id: "g1-pro-tier" } }
-      : { groups: [{ displayName: "Gemini Models", buckets: [{ bucketId: "gemini-weekly", window: "weekly", remainingFraction: 0.6, resetTime: "2026-10-27T00:00:00Z" }] }] })
-  }
-  let usage
-  try { usage = await plugin.auth.usage(async () => ({ type: "api", key: "agy:quota-smoke" }), {}) }
-  finally {
-    globalThis.fetch = realFetch
-    if (skip === undefined) delete process.env.AGY_BRIDGE_STORED_SIGNIN
-    else process.env.AGY_BRIDGE_STORED_SIGNIN = skip
-  }
-  check("auth.usage exposes measured HTTP quota", usage.windows?.[0]?.used === 40 && usage.windows[0].name === "Gemini · 7 days")
+  const usage = await plugin.auth.usage(async () => ({ type: "api", key: "agy" }), {})
+  check("auth.usage exposes measured CLI quota", usage.windows?.[0]?.used === 40 && usage.windows[0].name === "Gemini · 7 days")
   check("auth.usage preserves explicit cadence and reset", usage.windows?.[0]?.span === 604800 && usage.windows[0].resetsAt === "2026-10-27T00:00:00.000Z")
   check("auth.usage participates in routing and keeps bridge auth", usage.windows?.[0]?.aside === false && usage.signIn === "kept")
   const quotaModels = usage.windows?.[0]?.models ?? []
   check("auth.usage scopes Gemini quota to base and effort IDs even before catalog refresh",
     ["gemini-3.8-flash", "gemini-3.8-flash-high", "gemini-3.8-flash-low"].every(id => quotaModels.includes(id)) &&
     quotaModels.every(id => id.startsWith("gemini-")))
-  check("auth.usage shows the HTTP plan without inventing Google identity", !usage.user && usage.plan === "Google AI Pro")
+  check("auth.usage does not invent Google account identity", !usage.user && !usage.plan)
   const calls = logs().filter(event => event.type === "usage")
-  check("auth.usage never starts the CLI with a valid access token", calls.length === 0)
-  check("auth.usage queries only metadata endpoints", httpCalls.length === 2 && httpCalls.every(url => /:loadCodeAssist$|:retrieveUserQuotaSummary$/.test(url)))
+  check("auth.usage uses a separate cleaned workspace", calls.length === 1 && !fs.existsSync(calls[0].cwd))
+  check("auth.usage runs only the native usage command", calls[0]?.args.includes("/usage") && calls[0]?.args.includes("magpie-usage"))
 }
 
 {

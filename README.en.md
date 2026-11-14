@@ -47,7 +47,7 @@ channel: Antigravity's models over ACP. The differences:
 - **Tool calls**: Antigravity ACP ends the turn with the call as the reply's
   `tool_calls`. This plugin feeds the client's result back into the same agy
   turn (see "Tool bridge" below).
-- **Usage**: this plugin queries Google's grouped quotas over HTTP; Antigravity ACP reads
+- **Usage**: this plugin reads agy's CLI `/usage` report; Antigravity ACP reads
   the quota each reply carries.
 
 ## Tool bridge
@@ -132,7 +132,7 @@ turn); the models a client gets remain agy's decision.
   and 1.5.0; image input needs 1.5.0.
 - A Magpie build with OpenCode-style provider plugin support.
 - agy older than 1.4.12 is refused for sessions (see "Tool bridge"), and older
-  than 1.1.11 for CLI token renewal during quota queries, because those builds can treat `/usage` as
+  than 1.1.11 for CLI quota queries, because those builds can treat `/usage` as
   an ordinary model prompt.
 - **Auto-update**: the agy processes the plugin starts get
   `AGY_CLI_DISABLE_AUTO_UPDATE=true` by default, so the processes in the pool
@@ -150,11 +150,11 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.8 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to 0.2.9 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
 
-0.2.8 queries plan and grouped quotas over HTTP, following CLIProxyAPI, with
-fallback endpoints for partial quota summaries. agy CLI still renews expired
-tokens and handles all chat through ACP. Existing accounts need no reimport.
+0.2.9 restores CLI `/usage` quotas with optional HTTP plan lookup, retaining
+model-group routing and plan ID recognition. Plan failures do not affect quota,
+sign-in or ACP chat. Existing accounts need no reimport.
 
 0.2.7 ports community 0.1.49's resume fix: saved sessions are checked against
 the instructions actually sent to the CLI. After prompt rewrites change, affected
@@ -264,31 +264,26 @@ magpie quota agy-cli --json
 magpie quota refresh agy-cli --json
 ```
 
-Since 0.2.8, quota refresh uses the selected account's valid access token for
-HTTP metadata requests, following CLIProxyAPI and its management center:
+Since 0.2.9, quotas come from the selected account's `agy /usage --output-format json`.
+agy owns quota request headers, protocol and token renewal. The plugin maps its
+model groups, five-hour/weekly windows, remaining fractions and reset times.
+Each named profile uses its own credential directory; default accounts use agy's
+native store. There is no fallback to another account.
 
-- `loadCodeAssist` returns the account project and subscription. Prefer the paid
-  tier, otherwise the current tier; display its name or map known IDs to Free,
-  Pro, Ultra and Ultra Lite. Unknown tier IDs remain visible.
-- `retrieveUserQuotaSummary` returns model groups, five-hour/weekly windows,
-  remaining fractions and reset times. Try daily, sandbox and production hosts;
-  merge real buckets when a partial response lacks Gemini quotas.
-
-With a valid token, no CLI process starts. For an expired token or an explicit
-HTTP 401, run the selected account's restricted `agy /usage` command at most once
-so agy can renew its own token, then reread the saved access token and retry HTTP.
+After CLI quota succeeds, optional HTTP `loadCodeAssist` enriches the result with
+the plan using that account's CLI-stored access token. Prefer the paid tier,
+otherwise the current tier. Keep upstream names and recognize Free, Pro, Ultra
+and Ultra Lite IDs; display unknown IDs as received. No project is required and
+no HTTP quota endpoint is called. No fixed, unverified Hub User-Agent is set.
 The plugin never exchanges refresh tokens, writes credentials or onboards accounts.
-Missing/unreadable credentials do not trigger background sign-in. Named profiles,
-native default-account keyrings and headless Linux files are supported without
-falling back to another account.
 
-Every refresh queries current plan and quotas. Only the project ID can be reused
-for the same token. If plan lookup fails with a known account project, still query
-quota and omit the stale plan. If no project can be obtained, return an error.
-Each HTTP request allows up to four seconds; credential reads, CLI renewal and
-HTTP share a 15-second budget (maximum 18 seconds). Unknown windows show
-"Limits not available", never invented 0% or 100% readings.
-**Chat continues through `agy acp`; HTTP is used only for quota/plan metadata.**
+Plan lookup allows at most 1.5 seconds for credential reads and HTTP combined.
+Missing tokens, HTTP 401/403/429, transport failures, timeouts, malformed responses
+and absent plans only omit the plan. CLI quota and login state remain intact;
+plan failures do not trigger quota backoff or retain a stale plan. The next quota
+refresh retries plan lookup. CLI quota has a 15-second budget, capped at 18 seconds.
+Unknown windows show "Limits not available", never invented 0% or 100% readings.
+**Chat stays on `agy acp` and never waits for plan lookup; HTTP is plan-only.**
 
 Since 0.2.4, measured windows carry an exact `models` allowlist from the selected
 account's catalog, including base aliases and listed high, low, tiered or other
@@ -303,7 +298,7 @@ without extra model calls; refresh quota after the catalog learns new models.
 The generic Gemini pool covers Flash/Pro only. Argon requires its own reported
 group; it never borrows Flash/Pro quota when that group is absent. Unlike the
 community [Antigravity plugin](https://github.com/magpie-community/plugins/tree/main/packages/antigravity),
-this plugin reads HTTP group summaries without an extra `fetchAvailableModels` API
+this plugin reads CLI group quotas without an extra `fetchAvailableModels` API
 call for per-model readings. It cannot detect independent pools absent from the
 report, so unrecognized Gemini families remain outside the generic pool.
 
@@ -320,8 +315,8 @@ account shows its sign-in has expired until you sign in again. Other failed
 usage reads wait 10 minutes before the next try, doubling up to 6 hours.
 
 Each failed quota query emits one `[agy-usage]` JSON log entry with the account
-name, query stage and redacted original error in `detail`. HTTP failures retain
-the status code and upstream reason. Credentials, authentication headers, sensitive URL contents
+name, query stage, CLI version, exit code and redacted original error in `detail`.
+Plan failures are not quota failures. Credentials, authentication headers, sensitive URL contents
 and email addresses are filtered; diagnostic length is bounded. Shared concurrent
 queries log once, and backoff reads do not repeat the log. Successful queries and
 intentional cancellations do not produce error logs.
@@ -333,12 +328,12 @@ docker logs --since 10m magpie 2>&1 | grep -F '[agy-usage]'
 ```
 
 Magpie's quota error includes redacted original output after
-`HTTP error (redacted):` or `CLI error (redacted):`, limited to 4096 characters with a truncation marker when
+`CLI error (redacted):`, limited to 4096 characters with a truncation marker when
 needed. Update and reload the plugin, then refresh the affected account's quota
 to read the details directly in Magpie. Details remain available during failure
 backoff; changed credentials or a successful query clear the old details.
-HTTP 403, 429 and network timeouts do not invalidate the login; the UI preserves
-the upstream reason.
+Plan HTTP 401/403/429 and timeouts do not invalidate the login; quota errors
+preserve the original CLI reason.
 
 
 ## Environment variables

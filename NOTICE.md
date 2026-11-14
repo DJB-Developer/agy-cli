@@ -119,4 +119,5 @@ A1–A16、U1–U6 逐项并入。两边都有、且 `acb8d84` 写法更新的�
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/tree/905e70c48b47b7a1cb4a27dd3abc901e2cdd1e4a)
 及其 [Management Center](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/tree/3d893ec88938c3ceef200a15be6af8cf972564b3)。
 本仓独立实现 HTTP 查询、超时和错误脱敏，继续复用自身模型组路由；未引入其聊天执行器或 OAuth 续期实现。
-CLI `/usage` 运行器仅在需要获取新的 access token 时使用；原 U1–U6 的跨平台进程处理仍用于这一流程。
+0.2.8 中 CLI `/usage` 仅用于需要新 access token 时的续期；0.2.9 恢复每次额度刷新均通过 CLI。
+0.2.9 移除 HTTP 配额模块及固定 Hub User-Agent，保留 HTTP 套餐查询与套餐 ID 映射；原 U1–U6 的跨平台进程处理继续用于 CLI 额度查询。

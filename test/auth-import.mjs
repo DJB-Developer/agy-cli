@@ -44,62 +44,74 @@ for (const platform of ["linux", "darwin", "win32"]) {
   })
 }
 
-test("Magpie queries per-account HTTP quota/plan after CLI-only token renewal; chat stays on ACP", async () => {
+test("Magpie uses CLI quota and optional HTTP plans; plan failures never block routing or ACP chat", async () => {
   const calls = []
-  let failPlan = false
+  let mode = "ok", planSignal
   await withKit({
     env: { AGY_BRIDGE_STORED_SIGNIN: "" },
     fetch: async (url, init) => {
       calls.push({ url, token: init.headers.Authorization })
-      if (url.endsWith(":retrieveUserQuotaSummary")) {
-        const account = init.headers.Authorization === "Bearer access-a" ? "a" : "b"
-        assert.equal(JSON.parse(init.body).project, `project-${account}`)
-        return Response.json({ groups: [{ displayName: "Gemini Models", buckets: [{ bucketId: "gemini-weekly", remainingFraction: 0.8 }] }] })
-      }
-      if (failPlan) return new Response("private upstream error", { status: 403 })
-      return Response.json({ cloudaicompanionProject: init.headers.Authorization === "Bearer access-a" ? "project-a" : "project-b",
-        paidTier: { name: init.headers.Authorization === "Bearer access-a" ? "Google AI Pro" : "Google AI Ultra" } })
+      assert.equal(url, "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
+      assert.deepEqual(JSON.parse(init.body), { metadata: { ideType: "ANTIGRAVITY" } })
+      assert.equal(init.headers["User-Agent"], undefined, "do not send the unverified Hub identity")
+      if (mode === "network") throw Error("private network error")
+      if (mode === "invalid") return new Response("invalid json")
+      if (mode === "timeout") { planSignal = init.signal; return new Promise(() => {}) }
+      if (typeof mode === "number") return new Response("private upstream error", { status: mode })
+      // No project is needed for CLI quotas; ID-only tiers must still display.
+      return Response.json({ paidTier: { id: init.headers.Authorization === "Bearer access-a" ? "g1-pro-tier" : "g1-ultra-tier" } })
     },
     onSpawn: (_file, args) => {
       if (args.includes("--version")) return { stdout: "1.5.9\n" }
       if (!args.includes("/usage")) return 0
       const file = path.join(profileOf(args), "antigravity-cli", "antigravity-oauth-token")
-      const stored = JSON.parse(fs.readFileSync(file, "utf8"))
-      stored.token.access_token = `access-${nameOf(args)}`
-      stored.token.expiry = "2099-01-01T00:00:00Z"
-      fs.writeFileSync(file, JSON.stringify(stored))
-      return { stdout: JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups: [{ name: "Gemini Models", buckets: [
-        { id: "weekly", remainingFraction: 0.8 },
-      ] }] } } }) }
+      const saved = JSON.parse(fs.readFileSync(file, "utf8"))
+      saved.token.access_token = `access-${nameOf(args)}`
+      saved.token.expiry = "2099-01-01T00:00:00Z"
+      fs.writeFileSync(file, JSON.stringify(saved))
+      return { stdout: JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups: [
+        { name: "Gemini Models", buckets: [{ id: "gemini-weekly", window: "weekly", remainingFraction: 0.8 }] },
+        { name: "Claude and GPT models", buckets: [{ id: "3p-5h", window: "5h", remainingFraction: 0 }] },
+      ] } } }) }
     },
   }, async kit => {
     const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
+    await Promise.all([kit.plugin.provider.models({}, { auth: authOf(a) }), kit.plugin.provider.models({}, { auth: authOf(b) })])
     const readA = () => kit.plugin.auth.usage(async () => authOf(a))
     const [usageA, usageB, duplicateA] = await Promise.all([readA(), kit.plugin.auth.usage(async () => authOf(b)), readA()])
     assert.equal(usageA.plan, "Google AI Pro", usageA.error)
     assert.equal(usageB.plan, "Google AI Ultra", usageB.error)
     assert.equal(duplicateA.plan, usageA.plan)
-    assert.equal(calls.length, 4, "concurrent quota refreshes share one plan and one quota call per account")
+    assert.equal(calls.length, 2, "one optional HTTP plan query per account, including concurrent callers")
     assert.deepEqual(new Set(calls.map(call => call.token)), new Set(["Bearer access-a", "Bearer access-b"]))
-    assert.ok(calls.every(call => /:loadCodeAssist$|:retrieveUserQuotaSummary$/.test(call.url)))
     const cliReads = () => kit.otherSpawns.filter(s => s.args.includes("/usage")).length
-    assert.equal(cliReads(), 2, "expired tokens renew through their own CLI profiles")
-    failPlan = true
+    assert.equal(cliReads(), 2)
+    assert.deepEqual(usageA.windows.map(w => w.used), [20, 100])
+    assert.ok(usageA.windows.every(w => !w.aside && w.models.length), JSON.stringify(usageA.windows))
+    assert.ok(usageA.windows[0].models.every(id => id.startsWith("gemini-")))
+    assert.ok(usageA.windows[1].models.every(id => /^(claude|gpt)-/.test(id)))
+    for (mode of [401, 403, 429, 500, "network", "invalid", "timeout"]) {
+      const before = cliReads()
+      const failed = await readA()
+      assert.equal(failed.plan, undefined, `omit stale plan on ${mode}`)
+      assert.deepEqual(failed.windows, usageA.windows)
+      assert.equal(failed.signIn, "kept")
+      assert.equal(failed.error, undefined)
+      assert.equal(cliReads(), before + 1, "every refresh reads CLI quota, even with a valid token")
+    }
+    assert.equal(planSignal.aborted, true)
+    mode = "ok"
+    assert.equal((await readA()).plan, "Google AI Pro", "plan failure must not trigger quota/auth backoff")
+    mode = 403
     const failed = await readA()
-    assert.equal(failed.plan, undefined, "no stale/other account's plan after failure")
-    assert.equal(failed.windows[0].used, 20)
-    assert.equal(failed.signIn, "kept")
-    assert.equal(failed.error, undefined)
-    failPlan = false
-    assert.equal((await readA()).plan, "Google AI Pro", "metadata failure must not trigger quota/auth backoff")
-    assert.equal(cliReads(), 2, "valid tokens refresh metadata without starting the CLI")
+    assert.equal(failed.plan, undefined)
     const before = calls.length
     kit.defaultPrompt = async agent => { await agent.text("CLI reply"); return { stopReason: "end_turn" } }
     const request = await client(kit, authOf(a))
     const reply = await readSse(await request(baseBody()))
     assert.equal(reply.content[0].text, "CLI reply")
     assert.ok(kit.acpSpawns.some(spawn => nameOf(spawn.args) === "a" && spawn.args.includes("acp")))
-    assert.equal(calls.length, before, "chat must not call the plan or direct inference API")
+    assert.equal(calls.length, before, "chat must not call HTTP metadata or inference endpoints")
   })
 })
 
@@ -248,11 +260,9 @@ test("tool-result images steer within each named account's session without cross
 
 test("models and usage are scoped to host-selected auth and conflicting API environment cannot override it", async () => {
   await withKit({ env: { AGY_BRIDGE_STORED_SIGNIN: "", GEMINI_API_KEY: "global-key", AGY_ADC_AUTH: "1", WSL_INTEROP: "real-wsl" },
-    fetch: async (url, init) => {
-      const a = init.headers.Authorization === "Bearer access-a"
-      if (url.endsWith(":loadCodeAssist")) return Response.json({ cloudaicompanionProject: a ? "project-a" : "project-b" })
-      assert.equal(JSON.parse(init.body).project, a ? "project-a" : "project-b")
-      return Response.json({ groups: [{ displayName: "Gemini Models", buckets: [{ bucketId: "gemini-weekly", remainingFraction: a ? 0.8 : 0.3 }] }] })
+    fetch: async url => {
+      assert.equal(url, "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
+      return Response.json({})
     },
     onSpawn: (_file, args, opts) => {
       if (args.includes("--version")) return { stdout: "1.5.9\n" }

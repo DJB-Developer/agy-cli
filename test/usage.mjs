@@ -6,16 +6,33 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
-import { createUsageReader as createReader, fetchCliUsage as fetchUsage, parseUsageReport, sanitizeUsageDiagnostic } from "../usage.mjs"
+import { createUsageReader, fetchUsage, parseUsageReport, sanitizeUsageDiagnostic } from "../usage.mjs"
 import { forgetStoredSignIn } from "../signin.mjs"
-
-// The restricted CLI runner remains the token-renewal path. Keep its process
-// lifecycle/auth regression coverage; HTTP behavior is in quota-http.mjs.
-const createUsageReader = (resolve, options) => createReader(resolve, { ...options, queryUsage: fetchUsage })
 
 const report = groups => ({ status: "SUCCESS", command: { name: "usage", data: { groups } } })
 const group = (buckets, name = "Gemini Models") => ({ name, buckets })
 const bucket = (overrides = {}) => ({ id: "gemini-5h", name: "Five Hour Limit Remaining", window: "5h", remaining_fraction: 0.75, ...overrides })
+
+test("credential replacement cannot join a previous credential's in-flight quota query", async () => {
+  let identity = "a", release, entered
+  const started = new Promise(resolve => { entered = resolve })
+  const read = createUsageReader(() => "/same/agy", {
+    signIn: async () => ({ state: "present", fp: identity, canRenew: true }),
+    queryUsage: async () => {
+      const selected = identity
+      if (selected === "a") { entered(); await new Promise(resolve => { release = resolve }) }
+      return { windows: [{ used: selected === "a" ? 20 : 70 }], plan: `Plan ${selected}` }
+    },
+  })
+  const first = read()
+  await started
+  identity = "b"
+  const second = read()
+  await new Promise(resolve => setImmediate(resolve))
+  release()
+  assert.equal((await first).plan, "Plan a")
+  assert.equal((await second).plan, "Plan b")
+})
 
 const routingModels = [
   "gemini-3.8-flash", "gemini-3.8-flash-high", "gemini-3.8-flash-low", "gemini-3.8-flash-tiered",

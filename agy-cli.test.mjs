@@ -20,7 +20,6 @@ for (const [name, mocks] of [
   ["prefill.mjs", false],
   ["usage.mjs", true],
   ["plan.mjs", false],
-  ["quota-http.mjs", false],
   ["signin.mjs", false],
   ["auth-import.mjs", false],
   ["plugin-options.mjs", false],

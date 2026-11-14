@@ -36,7 +36,7 @@ OpenCode、Claude Code 等客户端经由 Magpie 调用 agy 向本插件开放�
   才在字节预算内重放历史。
 - **工具调用**：Antigravity ACP 把工具调用作为回复的 `tool_calls` 结束这一轮。本插件把
   客户端的结果送回同一轮 agy 对话（见下文「工具桥接」）。
-- **额度**：本插件通过 HTTP 查询 Google 的模型组配额；Antigravity ACP 读每次回复带的配额。
+- **额度**：本插件读取 agy CLI 的 `/usage` 模型组配额；Antigravity ACP 读每次回复带的配额。
 
 ## 工具桥接
 
@@ -95,7 +95,7 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
 - Antigravity CLI（`agy`），带 `acp` 子命令。在 Magpie 里登录需要 1.5.0 起的 agy（`agy acp --login`）；更早的版本请先在终端运行一次 `agy` 登录。
   文本与工具调用已在 1.4.12 和 1.5.0 上验证；图片输入需要 1.5.0。
 - 支持 OpenCode 风格 provider 插件的 Magpie。
-- agy 版本低于 1.4.12 时，会话会被拒绝（见「工具桥接」）；低于 1.1.11 时，额度查询所需的 CLI 续期也会被
+- agy 版本低于 1.4.12 时，会话会被拒绝（见「工具桥接」）；低于 1.1.11 时，CLI 额度查询也会被
   拒绝，以免旧版本把 `/usage` 当成模型提示词。
 - **自动更新**：插件启动的 agy 进程默认带 `AGY_CLI_DISABLE_AUTO_UPDATE=true`，免得进程池里的
   多个进程同时更新同一个可执行文件。你自己在终端里运行的 agy 不受影响，照常更新。你自己设置了
@@ -110,10 +110,10 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.8。现有账号保留，可继续添加其他账号。
+已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.9。现有账号保留，可继续添加其他账号。
 
-0.2.8 参考 CLIProxyAPI，通过 HTTP 查询套餐和模型组额度，缺失配额时尝试其他端点补全。
-token 过期仍由 agy CLI 续期，聊天继续走 ACP；不需要重新导入已有账号。
+0.2.9 恢复 CLI `/usage` 额度查询，套餐仍通过 HTTP 补充查询，保留模型组路由和套餐 ID 识别。
+套餐失败或超时仅省略套餐，不影响额度、登录和聊天；聊天仍走 ACP，无需重新导入账号。
 
 0.2.7 同步社区 0.1.49 的会话续接修复：保存会话按实际发送给 CLI 的提示词校验。
 提示词改写规则变更后，受影响的旧保存会话会从客户端历史重建，避免继续恢复旧提示词而反复报 429；
@@ -201,23 +201,20 @@ magpie quota agy-cli --json
 magpie quota refresh agy-cli --json
 ```
 
-从 0.2.8 起，参考 CLIProxyAPI 及其管理界面，使用所选账号的有效 access token 直接查询：
+从 0.2.9 起，额度恢复通过所选账号的 `agy /usage --output-format json` 查询。
+CLI 负责额度请求头、协议和 token 续期；插件读取模型组、5 小时/每周窗口、剩余比例及重置时间。
+命名账号使用自己的凭据目录，默认账号使用 CLI 原生凭据存储，不回退借用其他账号。
 
-- `loadCodeAssist`：获取该账号的项目和套餐。优先使用付费 tier；没有付费 tier 时使用当前 tier。
-  优先显示接口返回的名称，只有 ID 时识别 Free、Pro、Ultra、Ultra Lite，未知 ID 原样显示。
-- `retrieveUserQuotaSummary`：获取模型组、5 小时/每周窗口、剩余比例和重置时间。
-  按 daily、sandbox、production 顺序尝试；部分响应缺少 Gemini 时继续查询并合并真实配额桶。
+CLI 查询成功后，通过 HTTP `loadCodeAssist` 补充查询套餐，复用该账号 CLI 保存的有效 access token。
+优先显示付费 tier，缺失时使用当前 tier；保留接口名称及 Free、Pro、Ultra、Ultra Lite 的 ID 识别，
+未知 ID 原样显示。只查询套餐，不依赖返回项目，也不调用 HTTP 配额接口。
+不设置未经验证的固定 Hub User-Agent，不自行交换 refresh token、不写凭据、不开通账号。
 
-有效 token 时不启动 CLI。token 过期或 HTTP 明确返回 401 时，最多运行一次所选账号的
-受限 `agy /usage` 命令，让 CLI 自己续期，再读取其保存的 access token 重试 HTTP。
-插件不自行交换 refresh token、不改写凭据，也不开通账号。缺失或不可读的凭据不会触发后台登录。
-命名账号、默认账号的原生钥匙串和无桌面 Linux 凭据文件均支持，账号之间不回退借用凭据。
-
-每次刷新重新查询套餐和额度；只有项目标识可在当前 token 下复用。套餐接口失败但已有该账号项目时，
-仍尝试查询额度，省略旧套餐；若首次查询无法获得项目，则明确报错，不编造额度。
-HTTP 单次请求最多 4 秒，凭据读取、CLI 续期和 HTTP 的总预算默认 15 秒、最高 18 秒。
+套餐查询包括凭据读取和 HTTP 在内最多等待 1.5 秒；无 token、401/403/429、网络错误、超时、
+格式异常或无套餐信息时均省略套餐。已有 CLI 额度继续返回，不改变登录状态、不触发额度失败退避，
+也不沿用旧套餐。下次刷新会重新尝试。CLI 额度查询默认预算 15 秒、最高 18 秒。
 无可测量数据的窗口显示 "Limits not available"，不会假装为 0% 或 100%。
-**聊天继续通过 `agy acp`，HTTP 只用于套餐和额度元数据。**
+**聊天继续通过 `agy acp`；HTTP 仅用于可选套餐信息，聊天不等待套餐查询。**
 
 从 0.2.4 起，已测量的额度通过 `models` 精确绑定到当前账号模型目录里的模型 ID，
 包括基础名称和 high、low、tiered 等实际列出的变体。Gemini、Claude/GPT 分别计算；
@@ -228,7 +225,7 @@ HTTP 单次请求最多 4 秒，凭据读取、CLI 续期和 HTTP 的总预算�
 模型映射使用账号已有目录，不额外发起模型调用；新增模型在目录更新后刷新额度即可纳入。
 
 与社区 [Antigravity 插件](https://github.com/magpie-community/plugins/tree/main/packages/antigravity)
-不同，本插件查询 HTTP 配额摘要，没有额外调用 `fetchAvailableModels` 获取逐模型额度。
+不同，本插件读取 CLI 配额报告，没有额外调用 `fetchAvailableModels` 获取逐模型额度。
 因此不能判断报告未列出的独立额度池；无法确认归属的模型不会被绑定到通用 Gemini 组。
 
 升级后重新加载插件，并在提供商页面刷新各账号额度，让 Magpie 替换旧的“仅展示”读数。
@@ -240,7 +237,7 @@ HTTP 单次请求最多 4 秒，凭据读取、CLI 续期和 HTTP 的总预算�
 其他失败的额度查询等 10 分钟再试，每次翻倍，最长 6 小时。
 
 每次实际额度查询失败，会向日志输出一条 `[agy-usage]` JSON：
-包含账号名称、查询阶段和脱敏后的原始错误 `detail`。HTTP 失败保留状态码及厂商错误原因。
+包含账号名称、查询阶段、CLI 版本、退出码和脱敏后的原始错误 `detail`。套餐失败不记为额度失败。
 会过滤认证头、token、登录 URL 中的敏感内容和邮箱，并限制错误详情长度。
 并发共享查询只记录一次，失败退避期间不会重复记录；成功查询和主动取消不输出错误日志。
 
@@ -250,10 +247,10 @@ HTTP 单次请求最多 4 秒，凭据读取、CLI 续期和 HTTP 的总预算�
 docker logs --since 10m magpie 2>&1 | grep -F '[agy-usage]'
 ```
 
-Magpie 界面的额度错误提示会在 `HTTP error (redacted):` 或 `CLI error (redacted):` 后显示脱敏的原始错误，
+Magpie 界面的额度错误提示会在 `CLI error (redacted):` 后显示脱敏的原始错误，
 最多保留 4096 个字符，超长内容标记为截断。更新并重新加载插件后，刷新报错账号的额度即可查看，
 无需进入容器日志。失败退避期间仍保留错误详情；更换凭据或成功查询后不再显示旧详情。
-403、429 和网络超时不会自动把登录标记为失效；界面保留厂商返回的具体原因。
+套餐 HTTP 的 401、403、429 和网络超时不会把登录标记为失效；额度失败保留 CLI 返回的具体原因。
 
 
 ## 环境变量
