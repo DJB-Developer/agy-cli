@@ -1,5 +1,8 @@
 import { execFile } from "node:child_process"
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
+import fs from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
 
 // What agy's own sign-in looks like on this computer, read without running
 // agy. agy keeps its Google token in the system keyring through go-keyring,
@@ -9,6 +12,8 @@ import { createHash } from "node:crypto"
 // Manager. The value is JSON (on macOS behind "go-keyring-base64:"):
 //   {"token":{"access_token","refresh_token","expiry","expires_in","token_type"},
 //    "auth_method":"consumer","id_token_email":…}
+// Headless Linux without D-Bus uses the same JSON in
+// ~/.gemini/antigravity-cli/antigravity-oauth-token instead.
 //
 // Why this exists: an agy that isn't signed in, or whose sign-in Google no
 // longer takes, starts its own Google sign-in when it runs, and on Windows
@@ -35,6 +40,47 @@ const CACHE_MS = 30_000
 // Sign-ins agy takes from its environment rather than the keyring: a Gemini
 // or Google API key, Application Default Credentials, Vertex AI.
 const ENV_SIGN_INS = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "AGY_ADC_AUTH", "GOOGLE_GENAI_USE_VERTEXAI"]
+
+// agy itself uses this file on headless Linux without a D-Bus session.
+// Keep reads, imports and rollback on the same store. A desktop keyring
+// failure must not silently switch to a different account in a file.
+function credentialStore(platform, env, home, exec) {
+  if (platform !== "linux" || env.DBUS_SESSION_BUS_ADDRESS || env.XDG_RUNTIME_DIR) {
+    return {
+      name: "system keyring",
+      read: () => readRawSignIn(platform, exec),
+      write: raw => writeRawSignIn(raw, platform, exec),
+      encoded: raw => keyringValue(raw, platform),
+    }
+  }
+  const file = path.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token")
+  return {
+    name: "credential file (~/.gemini/antigravity-cli/antigravity-oauth-token)",
+    encoded: raw => raw,
+    async read() {
+      try { return { state: "present", raw: await fs.readFile(file, "utf8") } }
+      catch (error) { return { state: error.code === "ENOENT" ? "missing" : "unknown" } }
+    },
+    async write(raw) {
+      if (raw === null) {
+        try { await fs.unlink(file); return true }
+        catch (error) { return error.code === "ENOENT" }
+      }
+      const temporary = `${file}.${randomUUID()}.tmp`
+      try {
+        await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
+        // Publish only a complete owner-readable credential; an existing
+        // file (including a symlink) is replaced, never truncated in place.
+        const handle = await fs.open(temporary, "wx", 0o600)
+        try { await handle.writeFile(raw, "utf8"); await handle.sync() }
+        finally { await handle.close() }
+        await fs.rename(temporary, file)
+        return true
+      } catch { return false }
+      finally { await fs.unlink(temporary).catch(() => {}) }
+    },
+  }
+}
 
 // PowerShell reads the credential through CredReadW. CREDENTIALW is
 // Flags, Type, TargetName, Comment, LastWritten (8 bytes),
@@ -190,24 +236,27 @@ export function parseRefreshToken(input) {
 let importing = false
 
 // agy does the exchange using its own OAuth client. If it cannot use the
-// imported credential, restore the previous keyring entry (or remove ours).
-export async function importRefreshToken(input, { probe, platform = process.platform, exec = run, env = process.env } = {}) {
+// imported credential, restore the previous credential (or remove ours).
+export async function importRefreshToken(input, { probe, platform = process.platform, exec = run, env = process.env, home = os.homedir() } = {}) {
   let refreshToken
   try { refreshToken = parseRefreshToken(input) } catch (error) { return { error: error.message } }
   if (importing) return { error: "An account import is already in progress." }
   if (ENV_SIGN_INS.some(name => env[name])) return { error: "Remove agy's API key, ADC or Vertex environment authentication before importing a refresh token." }
   if (typeof probe !== "function") return { error: "An agy sign-in check is required." }
   importing = true
+  const store = credentialStore(platform, env, home, exec)
   let previous
   let written = false
   try {
-    previous = await readRawSignIn(platform, exec)
-    if (previous.state === "unknown") return { error: "Could not read agy's keyring. Unlock it first; Linux also needs secret-tool and a running Secret Service login collection." }
+    previous = await store.read()
+    if (previous.state === "unknown") return { error: `Could not read agy's ${store.name}. ${store.name === "system keyring"
+      ? "Unlock it and check access for the running user; desktop Linux also needs secret-tool and a Secret Service login collection."
+      : "Check file and HOME volume permissions for the user running Magpie."}` }
     const raw = JSON.stringify({ token: { access_token: "", refresh_token: refreshToken, token_type: "Bearer", expiry: "2000-01-01T00:00:00Z" }, auth_method: "consumer" })
-    if (!await writeRawSignIn(raw, platform, exec)) return { error: "Could not store the refresh token in agy's system keyring." }
+    if (!await store.write(raw)) return { error: `Could not store the refresh token in agy's ${store.name}.` }
     written = true
-    const saved = await readRawSignIn(platform, exec)
-    const expected = keyringValue(raw, platform)
+    const saved = await store.read()
+    const expected = store.encoded(raw)
     if (saved.state !== "present" || saved.raw !== expected) throw new Error("keyring write was not retained")
     forgetStoredSignIn({ dead: true })
     const result = await probe()
@@ -215,13 +264,13 @@ export async function importRefreshToken(input, { probe, platform = process.plat
     throw new Error("probe failed")
   } catch {
     // Neither subprocess output nor probe errors may echo the credential.
-    if (!written) return { error: "Could not access agy's system keyring." }
+    if (!written) return { error: `Could not access agy's ${store.name}.` }
     let restored = false
     try {
-      if (await writeRawSignIn(previous.state === "present" ? previous.raw : null, platform, exec)) {
-        const current = await readRawSignIn(platform, exec)
+      if (await store.write(previous.state === "present" ? previous.raw : null)) {
+        const current = await store.read()
         restored = previous.state === "missing" ? current.state === "missing"
-          : current.state === "present" && current.raw === keyringValue(previous.raw, platform)
+          : current.state === "present" && current.raw === store.encoded(previous.raw)
       }
     } catch {}
     return { error: restored
@@ -259,12 +308,12 @@ export function parseStored(raw, now = Date.now()) {
 }
 
 // readStoredSignIn reads agy's stored sign-in on this computer.
-export async function readStoredSignIn({ platform = process.platform, exec = run, now = Date.now(), env = process.env } = {}) {
+export async function readStoredSignIn({ platform = process.platform, exec = run, now = Date.now(), env = process.env, home = os.homedir() } = {}) {
   // tests, and setups this reading doesn't fit, turn it off
   if (env.AGY_BRIDGE_STORED_SIGNIN === "skip") return { state: "unknown" }
   // agy signs in with these instead of a stored Google sign-in
   if (ENV_SIGN_INS.some((name) => env[name])) return { state: "unknown" }
-  const s = await readRawSignIn(platform, exec)
+  const s = await credentialStore(platform, env, home, exec).read()
   return s.state === "present" ? parseStored(s.raw, now) : s
 }
 

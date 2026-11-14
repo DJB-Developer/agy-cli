@@ -103,8 +103,14 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
 
 ## 安装
 
-以下市场和 npm 命令安装的是上游社区版本，不包含本仓库新增的 refresh token 导入功能。
-本仓库提供包含该功能的源码。
+安装本仓库版本（包含 refresh token 导入和无桌面 Linux / Docker 支持）：
+
+```sh
+magpie plugin add github:DJB-Developer/agy-cli
+```
+
+已安装时，在 Magpie 插件页更新这个 GitHub 插件，再重新导入账号。
+以下市场和 npm 命令安装的是上游社区版本，不包含本仓库的改动。
 
 从 Magpie 社区插件市场安装（推荐）：在 Magpie 的 Plugins 页找到「Antigravity (local agy CLI)」点安装，或在终端运行：
 
@@ -121,7 +127,7 @@ magpie plugin add @magpie-community/opencode-agy-cli-auth
 1. 在 Magpie 的 Providers 页找到 `agy-cli` 并点击 Sign in。agy 已经登录时直接完成；
    没登录时插件运行 agy 自己的 Google 登录（`agy acp --login`），Magpie 打开登录页，
    登录后把页面显示的授权码（或整个页面地址）粘贴回 Magpie。Magpie 在服务器或 Docker
-   里也一样。登录的有效期是 15 分钟。Google 凭据保存在 agy 使用的系统钥匙串里；
+   里也一样。登录的有效期是 15 分钟。Google 凭据保存在 agy 使用的系统钥匙串或无桌面 Linux 的凭据文件里；
    agy 列出账号的模型（`agy models`）后才算登录成功。
 2. 模型名写成 `agy-cli/<模型>`。agy 对同一模型不同思考等级给出的多个模型 ID，
    在这里会合并成一个模型的多个变体，请求时再映射回对应的 agy ID。
@@ -133,15 +139,27 @@ magpie plugin add @magpie-community/opencode-agy-cli-auth
 也可以粘贴 `{"refresh_token":"…"}` 或 `{"token":{"refresh_token":"…"}}` 格式的 JSON。
 导入无需打开网页登录；token 必须与 agy 使用的 OAuth 客户端兼容。
 
-插件将凭据写入 agy 的系统钥匙串，由 agy 自己刷新 token 并验证模型列表。
+插件将凭据写入 agy 使用的存储，由 agy 自己刷新 token 并验证模型列表。
 验证失败时会尝试恢复原登录；恢复失败会明确提示重新登录。Magpie 仍只保存 `agy` 标记。
 这是**替换本机 agy 的当前账号**，不是添加独立的多账号池。请先结束正在运行的请求；
 成功后旧进程和会话续接记录会清理，后续请求使用新账号。
 
 - macOS 使用 Keychain，Windows 使用 Credential Manager。
-- Linux 需要安装 `secret-tool`（通常由 `libsecret-tools` 提供），并有可用、已解锁的
-  Secret Service `login` collection；无钥匙串的服务器或 Docker 环境无法使用此导入方式。
+- 无桌面的 Linux / Docker（没有 `DBUS_SESSION_BUS_ADDRESS` 和 `XDG_RUNTIME_DIR`）
+  自动使用 agy 的原生凭据文件 `~/.gemini/antigravity-cli/antigravity-oauth-token`，
+  原子写入，权限为 `0600`，不需要 `secret-tool` 或钥匙串服务。
+- 有桌面会话的 Linux 使用 `secret-tool`（通常由 `libsecret-tools` 提供）和已解锁的
+  Secret Service `login` collection。钥匙串不可读时不会偷偷切换到另一份文件账号。
 - 设置了 Gemini/Google API key、ADC 或 Vertex 环境认证时，需要先移除这些设置。
+
+#### 1Panel / Magpie 官方 Docker 镜像
+
+[Magpie 官方镜像](https://github.com/yetone/magpie/blob/main/Dockerfile) 使用 `HOME=/config/home`。保留 Compose 中的
+`magpie-config:/config` 卷即可，凭据文件会保存到
+`/config/home/.gemini/antigravity-cli/antigravity-oauth-token`，容器重建后仍可使用。
+更新本插件后重新导入，不需要在容器中安装 D-Bus 或 GNOME Keyring，也不要把 token 写进 Compose。
+文件存储路径已用 agy 1.5.9 的 Linux 构建在无网络容器中验证：agy 能读取它并进入 token 刷新流程；
+这项测试没有使用真实账号或调用模型。
 
 ## 并发
 
@@ -169,7 +187,7 @@ magpie quota refresh agy-cli --json
 "Limits not available"，而不是 0% 或 100%。
 
 未登录的 agy 一运行就会在浏览器里打开 Google 登录页，所以插件在为额度或模型列表运行 agy 之前，
-先看系统钥匙串（macOS）、凭据管理器（Windows）或 Secret Service（Linux）里 agy 存的登录，只读有没有、何时到期。没有登录、
+先看系统钥匙串（macOS）、凭据管理器（Windows）、Secret Service（桌面 Linux）或原生凭据文件（无桌面 Linux）里 agy 存的登录，只读有没有、何时到期。没有登录、
 登录已过期且无法续期、或 agy 已在这份登录上失败过时，不运行 agy，账号显示登录已过期，直到重新登录。
 其他失败的额度查询等 10 分钟再试，每次翻倍，最长 6 小时。
 

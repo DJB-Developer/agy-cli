@@ -143,8 +143,14 @@ turn); the models a client gets remain agy's decision.
 
 ## Install
 
-The marketplace and npm commands below install the upstream community version, which does not include
-this repository's refresh-token import feature. This repository provides the source with that feature.
+Install this repository's version, including refresh-token import and headless Linux / Docker support:
+
+```sh
+magpie plugin add github:DJB-Developer/agy-cli
+```
+
+If already installed, update this GitHub plugin on Magpie's Plugins page, then import again.
+The marketplace and npm commands below install the upstream community version, without this repository's changes.
 
 From the Magpie community plugins: find "Antigravity (local agy CLI)" on
 Magpie's Plugins page and install it, or run:
@@ -166,7 +172,7 @@ After installing, sign in from Magpie; no terminal needed.
    sign-in (`agy acp --login`): Magpie opens the sign-in page, and you paste the
    code the page shows (or the page's whole address) back into Magpie. This
    works with Magpie on a server or in Docker too. The sign-in waits 15
-   minutes. Google credentials stay in agy's system keyring; the plugin
+   minutes. Google credentials stay in agy's system keyring or its headless Linux credential file; the plugin
    counts the sign-in as done only once
    `agy models` lists the account's models.
 2. Refer to models as `agy-cli/<model>`. When agy lists separate model IDs
@@ -181,7 +187,7 @@ Choose **Import an account (refresh token)** under Sign in and paste one
 `{"token":{"refresh_token":"…"}}`. No browser sign-in is needed. The token
 must be compatible with agy's OAuth client.
 
-The plugin writes the credential to agy's system keyring, then lets agy refresh
+The plugin writes the credential to agy's own storage, then lets agy refresh
 it and verify its model list. If verification fails, it attempts to restore the
 previous sign-in; a failed restore explicitly asks you to sign in again. Magpie
 still stores only the `agy` marker. This **replaces the local CLI's current
@@ -190,11 +196,26 @@ requests first. On success, old processes and saved session-resume records are
 cleared so subsequent requests use the new account.
 
 - macOS uses Keychain; Windows uses Credential Manager.
-- Linux needs `secret-tool` (usually in `libsecret-tools`) and an available,
-  unlocked Secret Service `login` collection. This import method does not work
-  on a server or in Docker without a keyring.
+- Headless Linux / Docker (neither `DBUS_SESSION_BUS_ADDRESS` nor `XDG_RUNTIME_DIR`
+  set) automatically uses agy's native file at
+  `~/.gemini/antigravity-cli/antigravity-oauth-token`, written atomically with
+  owner-only `0600` permissions. No `secret-tool` or keyring daemon is needed.
+- Desktop Linux uses `secret-tool` (usually in `libsecret-tools`) and an unlocked
+  Secret Service `login` collection. An unreadable desktop keyring never silently
+  switches to a different file account.
 - Remove Gemini/Google API key, ADC or Vertex environment authentication before
   importing a refresh token.
+
+#### 1Panel / official Magpie Docker image
+
+The [official Magpie image](https://github.com/yetone/magpie/blob/main/Dockerfile) sets `HOME=/config/home`. Keep the existing
+`magpie-config:/config` volume: credentials persist at
+`/config/home/.gemini/antigravity-cli/antigravity-oauth-token` across container
+recreation. Update this plugin and import again; installing D-Bus or GNOME Keyring
+is unnecessary, and the token does not belong in Compose.
+The native file path was verified with agy 1.5.9 on Linux in a container without
+network access: agy read the file and attempted a token refresh. No real account
+or model call was used for this check.
 
 ## Concurrency
 
@@ -229,7 +250,7 @@ measurable data shows "Limits not available" rather than a fake 0% or 100%.
 
 A signed-out agy opens Google's sign-in page in the browser when it runs, so
 before running agy for usage or the model list, the plugin looks at agy's stored
-sign-in in the system keychain (macOS), Credential Manager (Windows), or Secret Service (Linux) and only
+sign-in in the system keychain (macOS), Credential Manager (Windows), Secret Service (desktop Linux), or native credential file (headless Linux) and only
 reads whether one is there and when it ends. With none, with one that has ended
 and can't be renewed, or with one agy already failed on, agy is not run: the
 account shows its sign-in has expired until you sign in again. Other failed

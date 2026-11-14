@@ -88,3 +88,16 @@ test("an active request prevents account replacement", async () => {
     } finally { kit.module.__agyTestAllProcs.delete(proc) }
   })
 })
+
+test("headless Linux auth entry imports without executing a keyring command", async () => {
+  const kit = await createBridgeKit({ platform: "linux", env: { AGY_BRIDGE_STORED_SIGNIN: "" },
+    onExecFile: async () => assert.fail("headless import must not call secret-tool") })
+  try {
+    const started = await kit.plugin.auth.methods[1].authorize({ refresh_token: "1//docker-test" })
+    assert.deepEqual(await started.callback(), { type: "success", key: "agy" })
+    const file = path.join(kit.home, ".gemini", "antigravity-cli", "antigravity-oauth-token")
+    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).token.refresh_token, "1//docker-test")
+    assert.equal(kit.execFiles.length, 0)
+    assert.equal(kit.modelsSpawns.length, 1)
+  } finally { await kit.dispose() }
+})

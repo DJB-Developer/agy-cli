@@ -2,6 +2,9 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, importRefreshToken, isDead, noteDead, parseRefreshToken, parseStored, readStoredSignIn, storedSignIn, storedSignInNow } from "../signin.mjs"
 
+// Exercise native keyrings even when tests run on a headless Linux host.
+const KEYRING_ENV = { DBUS_SESSION_BUS_ADDRESS: "test-bus" }
+
 const NOW = Date.parse("2026-11-13T00:00:00Z")
 const stored = (token, extra = {}) => JSON.stringify({ token, auth_method: "consumer", id_token_email: "someone@example.com", ...extra })
 const b64 = (s) => "go-keyring-base64:" + Buffer.from(s).toString("base64")
@@ -47,23 +50,23 @@ test("readStoredSignIn asks each system's keyring the way go-keyring stores it",
   const value = stored({ access_token: "a", refresh_token: "r", expiry: "2026-11-12T00:00:00Z" })
   const calls = []
   const mac = (code, stdout = "") => async (file, args) => { calls.push([file, ...args]); return { code, stdout } }
-  assert.equal((await readStoredSignIn({ platform: "darwin", exec: mac(44), env: {} })).state, "missing")
+  assert.equal((await readStoredSignIn({ platform: "darwin", exec: mac(44), env: KEYRING_ENV })).state, "missing")
   assert.deepEqual(calls[0], ["/usr/bin/security", "find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"])
-  assert.equal((await readStoredSignIn({ platform: "darwin", exec: mac(51), env: {} })).state, "unknown")
-  assert.equal((await readStoredSignIn({ platform: "darwin", exec: mac(0, b64(value) + "\n"), now: NOW, env: {} })).state, "present")
+  assert.equal((await readStoredSignIn({ platform: "darwin", exec: mac(51), env: KEYRING_ENV })).state, "unknown")
+  assert.equal((await readStoredSignIn({ platform: "darwin", exec: mac(0, b64(value) + "\n"), now: NOW, env: KEYRING_ENV })).state, "present")
   const win = (stdout, code = 0) => async (file, args) => { calls.push([file, ...args]); return { code, stdout } }
-  assert.equal((await readStoredSignIn({ platform: "win32", exec: win("MISSING\r\n"), env: {} })).state, "missing")
+  assert.equal((await readStoredSignIn({ platform: "win32", exec: win("MISSING\r\n"), env: KEYRING_ENV })).state, "missing")
   assert.match(calls.at(-1).at(-1), /CredReadW[\s\S]*'gemini:antigravity'/)
-  assert.equal((await readStoredSignIn({ platform: "win32", exec: win("WARNING: something\r\nMISSING\r\n"), env: {} })).state, "missing")
-  assert.equal((await readStoredSignIn({ platform: "win32", exec: win("ERROR 5\r\n"), env: {} })).state, "unknown")
-  assert.equal((await readStoredSignIn({ platform: "win32", exec: win("", 1), env: {} })).state, "unknown")
-  const w = await readStoredSignIn({ platform: "win32", exec: win("OK " + Buffer.from(value).toString("base64") + "\r\n"), now: NOW, env: {} })
+  assert.equal((await readStoredSignIn({ platform: "win32", exec: win("WARNING: something\r\nMISSING\r\n"), env: KEYRING_ENV })).state, "missing")
+  assert.equal((await readStoredSignIn({ platform: "win32", exec: win("ERROR 5\r\n"), env: KEYRING_ENV })).state, "unknown")
+  assert.equal((await readStoredSignIn({ platform: "win32", exec: win("", 1), env: KEYRING_ENV })).state, "unknown")
+  const w = await readStoredSignIn({ platform: "win32", exec: win("OK " + Buffer.from(value).toString("base64") + "\r\n"), now: NOW, env: KEYRING_ENV })
   assert.equal(w.state, "present")
   assert.equal(w.canRenew, true)
-  assert.equal((await readStoredSignIn({ platform: "linux", exec: mac(0, value), env: {} })).state, "present")
+  assert.equal((await readStoredSignIn({ platform: "linux", exec: mac(0, value), env: KEYRING_ENV })).state, "present")
   assert.deepEqual(calls.at(-1), ["secret-tool", "lookup", "service", "gemini", "username", "antigravity"])
-  assert.equal((await readStoredSignIn({ platform: "linux", exec: mac(1), env: {} })).state, "missing")
-  assert.equal((await readStoredSignIn({ platform: "linux", exec: async () => ({ code: 1, stdout: "", stderr: "no session bus" }), env: {} })).state, "unknown")
+  assert.equal((await readStoredSignIn({ platform: "linux", exec: mac(1), env: KEYRING_ENV })).state, "missing")
+  assert.equal((await readStoredSignIn({ platform: "linux", exec: async () => ({ code: 1, stdout: "", stderr: "no session bus" }), env: KEYRING_ENV })).state, "unknown")
   const before = calls.length
   for (const env of [{ AGY_BRIDGE_STORED_SIGNIN: "skip" }, { GEMINI_API_KEY: "k" }, { AGY_ADC_AUTH: "1" }]) {
     assert.equal((await readStoredSignIn({ platform: "darwin", exec: mac(44), env })).state, "unknown")
@@ -141,11 +144,11 @@ test("imports into agy's native store on each platform, validates, and never put
     const store = keyring(platform)
     await storedSignIn({ read: async () => ({ state: "missing" }) })
     let probes = 0
-    const result = await importRefreshToken("1//private-token", { platform, exec: store.exec, env: {}, probe: async () => {
+    const result = await importRefreshToken("1//private-token", { platform, exec: store.exec, env: KEYRING_ENV, probe: async () => {
       probes++
       assert.equal(parseStored(store.raw).canRenew, true)
       assert.equal(parseStored(store.raw).expired, true)
-      assert.equal(await backgroundBlocked({ read: () => readStoredSignIn({ platform, exec: store.exec, env: {} }) }), "")
+      assert.equal(await backgroundBlocked({ read: () => readStoredSignIn({ platform, exec: store.exec, env: KEYRING_ENV }) }), "")
       return { ok: true }
     } })
     assert.deepEqual(result, { ok: true })
@@ -165,7 +168,7 @@ test("a refused or throwing probe restores the previous credential or removes a 
     for (const initial of [null, platform === "darwin" ? b64(stored({ refresh_token: "old" })) : stored({ refresh_token: "old" })]) {
       for (const throws of [false, true]) {
         const store = keyring(platform, initial)
-        const result = await importRefreshToken("private-token", { platform, exec: store.exec, env: {}, probe: async () => {
+        const result = await importRefreshToken("private-token", { platform, exec: store.exec, env: KEYRING_ENV, probe: async () => {
           if (throws) throw new Error("private-token")
           return { ok: false, why: "private-token" }
         } })
@@ -180,7 +183,7 @@ test("a refused or throwing probe restores the previous credential or removes a 
 test("bad input, unavailable stores, and environment auth cannot overwrite credentials", async () => {
   let calls = 0
   let probes = 0
-  const opts = { platform: "darwin", exec: async () => { calls++; return { code: 51, stdout: "" } }, env: {}, probe: async () => { probes++; return { ok: true } } }
+  const opts = { platform: "darwin", exec: async () => { calls++; return { code: 51, stdout: "" } }, env: KEYRING_ENV, probe: async () => { probes++; return { ok: true } } }
   assert.match((await importRefreshToken("", opts)).error, /Paste/)
   assert.match((await importRefreshToken("token", { ...opts, env: { GEMINI_API_KEY: "key" } })).error, /environment/)
   assert.equal(calls, 0)
@@ -199,10 +202,10 @@ test("write and rollback failures are reported without exposing subprocess outpu
     }
     return store.exec(file, args, input)
   }
-  const result = await importRefreshToken("private-token", { platform: "linux", exec, env: {}, probe: async () => ({ ok: false }) })
+  const result = await importRefreshToken("private-token", { platform: "linux", exec, env: KEYRING_ENV, probe: async () => ({ ok: false }) })
   assert.match(result.error, /could not be restored/)
   assert.doesNotMatch(result.error, /private-token/)
-  const failed = await importRefreshToken("private-token", { platform: "linux", exec, env: {}, probe: async () => { assert.fail("must not probe a failed write") } })
+  const failed = await importRefreshToken("private-token", { platform: "linux", exec, env: KEYRING_ENV, probe: async () => { assert.fail("must not probe a failed write") } })
   assert.match(failed.error, /Could not store/)
 })
 
@@ -211,12 +214,12 @@ test("concurrent imports cannot overwrite one another", async () => {
   let release
   let started
   const probing = new Promise(resolve => { started = resolve })
-  const first = importRefreshToken("first", { platform: "linux", exec: store.exec, env: {}, probe: () => {
+  const first = importRefreshToken("first", { platform: "linux", exec: store.exec, env: KEYRING_ENV, probe: () => {
     started()
     return new Promise(resolve => { release = resolve })
   } })
   await probing
-  assert.match((await importRefreshToken("second", { platform: "linux", exec: store.exec, env: {}, probe: async () => ({ ok: true }) })).error, /already in progress/)
+  assert.match((await importRefreshToken("second", { platform: "linux", exec: store.exec, env: KEYRING_ENV, probe: async () => ({ ok: true }) })).error, /already in progress/)
   release({ ok: true })
   assert.deepEqual(await first, { ok: true })
   assert.equal(JSON.parse(store.raw).token.refresh_token, "first")
@@ -226,7 +229,7 @@ test("a command reporting success without retaining the token cannot validate th
   const initial = b64(stored({ refresh_token: "old" }))
   let probes = 0
   const result = await importRefreshToken("new", {
-    platform: "darwin", env: {},
+    platform: "darwin", env: KEYRING_ENV,
     exec: async (_file, args) => ({ code: 0, stdout: args[0] === "find-generic-password" ? initial : "" }),
     probe: async () => { probes++; return { ok: true } },
   })

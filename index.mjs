@@ -5648,7 +5648,7 @@ export const AntigravityBridgePlugin = async () => {
             if (!agy) return { type: "failed", error: "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli" }
             return {
               url: "",
-              instructions: "Importing the account into agy's system keyring and checking it with agy…",
+              instructions: "Importing the account and checking it with agy…",
               method: "auto",
               callback: async () => {
                 if (importingAccount) return { type: "failed", error: "An account import is already in progress." }
