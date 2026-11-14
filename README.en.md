@@ -97,8 +97,8 @@ MCP server. The control port listens on loopback only, with a token per process.
   (SillyTavern presets, "continue"/"impersonate", bot frameworks) are served
   instead of rejected; the session ledger stays aligned across turns. See
   "Assistant prefill" below.
-- **Usage visibility**: Magpie shows the agy subscription usage windows. They are
-  informational only; running out of quota does not block requests automatically.
+- **Usage and routing**: Magpie shows the agy subscription usage windows and uses
+  measured quotas for their model groups. Unknown groups or readings remain display-only.
 
 ## Assistant prefill
 
@@ -149,7 +149,7 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.3 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to 0.2.4 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
 The marketplace and npm commands below install the upstream community version, without this repository's changes.
 
 From the Magpie community plugins: find "Antigravity (local agy CLI)" on
@@ -245,6 +245,27 @@ magpie quota refresh agy-cli --json
 The numbers come from the selected account's agy `/usage` report, broken down
 by model group. Named accounts query through their own credential directories. A window with no
 measurable data shows "Limits not available" rather than a fake 0% or 100%.
+
+Since 0.2.4, measured windows carry an exact `models` allowlist from the selected
+account's catalog, including base aliases and listed high, low, tiered or other
+variants. Gemini and Claude/GPT allowances are separate. A more specific reported
+group, such as Gemini 4 Argon, owns its matching models instead of the broader
+group. Both five-hour and weekly windows reach Magpie for model-specific ordering,
+quota caps and failover under the selected routing policy. Unrecognized groups,
+groups with no catalog matches and unknown readings stay display-only, so they
+cannot incorrectly exhaust the whole account. Mapping reads the existing catalog
+without extra model calls; refresh quota after the catalog learns new models.
+
+The generic Gemini pool covers Flash/Pro only. Argon requires its own reported
+group; it never borrows Flash/Pro quota when that group is absent. Unlike the
+community [Antigravity plugin](https://github.com/magpie-community/plugins/tree/main/packages/antigravity),
+this plugin reads CLI group quotas without an extra `fetchAvailableModels` API
+call for per-model readings. It cannot detect independent pools absent from the
+report, so unrecognized Gemini families remain outside the generic pool.
+
+After upgrading, reload the plugin and refresh each account's quota to replace
+Magpie's old display-only readings. This does not switch routing to round-robin:
+account preference still follows your routing policy and session affinity.
 
 A signed-out agy opens Google's sign-in page in the browser when it runs, so
 before running agy for usage or the model list, the plugin looks at agy's stored

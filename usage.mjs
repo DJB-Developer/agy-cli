@@ -107,9 +107,38 @@ function cadence(bucket, id, name) {
   return { name: name || id }
 }
 
+const poolName = group => (text(field(group, "displayName", "display_name")) || text(group?.name) || "Quota")
+  .replace(/\s+models$/i, "").replace(/\s+and\s+/gi, " & ")
+const modelWords = value => value.toLowerCase().replace(/[\s._-]+/g, "-")
+
+// Magpie's `models` is an exact-ID allowlist (not a glob). Use the account's
+// catalog, including collapsed aliases and raw effort variants. A narrower
+// named pool owns its models even when its reading is unknown or disabled:
+// falling back to a broad pool would invent an allowance for those models.
+function modelsByGroup(groups, models) {
+  const names = groups.map(group => modelWords(poolName(group)))
+  const score = (name, id) => {
+    if (name === "claude-&-gpt") return /^(?:claude|gpt)-/.test(id) ? 1 : 0
+    // Antigravity can omit Argon's separate pool from the summary. Unlike
+    // its direct-API plugin we have no per-model quota reading to compare:
+    // only the known Flash/Pro families belong to the generic Gemini pool.
+    if (name === "gemini") return /^gemini-(?:\d+(?:-\d+)*-)?(?:flash|pro)(?:-|$)/.test(id) ? 2 : 0
+    if (["claude", "gpt"].includes(name)) return id.startsWith(name + "-") ? 2 : 0
+    if (!/^(?:gemini|claude|gpt)-[a-z0-9]/.test(name)) return 0
+    return id === name || id.startsWith(name + "-") ? name.length : 0
+  }
+  const out = groups.map(() => [])
+  for (const model of new Set(Array.isArray(models) ? models.filter(id => typeof id === "string" && id) : [])) {
+    const scores = names.map(name => score(name, modelWords(model)))
+    const best = Math.max(0, ...scores)
+    if (best) scores.forEach((value, i) => { if (value === best) out[i].push(model) })
+  }
+  return out
+}
+
 // agy's command report is not its token-usage object or a model-availability list.
 // Unknown quota is not evidence of exhaustion or a full allowance.
-export function parseUsageReport(value) {
+export function parseUsageReport(value, { models = [] } = {}) {
   let report
   try { report = typeof value === "string" ? JSON.parse(value) : value } catch {
     throw new UsageError("agy returned an invalid usage report.")
@@ -117,11 +146,11 @@ export function parseUsageReport(value) {
   if (report?.status !== "SUCCESS" || report?.command?.name !== "usage") {
     throw commandFailure(`${text(report?.error)} ${text(report?.response)}`)
   }
-  const groups = report.command.data?.groups
+  const groups = Array.isArray(report.command.data?.groups) ? report.command.data.groups : []
+  const members = modelsByGroup(groups, models)
   const windows = []
-  for (const group of Array.isArray(groups) ? groups : []) {
-    const pool = (text(field(group, "displayName", "display_name")) || text(group?.name) || "Quota")
-      .replace(/\s+models$/i, "").replace(/\s+and\s+/gi, " & ")
+  for (const [index, group] of groups.entries()) {
+    const pool = poolName(group)
     for (const bucket of Array.isArray(group?.buckets) ? group.buckets : []) {
       const id = text(field(bucket, "bucketId", "bucket_id")) || text(bucket?.id)
       if (!id || bucket?.disabled === true) continue
@@ -135,8 +164,9 @@ export function parseUsageReport(value) {
       const resetsAt = resetTime(field(bucket, "resetTime", "reset_time"))
       windows.push({
         name: `${pool} · ${period.name}`,
-        // This feature displays quota only; it must not change model routing.
-        aside: true,
+        // Never emit an unscoped routing window: it would cap every model.
+        aside: !known || members[index].length === 0,
+        ...(known && members[index].length ? { models: members[index] } : {}),
         ...(known ? { used: Math.round((1 - fraction) * 1e8) / 1e6 } : { display: "Limits not available" }),
         ...(period.span ? { span: period.span } : {}),
         ...(resetsAt ? { resetsAt } : {}),
@@ -285,6 +315,7 @@ export async function fetchUsage(agy, {
   maxOutputBytes = MAX_OUTPUT_BYTES,
   signal,
   tempRoot = os.tmpdir(),
+  getModels = () => [],
 } = {}) {
   if (!agy) throw new UsageError("agy CLI not found. Install it and run `agy` once to sign in.")
   const deadline = Date.now() + timeout(timeoutMs)
@@ -332,7 +363,7 @@ export async function fetchUsage(agy, {
     result = null
     result = await run(agy, [...(geminiDir ? [`--gemini_dir=${geminiDir}`] : []), "-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`], options)
     if (result.code !== 0) throw commandFailure(result.stderr + "\n" + result.stdout)
-    return parseUsageReport(result.stdout)
+    return parseUsageReport(result.stdout, { models: getModels(agy) })
   } catch (error) {
     if (error?.kind !== "cancel") {
       let detail = ""

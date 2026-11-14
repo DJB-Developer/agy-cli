@@ -70,7 +70,7 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
   都在客户端侧完成。
 - **助手预填**：以 assistant 结尾的预填请求（SillyTavern 预设、继续写、bot 框架）不再
   400 拒绝：预填留在本轮并渲染为续写载体，会话跨轮保持对齐，见下文「助手预填」。
-- **额度查看**：在 Magpie 里查看 agy 订阅的用量窗口，仅作展示，额度耗尽时不会自动拦截请求。
+- **额度与路由**：Magpie 显示 agy 订阅的用量窗口，已知额度按对应模型组参与路由；无法识别的组或未知额度仅作展示。
 
 ## 助手预填（assistant prefill）
 
@@ -109,7 +109,7 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.3。现有账号保留，可继续添加其他账号。
+已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.4。现有账号保留，可继续添加其他账号。
 以下市场和 npm 命令安装的是上游社区版本，不包含本仓库的改动。
 
 从 Magpie 社区插件市场安装（推荐）：在 Magpie 的 Plugins 页找到「Antigravity (local agy CLI)」点安装，或在终端运行：
@@ -189,6 +189,21 @@ magpie quota refresh agy-cli --json
 额度数据来自所选账号的 agy `/usage` 报告，按模型组列出订阅窗口。
 命名账号使用各自独立的凭据目录查询。没有可测量数据的窗口会显示
 "Limits not available"，而不是 0% 或 100%。
+
+从 0.2.4 起，已测量的额度通过 `models` 精确绑定到当前账号模型目录里的模型 ID，
+包括基础名称和 high、low、tiered 等实际列出的变体。Gemini、Claude/GPT 分别计算；
+如果报告包含 Gemini 4 Argon 等更具体的组，该组优先拥有匹配模型，不再套用宽泛组的额度。
+通用 Gemini 组仅匹配 Flash/Pro；报告未单独给出 Argon 组时，不借用 Flash/Pro 的额度。
+5 小时、每周窗口均保留，由 Magpie 按对应模型和路由策略处理排序、额度上限和切换。
+无法识别的组、未匹配到目录模型的组及未知额度仍仅展示，不会误判为全账号耗尽。
+模型映射使用账号已有目录，不额外发起模型调用；新增模型在目录更新后刷新额度即可纳入。
+
+与社区 [Antigravity 插件](https://github.com/magpie-community/plugins/tree/main/packages/antigravity)
+不同，本插件仍通过 CLI 查询组额度，没有额外调用 `fetchAvailableModels` 获取逐模型额度。
+因此不能判断报告未列出的独立额度池；无法确认归属的模型不会被绑定到通用 Gemini 组。
+
+升级后重新加载插件，并在提供商页面刷新各账号额度，让 Magpie 替换旧的“仅展示”读数。
+本更新不会把路由策略改成轮询：同一账号是否继续优先，仍取决于你设置的策略和会话亲和。
 
 未登录的 agy 一运行就会在浏览器里打开 Google 登录页，所以插件在为额度或模型列表运行 agy 之前，
 先看系统钥匙串（macOS）、凭据管理器（Windows）、Secret Service（桌面 Linux）或原生凭据文件（无桌面 Linux）里 agy 存的登录，只读有没有、何时到期。没有登录、

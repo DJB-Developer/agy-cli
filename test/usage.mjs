@@ -13,6 +13,72 @@ const report = groups => ({ status: "SUCCESS", command: { name: "usage", data: {
 const group = (buckets, name = "Gemini Models") => ({ name, buckets })
 const bucket = (overrides = {}) => ({ id: "gemini-5h", name: "Five Hour Limit Remaining", window: "5h", remaining_fraction: 0.75, ...overrides })
 
+const routingModels = [
+  "gemini-3.8-flash", "gemini-3.8-flash-high", "gemini-3.8-flash-low", "gemini-3.8-flash-tiered",
+  "gemini-4-argon", "gemini-4-argon-high", "claude-sonnet-5-5", "gpt-oss-120b", "gpt-oss-120b-medium",
+  "mystery-model",
+]
+
+test("routing quota is measured and scoped to its model group, including effort aliases", () => {
+  const result = parseUsageReport(report([
+    group([bucket(), bucket({ id: "gemini-weekly", window: "weekly", remaining_fraction: 0.5 })]),
+    group([bucket({ id: "3p-5h", remaining_fraction: 0 })], "Claude and GPT models"),
+    group([bucket({ id: "argon-weekly", window: "weekly", remaining_fraction: 0.53 })], "Gemini 4 Argon"),
+  ]), { models: routingModels })
+  const [gemini, week, thirdParty, argon] = result.windows
+  assert.equal(gemini.aside, false, "measured Gemini quota must reach Magpie routing")
+  assert.deepEqual(gemini.models, routingModels.slice(0, 4))
+  assert.deepEqual(week.models, gemini.models)
+  assert.deepEqual(thirdParty.models, routingModels.slice(6, 9))
+  assert.deepEqual(argon.models, routingModels.slice(4, 6))
+  assert.ok(result.windows.every(w => w.aside === false && w.models.length > 0))
+  assert.deepEqual(result.windows.map(w => w.used), [25, 50, 100, 47])
+  // Routing can stop Claude/GPT at 100% without stopping Flash or Argon.
+  assert.ok(result.windows.filter(w => w.used === 100).every(w => !w.models.some(id => id.startsWith("gemini-"))))
+})
+
+test("routing quota never broadens unknown groups or unknown/disabled specialized allowances", () => {
+  const result = parseUsageReport(report([
+    group([bucket()]),
+    group([bucket({ remaining_fraction: null })], "Gemini 4 Argon"),
+    group([bucket({ remaining_fraction: 0 })], "Unknown models"),
+    group([bucket({ disabled: true })], "Gemini 3.8 Flash"),
+  ]), { models: routingModels })
+  assert.equal(result.windows.length, 3)
+  assert.ok(result.windows.every(w => w.aside === true))
+  assert.ok(result.windows.every(w => !w.models?.length))
+})
+
+test("routing quota uses bounded model names, most-specific groups and normalized display names", () => {
+  const models = ["gemini-3.8-flash", "gemini-3.8-flash-high", "gemini-3.8-flash-lite", "gemini-3.80-flash", "gpt-oss-120b"]
+  const result = parseUsageReport(report([
+    group([bucket()], "Gemini"),
+    group([bucket()], "Gemini 3.8 Flash Models"),
+    { display_name: " GEMINI 3.8 FLASH LITE ", buckets: [bucket()] },
+    group([bucket()], "GPT models"),
+  ]), { models: [...models, models[0]] })
+  assert.deepEqual(result.windows.map(w => w.models), [[models[3]], models.slice(0, 2), [models[2]], [models[4]]])
+})
+
+test("routing quota separates Claude and GPT subgroups from the shared third-party pool", () => {
+  const models = ["claude-sonnet-5-5", "claude-opus-5-5", "gpt-oss-120b", "gpt-oss-120b-medium", "gpt-5"]
+  const result = parseUsageReport(report([
+    group([bucket()], "Claude and GPT models"),
+    group([bucket()], "Claude Sonnet models"),
+    group([bucket()], "GPT OSS models"),
+  ]), { models })
+  assert.deepEqual(result.windows.map(w => w.models), [[models[1], models[4]], [models[0]], models.slice(2, 4)])
+})
+
+test("routing quota never assumes Argon or a new Gemini family shares the broad Gemini pool", () => {
+  // Antigravity's usage tests cover an Argon allowance independent of Gemini
+  // even when the summary has no Argon group. CLI group-only data cannot tell
+  // its allowance in that case; leave it unknown instead of borrowing Flash's.
+  const models = [...routingModels, "gemini-9-new-high", "gemini-3.1-pro-high"]
+  const result = parseUsageReport(report([group([bucket({ remaining_fraction: 0 })])]), { models })
+  assert.deepEqual(result.windows[0].models, [...routingModels.slice(0, 4), "gemini-3.1-pro-high"])
+})
+
 test("maps all groups/cadences to display-only Magpie windows, without invented identity", () => {
   const result = parseUsageReport(report([
     group([bucket(), bucket({ id: "gemini-weekly", window: "weekly", remaining_fraction: 0.5 })]),

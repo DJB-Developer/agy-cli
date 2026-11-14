@@ -701,7 +701,11 @@ const legacyModel = "agy-cli/gemini-test-low"
   const usage = await plugin.auth.usage(async () => ({ type: "api", key: "agy" }), {})
   check("auth.usage exposes measured CLI quota", usage.windows?.[0]?.used === 40 && usage.windows[0].name === "Gemini · 7 days")
   check("auth.usage preserves explicit cadence and reset", usage.windows?.[0]?.span === 604800 && usage.windows[0].resetsAt === "2026-10-27T00:00:00.000Z")
-  check("auth.usage is display-only and keeps bridge auth", usage.windows?.[0]?.aside === true && usage.signIn === "kept")
+  check("auth.usage participates in routing and keeps bridge auth", usage.windows?.[0]?.aside === false && usage.signIn === "kept")
+  const quotaModels = usage.windows?.[0]?.models ?? []
+  check("auth.usage scopes Gemini quota to base and effort IDs even before catalog refresh",
+    ["gemini-3.8-flash", "gemini-3.8-flash-high", "gemini-3.8-flash-low"].every(id => quotaModels.includes(id)) &&
+    quotaModels.every(id => id.startsWith("gemini-")))
   check("auth.usage does not invent Google account identity", !usage.user && !usage.plan)
   const calls = logs().filter(event => event.type === "usage")
   check("auth.usage uses a separate cleaned workspace", calls.length === 1 && !fs.existsSync(calls[0].cwd))

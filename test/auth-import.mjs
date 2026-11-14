@@ -122,25 +122,32 @@ test("models and usage are scoped to host-selected auth and conflicting API envi
       if (!args.includes("/usage")) return 0
       assert.equal(opts.env.GEMINI_API_KEY, "")
       assert.equal(opts.env.AGY_ADC_AUTH, "")
-      return { stdout: JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups: [{ name: "Quota", buckets: [
+      return { stdout: JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups: [{ name: "Gemini Models", buckets: [
         { id: "weekly", remainingFraction: nameOf(args) === "a" ? 0.8 : 0.3 },
       ] }] } } }) }
     },
   }, async kit => {
     const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
-    kit.modelsBehavior = ({ args }) => ({ stdout: modelsOutput([[`gemini-account-${nameOf(args)}-high`, `Account ${nameOf(args)}`]]) })
-    kit.offeredModels = args => [[`gemini-account-${nameOf(args)}-high`, `Account ${nameOf(args)}`]]
+    const rows = args => ["high", "low"].map(effort => [`gemini-3.8-flash-${nameOf(args)}-${effort}`, `Account ${nameOf(args)} (${effort})`])
+    kit.modelsBehavior = ({ args }) => ({ stdout: modelsOutput(rows(args)) })
+    kit.offeredModels = rows
     const [modelsA, modelsB] = await Promise.all([
       kit.plugin.provider.models({}, { auth: authOf(a) }), kit.plugin.provider.models({}, { auth: authOf(b) }),
     ])
-    assert.ok(modelsA["gemini-account-a-high"])
-    assert.equal(modelsA["gemini-account-b-high"], undefined)
-    assert.ok(modelsB["gemini-account-b-high"])
+    assert.ok(modelsA["gemini-3.8-flash-a"])
+    assert.equal(modelsA["gemini-3.8-flash-b"], undefined)
+    assert.ok(modelsB["gemini-3.8-flash-b"])
+    const queries = kit.modelsSpawns.length
     const [usageA, usageB] = await Promise.all([
       kit.plugin.auth.usage(async () => authOf(a)), kit.plugin.auth.usage(async () => authOf(b)),
     ])
     assert.equal(usageA.windows[0]?.used, 20, usageA.error)
     assert.equal(usageB.windows[0]?.used, 70, usageB.error)
+    assert.equal(usageA.windows[0].aside, false)
+    assert.equal(usageB.windows[0].aside, false)
+    assert.deepEqual(usageA.windows[0].models, ["gemini-3.8-flash-a-high", "gemini-3.8-flash-a-low", "gemini-3.8-flash-a"])
+    assert.deepEqual(usageB.windows[0].models, ["gemini-3.8-flash-b-high", "gemini-3.8-flash-b-low", "gemini-3.8-flash-b"])
+    assert.equal(kit.modelsSpawns.length, queries, "usage must not start another model listing")
     assert.ok(kit.modelsSpawns.every(s => s.env.WSL_INTEROP === "real-wsl" && !s.env.GEMINI_API_KEY))
   })
 })

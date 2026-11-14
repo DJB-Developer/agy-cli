@@ -5619,9 +5619,19 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, a
 }
 
 const createPlugin = async () => {
-  const readUsage = createUsageReader(findAgy, account.dir ? {
-    signIn: () => accountSignIn(account), env: accountEnv(process.env, account), geminiDir: account.dir,
-  } : {})
+  const readUsage = createUsageReader(findAgy, {
+    // Read this account's current/saved catalog without starting extra CLI
+    // queries inside Magpie's bounded usage call. Include raw effort IDs and
+    // the aliases exposed by provider.models, so either request form is scoped.
+    getModels: agy => {
+      useAgyPath(agy)
+      const catalog = catalogOf(cachedModelCatalog).routing
+      return [...catalog.rawIds, ...catalog.models.map(model => model.id)]
+    },
+    ...(account.dir ? {
+      signIn: () => accountSignIn(account), env: accountEnv(process.env, account), geminiDir: account.dir,
+    } : {}),
+  })
   return {
     auth: {
       provider: PROVIDER_ID,
