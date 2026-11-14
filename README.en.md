@@ -159,13 +159,35 @@ After installing, sign in from Magpie; no terminal needed.
    sign-in (`agy acp --login`): Magpie opens the sign-in page, and you paste the
    code the page shows (or the page's whole address) back into Magpie. This
    works with Magpie on a server or in Docker too. The sign-in waits 15
-   minutes. Google credentials stay with agy (in the system keyring); the
-   plugin never reads or stores them, and counts the sign-in as done only once
+   minutes. Google credentials stay in agy's system keyring; the plugin
+   counts the sign-in as done only once
    `agy models` lists the account's models.
 2. Refer to models as `agy-cli/<model>`. When agy lists separate model IDs
    for different thinking levels, they are grouped here as variants of one model,
    and each request is mapped back to the matching agy ID.
 3. Pick the model in your client as usual.
+
+### Import with a refresh token
+
+Choose **Import an account (refresh token)** under Sign in and paste one
+`refresh_token`, or JSON shaped as `{"refresh_token":"…"}` or
+`{"token":{"refresh_token":"…"}}`. No browser sign-in is needed. The token
+must be compatible with agy's OAuth client.
+
+The plugin writes the credential to agy's system keyring, then lets agy refresh
+it and verify its model list. If verification fails, it attempts to restore the
+previous sign-in; a failed restore explicitly asks you to sign in again. Magpie
+still stores only the `agy` marker. This **replaces the local CLI's current
+account**, rather than adding an independent account to a pool. Finish active
+requests first. On success, old processes and saved session-resume records are
+cleared so subsequent requests use the new account.
+
+- macOS uses Keychain; Windows uses Credential Manager.
+- Linux needs `secret-tool` (usually in `libsecret-tools`) and an available,
+  unlocked Secret Service `login` collection. This import method does not work
+  on a server or in Docker without a keyring.
+- Remove Gemini/Google API key, ADC or Vertex environment authentication before
+  importing a refresh token.
 
 ## Concurrency
 
@@ -194,13 +216,13 @@ magpie quota refresh agy-cli --json
 ```
 
 The numbers come from agy's own `/usage` report for whichever account is signed
-in to the CLI, broken down by model group. The plugin never writes Google tokens
-or sends them anywhere; it always reports the account agy is signed in to. A window with no
+in to the CLI, broken down by model group. Usage queries run through agy and
+always report the account agy is signed in to. A window with no
 measurable data shows "Limits not available" rather than a fake 0% or 100%.
 
 A signed-out agy opens Google's sign-in page in the browser when it runs, so
 before running agy for usage or the model list, the plugin looks at agy's stored
-sign-in in the system keychain (macOS) or Credential Manager (Windows) and only
+sign-in in the system keychain (macOS), Credential Manager (Windows), or Secret Service (Linux) and only
 reads whether one is there and when it ends. With none, with one that has ended
 and can't be renewed, or with one agy already failed on, agy is not run: the
 account shows its sign-in has expired until you sign in again. Other failed

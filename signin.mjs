@@ -67,15 +67,170 @@ try {
 } finally { [MagpieAgy.Cred]::CredFree($p) }
 `
 
-function run(file, args) {
+function run(file, args, input) {
   return new Promise((resolve) => {
     try {
-      execFile(file, args, { timeout: READ_TIMEOUT_MS, windowsHide: true, maxBuffer: 1024 * 1024, encoding: "utf8" },
-        (error, stdout) => resolve({ code: error ? (typeof error.code === "number" ? error.code : -1) : 0, stdout: String(stdout ?? "") }))
+      const child = execFile(file, args, { timeout: READ_TIMEOUT_MS, windowsHide: true, maxBuffer: 1024 * 1024, encoding: "utf8" },
+        (error, stdout, stderr) => resolve({ code: error ? (typeof error.code === "number" ? error.code : -1) : 0, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") }))
+      child?.stdin?.on("error", () => {})
+      child?.stdin?.end(input)
     } catch {
       resolve({ code: -1, stdout: "" })
     }
   })
+}
+
+// Use the same native stores as go-keyring. Secrets travel on stdin, never
+// in a shell command, process arguments, or a plugin account record.
+const WINDOWS_WRITE_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class MagpieAgyWrite {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  public struct Credential {
+    public uint Flags, Type;
+    public string TargetName, Comment;
+    public long LastWritten;
+    public uint CredentialBlobSize;
+    public IntPtr CredentialBlob;
+    public uint Persist, AttributeCount;
+    public IntPtr Attributes;
+    public string TargetAlias, UserName;
+  }
+  [DllImport("advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern bool Write(ref Credential credential, uint flags);
+  [DllImport("advapi32.dll", EntryPoint = "CredDeleteW", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern bool Delete(string target, uint type, uint flags);
+}
+'@
+$inputValue = [Console]::In.ReadToEnd().Trim()
+if ($inputValue -eq 'DELETE') {
+  if (-not [MagpieAgyWrite]::Delete('${SERVICE}:${USER}', 1, 0)) { exit 1 }
+  exit 0
+}
+$bytes = [Convert]::FromBase64String($inputValue)
+$c = New-Object MagpieAgyWrite+Credential
+$c.Type = 1
+$c.TargetName = '${SERVICE}:${USER}'
+$c.UserName = '${USER}'
+$c.Persist = 2
+$c.CredentialBlobSize = $bytes.Length
+$c.CredentialBlob = [Runtime.InteropServices.Marshal]::AllocHGlobal($bytes.Length)
+try {
+  [Runtime.InteropServices.Marshal]::Copy($bytes, 0, $c.CredentialBlob, $bytes.Length)
+  if (-not [MagpieAgyWrite]::Write([ref]$c, 0)) { exit 1 }
+} finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($c.CredentialBlob) }
+`
+
+async function readRawSignIn(platform, exec) {
+  if (platform === "darwin") {
+    const r = await exec("/usr/bin/security", ["find-generic-password", "-s", SERVICE, "-a", USER, "-w"])
+    return r.code === 44 ? { state: "missing" } : r.code === 0
+      ? { state: "present", raw: r.stdout.trim() } : { state: "unknown" }
+  }
+  if (platform === "win32") {
+    const r = await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WINDOWS_SCRIPT])
+    const out = r.stdout.trim().split(/\r?\n/).at(-1)?.trim() ?? ""
+    if (r.code !== 0) return { state: "unknown" }
+    if (out === "MISSING") return { state: "missing" }
+    return out.startsWith("OK ") ? { state: "present", raw: Buffer.from(out.slice(3), "base64").toString("utf8") } : { state: "unknown" }
+  }
+  if (platform === "linux") {
+    const r = await exec("secret-tool", ["lookup", "service", SERVICE, "username", USER])
+    if (r.code === 0) return { state: "present", raw: r.stdout.trim() }
+    if (r.code === 1 && !r.stdout.trim() && !r.stderr?.trim()) return { state: "missing" }
+  }
+  return { state: "unknown" }
+}
+
+function keyringValue(raw, platform) {
+  if (platform !== "darwin" || raw.startsWith("go-keyring-base64:") || raw.startsWith("go-keyring-encoded:")) return raw
+  return "go-keyring-base64:" + Buffer.from(raw).toString("base64")
+}
+
+async function writeRawSignIn(raw, platform, exec) {
+  let r
+  if (platform === "darwin") {
+    if (raw === null) r = await exec("/usr/bin/security", ["delete-generic-password", "-s", SERVICE, "-a", USER])
+    else {
+      // The value is encoded before it enters security's command parser.
+      const value = keyringValue(raw, platform)
+      if (!/^go-keyring-(?:base64:[A-Za-z0-9+/=]*|encoded:[a-fA-F0-9]*)$/.test(value)) return false
+      const command = `add-generic-password -U -s ${SERVICE} -a ${USER} -w ${value}\n`
+      if (Buffer.byteLength(command) > 4096) return false
+      r = await exec("/usr/bin/security", ["-i"], command)
+    }
+  } else if (platform === "win32") {
+    r = await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WINDOWS_WRITE_SCRIPT],
+      raw === null ? "DELETE" : Buffer.from(raw).toString("base64"))
+  } else if (platform === "linux") {
+    r = raw === null
+      ? await exec("secret-tool", ["clear", "service", SERVICE, "username", USER])
+      : await exec("secret-tool", ["store", "--label=Antigravity CLI", "--collection=login", "service", SERVICE, "username", USER], raw)
+  }
+  return r?.code === 0
+}
+
+export function parseRefreshToken(input) {
+  const text = typeof input === "string" ? input.trim() : ""
+  let token = text
+  if (/^[{\[\"]/.test(text)) {
+    let value
+    try { value = JSON.parse(text) } catch { throw new Error("Paste a refresh token or valid account JSON.") }
+    token = value?.token?.refresh_token ?? value?.refresh_token
+  }
+  if (typeof token !== "string" || !token.trim() || /[\s\x00-\x1f\x7f"{}\[\]]/.test(token.trim())) {
+    throw new Error("Paste one refresh token, or an account JSON containing refresh_token.")
+  }
+  return token.trim()
+}
+
+let importing = false
+
+// agy does the exchange using its own OAuth client. If it cannot use the
+// imported credential, restore the previous keyring entry (or remove ours).
+export async function importRefreshToken(input, { probe, platform = process.platform, exec = run, env = process.env } = {}) {
+  let refreshToken
+  try { refreshToken = parseRefreshToken(input) } catch (error) { return { error: error.message } }
+  if (importing) return { error: "An account import is already in progress." }
+  if (ENV_SIGN_INS.some(name => env[name])) return { error: "Remove agy's API key, ADC or Vertex environment authentication before importing a refresh token." }
+  if (typeof probe !== "function") return { error: "An agy sign-in check is required." }
+  importing = true
+  let previous
+  let written = false
+  try {
+    previous = await readRawSignIn(platform, exec)
+    if (previous.state === "unknown") return { error: "Could not read agy's keyring. Unlock it first; Linux also needs secret-tool and a running Secret Service login collection." }
+    const raw = JSON.stringify({ token: { access_token: "", refresh_token: refreshToken, token_type: "Bearer", expiry: "2000-01-01T00:00:00Z" }, auth_method: "consumer" })
+    if (!await writeRawSignIn(raw, platform, exec)) return { error: "Could not store the refresh token in agy's system keyring." }
+    written = true
+    const saved = await readRawSignIn(platform, exec)
+    const expected = keyringValue(raw, platform)
+    if (saved.state !== "present" || saved.raw !== expected) throw new Error("keyring write was not retained")
+    forgetStoredSignIn({ dead: true })
+    const result = await probe()
+    if (result?.ok) return { ok: true }
+    throw new Error("probe failed")
+  } catch {
+    // Neither subprocess output nor probe errors may echo the credential.
+    if (!written) return { error: "Could not access agy's system keyring." }
+    let restored = false
+    try {
+      if (await writeRawSignIn(previous.state === "present" ? previous.raw : null, platform, exec)) {
+        const current = await readRawSignIn(platform, exec)
+        restored = previous.state === "missing" ? current.state === "missing"
+          : current.state === "present" && current.raw === keyringValue(previous.raw, platform)
+      }
+    } catch {}
+    return { error: restored
+      ? "agy could not use this refresh token. Check the token, its OAuth client and network access. The previous sign-in was restored."
+      : "agy could not use this refresh token, and the previous sign-in could not be restored. Sign in again." }
+  } finally {
+    forgetStoredSignIn()
+    importing = false
+  }
 }
 
 // parseStored is what a stored value says, "unknown" when it isn't the
@@ -109,24 +264,8 @@ export async function readStoredSignIn({ platform = process.platform, exec = run
   if (env.AGY_BRIDGE_STORED_SIGNIN === "skip") return { state: "unknown" }
   // agy signs in with these instead of a stored Google sign-in
   if (ENV_SIGN_INS.some((name) => env[name])) return { state: "unknown" }
-  if (platform === "darwin") {
-    const r = await exec("/usr/bin/security", ["find-generic-password", "-s", SERVICE, "-a", USER, "-w"])
-    // 44: errSecItemNotFound
-    if (r.code === 44) return { state: "missing" }
-    if (r.code !== 0) return { state: "unknown" }
-    return parseStored(r.stdout, now)
-  }
-  if (platform === "win32") {
-    const r = await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WINDOWS_SCRIPT])
-    // the answer is the last line; anything PowerShell said before it isn't
-    const out = r.stdout.trim().split(/\r?\n/).at(-1)?.trim() ?? ""
-    if (r.code !== 0) return { state: "unknown" }
-    if (out === "MISSING") return { state: "missing" }
-    if (!out.startsWith("OK ")) return { state: "unknown" }
-    // go-keyring on Windows stores the value's bytes as they are (UTF-8)
-    return parseStored(Buffer.from(out.slice(3), "base64").toString("utf8"), now)
-  }
-  return { state: "unknown" }
+  const s = await readRawSignIn(platform, exec)
+  return s.state === "present" ? parseStored(s.raw, now) : s
 }
 
 // cannotSignIn is why a stored sign-in can't serve agy without a new

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, isDead, noteDead, parseStored, readStoredSignIn, storedSignIn, storedSignInNow } from "../signin.mjs"
+import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, importRefreshToken, isDead, noteDead, parseRefreshToken, parseStored, readStoredSignIn, storedSignIn, storedSignInNow } from "../signin.mjs"
 
 const NOW = Date.parse("2026-11-13T00:00:00Z")
 const stored = (token, extra = {}) => JSON.stringify({ token, auth_method: "consumer", id_token_email: "someone@example.com", ...extra })
@@ -60,7 +60,10 @@ test("readStoredSignIn asks each system's keyring the way go-keyring stores it",
   const w = await readStoredSignIn({ platform: "win32", exec: win("OK " + Buffer.from(value).toString("base64") + "\r\n"), now: NOW, env: {} })
   assert.equal(w.state, "present")
   assert.equal(w.canRenew, true)
-  assert.equal((await readStoredSignIn({ platform: "linux", exec: mac(0), env: {} })).state, "unknown")
+  assert.equal((await readStoredSignIn({ platform: "linux", exec: mac(0, value), env: {} })).state, "present")
+  assert.deepEqual(calls.at(-1), ["secret-tool", "lookup", "service", "gemini", "username", "antigravity"])
+  assert.equal((await readStoredSignIn({ platform: "linux", exec: mac(1), env: {} })).state, "missing")
+  assert.equal((await readStoredSignIn({ platform: "linux", exec: async () => ({ code: 1, stdout: "", stderr: "no session bus" }), env: {} })).state, "unknown")
   const before = calls.length
   for (const env of [{ AGY_BRIDGE_STORED_SIGNIN: "skip" }, { GEMINI_API_KEY: "k" }, { AGY_ADC_AUTH: "1" }]) {
     assert.equal((await readStoredSignIn({ platform: "darwin", exec: mac(44), env })).state, "unknown")
@@ -101,4 +104,132 @@ test("storedSignInNow answers from the last read without waiting, and reads agai
   assert.deepEqual(storedSignInNow({ read }), { state: "missing" })
   assert.equal(reads, 1)
   forgetStoredSignIn({ dead: true })
+})
+
+test("refresh-token input accepts one token or an account export and rejects malformed input", () => {
+  for (const input of ["  1//test-token \n", '{"refresh_token":"1//test-token"}', '{"token":{"refresh_token":"1//test-token","access_token":"ignored"}}']) {
+    assert.equal(parseRefreshToken(input), "1//test-token")
+  }
+  for (const input of [undefined, "", "\n", "one\ntwo", "one two", '{"refresh_token":', "{}", "[]", '{"refresh_token":123}', '{"token":{"refresh_token":""}}']) {
+    assert.throws(() => parseRefreshToken(input), /Paste/)
+  }
+})
+
+function keyring(platform, initial = null) {
+  let raw = initial
+  const calls = []
+  return {
+    calls,
+    get raw() { return raw },
+    async exec(file, args, input) {
+      calls.push({ file, args, input })
+      if (input !== undefined || args[0] === "delete-generic-password" || args[0] === "clear") {
+        if (platform === "darwin") raw = input ? input.match(/ -w (\S+)\n$/)[1] : null
+        if (platform === "win32") raw = input === "DELETE" ? null : Buffer.from(input, "base64").toString("utf8")
+        if (platform === "linux") raw = input ?? null
+        return { code: 0, stdout: "" }
+      }
+      if (platform === "darwin") return { code: raw === null ? 44 : 0, stdout: raw ?? "" }
+      if (platform === "win32") return { code: 0, stdout: raw === null ? "MISSING" : "OK " + Buffer.from(raw).toString("base64") }
+      return { code: raw === null ? 1 : 0, stdout: raw ?? "" }
+    },
+  }
+}
+
+test("imports into agy's native store on each platform, validates, and never puts tokens in args", async () => {
+  for (const platform of ["darwin", "win32", "linux"]) {
+    const store = keyring(platform)
+    await storedSignIn({ read: async () => ({ state: "missing" }) })
+    let probes = 0
+    const result = await importRefreshToken("1//private-token", { platform, exec: store.exec, env: {}, probe: async () => {
+      probes++
+      assert.equal(parseStored(store.raw).canRenew, true)
+      assert.equal(parseStored(store.raw).expired, true)
+      assert.equal(await backgroundBlocked({ read: () => readStoredSignIn({ platform, exec: store.exec, env: {} }) }), "")
+      return { ok: true }
+    } })
+    assert.deepEqual(result, { ok: true })
+    assert.equal(probes, 1)
+    const write = store.calls.find(call => call.input !== undefined)
+    assert.doesNotMatch(JSON.stringify(store.calls.map(({ file, args }) => ({ file, args }))), /private-token/)
+    const raw = platform === "darwin" ? Buffer.from(store.raw.slice("go-keyring-base64:".length), "base64").toString() : store.raw
+    assert.deepEqual(JSON.parse(raw), { token: { access_token: "", refresh_token: "1//private-token", token_type: "Bearer", expiry: "2000-01-01T00:00:00Z" }, auth_method: "consumer" })
+    if (platform === "darwin") assert.deepEqual(write.args, ["-i"])
+    if (platform === "win32") assert.match(write.args.at(-1), /CredWriteW/)
+    if (platform === "linux") assert.deepEqual(write.args, ["store", "--label=Antigravity CLI", "--collection=login", "service", "gemini", "username", "antigravity"])
+  }
+})
+
+test("a refused or throwing probe restores the previous credential or removes a new entry", async () => {
+  for (const platform of ["darwin", "win32", "linux"]) {
+    for (const initial of [null, platform === "darwin" ? b64(stored({ refresh_token: "old" })) : stored({ refresh_token: "old" })]) {
+      for (const throws of [false, true]) {
+        const store = keyring(platform, initial)
+        const result = await importRefreshToken("private-token", { platform, exec: store.exec, env: {}, probe: async () => {
+          if (throws) throw new Error("private-token")
+          return { ok: false, why: "private-token" }
+        } })
+        assert.match(result.error, /previous sign-in was restored/)
+        assert.doesNotMatch(result.error, /private-token/)
+        assert.equal(store.raw, initial)
+      }
+    }
+  }
+})
+
+test("bad input, unavailable stores, and environment auth cannot overwrite credentials", async () => {
+  let calls = 0
+  let probes = 0
+  const opts = { platform: "darwin", exec: async () => { calls++; return { code: 51, stdout: "" } }, env: {}, probe: async () => { probes++; return { ok: true } } }
+  assert.match((await importRefreshToken("", opts)).error, /Paste/)
+  assert.match((await importRefreshToken("token", { ...opts, env: { GEMINI_API_KEY: "key" } })).error, /environment/)
+  assert.equal(calls, 0)
+  assert.match((await importRefreshToken("token", opts)).error, /Could not read/)
+  assert.equal(calls, 1)
+  assert.equal(probes, 0)
+})
+
+test("write and rollback failures are reported without exposing subprocess output", async () => {
+  const store = keyring("linux")
+  let writes = 0
+  const exec = async (file, args, input) => {
+    if (input !== undefined || args[0] === "clear") {
+      writes++
+      if (writes > 1) return { code: 1, stdout: "private-token" }
+    }
+    return store.exec(file, args, input)
+  }
+  const result = await importRefreshToken("private-token", { platform: "linux", exec, env: {}, probe: async () => ({ ok: false }) })
+  assert.match(result.error, /could not be restored/)
+  assert.doesNotMatch(result.error, /private-token/)
+  const failed = await importRefreshToken("private-token", { platform: "linux", exec, env: {}, probe: async () => { assert.fail("must not probe a failed write") } })
+  assert.match(failed.error, /Could not store/)
+})
+
+test("concurrent imports cannot overwrite one another", async () => {
+  const store = keyring("linux")
+  let release
+  let started
+  const probing = new Promise(resolve => { started = resolve })
+  const first = importRefreshToken("first", { platform: "linux", exec: store.exec, env: {}, probe: () => {
+    started()
+    return new Promise(resolve => { release = resolve })
+  } })
+  await probing
+  assert.match((await importRefreshToken("second", { platform: "linux", exec: store.exec, env: {}, probe: async () => ({ ok: true }) })).error, /already in progress/)
+  release({ ok: true })
+  assert.deepEqual(await first, { ok: true })
+  assert.equal(JSON.parse(store.raw).token.refresh_token, "first")
+})
+
+test("a command reporting success without retaining the token cannot validate the old account", async () => {
+  const initial = b64(stored({ refresh_token: "old" }))
+  let probes = 0
+  const result = await importRefreshToken("new", {
+    platform: "darwin", env: {},
+    exec: async (_file, args) => ({ code: 0, stdout: args[0] === "find-generic-password" ? initial : "" }),
+    probe: async () => { probes++; return { ok: true } },
+  })
+  assert.match(result.error, /previous sign-in was restored/)
+  assert.equal(probes, 0)
 })

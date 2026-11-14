@@ -8,7 +8,7 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
-import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, storedSignInNow } from "./signin.mjs"
+import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, importRefreshToken, parseRefreshToken, storedSignInNow } from "./signin.mjs"
 import { sanitizePatternFields } from "./re2-pattern.mjs"
 import { startLogin } from "./login.mjs"
 import { ensureGeminiArrayItems } from "./array-items.mjs"
@@ -136,6 +136,7 @@ const FALLBACK_MODELS = [
 const pool = new Map()
 const parked = new Map()
 const allProcs = new Set()
+let importingAccount = false
 const sessions = new Map()
 const toolCalls = new Map()
 let cachedAgyPath
@@ -225,6 +226,7 @@ function execOnce(file, args, opts = {}) {
 }
 
 async function listAgyModels(agyPath) {
+  if (importingAccount) return null
   // a listing nobody asked for doesn't run an agy that would start its own
   // Google sign-in (signin.mjs); the catalog it has stays
   if (await backgroundBlocked()) return null
@@ -5592,7 +5594,7 @@ export const AntigravityBridgePlugin = async () => {
       provider: PROVIDER_ID,
       single: true,
       // Magpie's usage hook; OpenCode ignores this extension. agy owns auth.
-      usage: async () => readUsage(),
+      usage: async () => importingAccount ? { windows: [], error: "An account import is in progress." } : readUsage(),
       methods: [
         {
           // agy's own Google sign-in (`agy acp --login`): magpie opens its
@@ -5635,12 +5637,53 @@ export const AntigravityBridgePlugin = async () => {
             }
           },
         },
+        {
+          type: "oauth",
+          label: "Import an account (refresh token)",
+          prompts: [{ type: "text", key: "refresh_token", message: "Refresh token or account JSON (replaces agy's local account)" }],
+          authorize: async (inputs) => {
+            let token
+            try { token = parseRefreshToken(inputs?.refresh_token) } catch (error) { return { type: "failed", error: error.message } }
+            const agy = findAgy()
+            if (!agy) return { type: "failed", error: "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli" }
+            return {
+              url: "",
+              instructions: "Importing the account into agy's system keyring and checking it with agy…",
+              method: "auto",
+              callback: async () => {
+                if (importingAccount) return { type: "failed", error: "An account import is already in progress." }
+                if ([...allProcs].some(proc => proc.turn && !proc.turn.finalized)) {
+                  return { type: "failed", error: "Wait for agy's active requests to finish before importing an account." }
+                }
+                importingAccount = true
+                try {
+                  // Retire processes holding the old account before changing
+                  // the keyring; subsequent requests start with the new one.
+                  await Promise.all([...allProcs].map(proc => { dropFromPool(proc); return proc.stop() }))
+                  forgetOffered()
+                  const result = await importRefreshToken(token, { probe: () => probeSignedIn(agy) })
+                  if (result.error) return { type: "failed", error: result.error }
+                  loadParked()
+                  for (const entry of readStateFile()) unparked.add(entry.key)
+                  parked.clear()
+                  saveParked()
+                  return { type: "success", key: "agy" }
+                } catch {
+                  return { type: "failed", error: "Could not import the account. Finish active requests and try again." }
+                } finally {
+                  importingAccount = false
+                }
+              },
+            }
+          },
+        },
       ],
       loader: async () => {
         return {
           baseURL: "agy://local",
           apiKey: "agy",
           fetch: async (fetchInput, init = {}) => {
+            if (importingAccount) return jsonError(503, "An account import is in progress; try again when it finishes.")
             const requestUrl = typeof fetchInput === "string"
               ? fetchInput
               : fetchInput instanceof URL

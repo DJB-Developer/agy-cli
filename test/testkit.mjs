@@ -488,6 +488,15 @@ export async function createBridgeKit(options = {}) {
   const execFile = (file, args = [], opts, callback) => {
     if (typeof opts === "function") callback = opts
     kit.execFiles.push({ file, args })
+    if (options.onExecFile) return { stdin: {
+      on() {},
+      end(input) {
+        Promise.resolve().then(() => options.onExecFile(file, args, input)).then(result => {
+          callback(result.code ? Object.assign(new Error("keyring error (test)"), { code: result.code }) : null,
+            result.stdout ?? "", result.stderr ?? "")
+        }, error => callback(error, "", ""))
+      },
+    } }
     const stored = options.storedSignIn
     setImmediate(() => stored === "missing" || stored === undefined
       ? callback(Object.assign(new Error("not found (test)"), { code: 44 }), "", "")

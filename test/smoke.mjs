@@ -748,7 +748,7 @@ const legacyModel = "agy-cli/gemini-test-low"
   const before = logs().filter(event => event.type === "models").length
   const result = await plugin.auth.methods[0].authorize()
   const probes = logs().filter(event => event.type === "models").slice(before)
-  check("sign-in is agy's Google sign-in, an oauth way", plugin.auth.methods.length === 1 && plugin.auth.methods[0].type === "oauth")
+  check("sign-in offers Google's browser flow and refresh-token import", plugin.auth.methods.length === 2 && plugin.auth.methods.every(method => method.type === "oauth"))
   check("signed in to agy already, the sign-in opens nothing", result.url === "" && result.method === "auto")
   check("signed in to agy already, the sign-in saves agy", (await result.callback())?.type === "success")
   check("authorize login probe disables auto update", probes.length === 1 && probes[0].update === "true")
