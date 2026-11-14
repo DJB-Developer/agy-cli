@@ -149,7 +149,7 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.2 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to 0.2.3 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
 The marketplace and npm commands below install the upstream community version, without this repository's changes.
 
 From the Magpie community plugins: find "Antigravity (local agy CLI)" on
@@ -285,7 +285,7 @@ eligibility conclusion.
 | `AGY_BRIDGE_MAX_PROCS` | 16 | Maximum agy processes per account |
 | `AGY_BRIDGE_THINKING` | on | Set to `0` to stop forwarding thought summaries |
 | `AGY_BRIDGE_EFFORT` | unset | Force a thinking level: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` |
-| `AGY_BRIDGE_MINIMAL_AGENT` | off | Set to `1` to drop agy's own prompt components; see "Minimal agent" below |
+| `AGY_BRIDGE_MINIMAL_AGENT` | off | Set to `1` to drop agy's own prompt components; Magpie's saved UI switch takes precedence. See "Minimal agent" below |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | How long a process may sit idle before it is reclaimed; the session can still resume |
 | `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | How long a reclaimed session stays resumable (6 hours) |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | Where resumable session records are kept |
@@ -300,7 +300,22 @@ eligibility conclusion.
 | `AGY_BRIDGE_PREFILL` | on | Set to `0` to restore the stock 400 reject for assistant prefill tails; see "Assistant prefill" |
 | `AGY_BRIDGE_PREFILL_CARRIER_NOTE` | English system note | The note line rendered before a prefill fragment (sent to the model) |
 
-## Minimal agent (`AGY_BRIDGE_MINIMAL_AGENT=1`)
+## Minimal agent
+
+Since 0.2.3, open **Providers → agy-cli → Edit → Plugin options**, change
+**Minimal agent prompt**, and Save. No Compose edit or container restart is needed.
+The switch applies to every agy-cli account. Magpie saves it across restarts.
+
+Changes apply to new conversation turns. Running replies and pending tool calls
+finish with their original setting. After a mode change, the next turn rebuilds
+the session from the client's history instead of reusing the old prompt.
+Sessions saved before this version lack a mode record and rebuild once on their
+first continuation as well.
+
+The default is off, or on if `AGY_BRIDGE_MINIMAL_AGENT=1` was already set.
+A saved UI value overrides the environment, including an explicit off. Older
+Magpie hosts and OpenCode retain the environment fallback. If Plugin options is
+missing after updating the plugin, update Magpie too.
 
 By default agy runs every request with its own system prompt, and the
 client's system prompt is added to it: in the session when agy advertises
@@ -322,7 +337,7 @@ paths…") goes reworded with the same meaning, as the Antigravity provider
 sends it: word for word, it got most `gemini-4-argon` answers fast, without
 thinking and shallow (#1028).
 
-Set to `1`, the temporary agent carries `excludeDefaultComponents: true`. The
+With the switch on (or the environment variable set to `1`), the temporary agent carries `excludeDefaultComponents: true`. The
 request that goes upstream then has none of agy's own system prompt, only
 the plugin's one-line tool note and the client's system prompt (sent in one
 of the two ways above). The original author measured about 8,400 input

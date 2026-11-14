@@ -590,7 +590,7 @@ export async function createBridgeKit(options = {}) {
     if (!kit.turns.includes(this)) kit.turns.push(this)
     return originalRegister.apply(this, args)
   }
-  kit.plugin = await ns.AntigravityBridgePlugin()
+  kit.plugin = await ns.AntigravityBridgePlugin(options.pluginInput)
   kit.loaded = await kit.plugin.auth.loader()
 
   kit.models = () => kit.plugin.provider.models()

@@ -109,7 +109,7 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.2。现有账号保留，可继续添加其他账号。
+已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.3。现有账号保留，可继续添加其他账号。
 以下市场和 npm 命令安装的是上游社区版本，不包含本仓库的改动。
 
 从 Magpie 社区插件市场安装（推荐）：在 Magpie 的 Plugins 页找到「Antigravity (local agy CLI)」点安装，或在终端运行：
@@ -221,7 +221,7 @@ docker logs --since 10m magpie 2>&1 | grep -F '[agy-usage]'
 | `AGY_BRIDGE_MAX_PROCS` | 16 | 每个账号的 agy 进程池上限 |
 | `AGY_BRIDGE_THINKING` | 开启 | 设为 `0` 关闭思考摘要 |
 | `AGY_BRIDGE_EFFORT` | 未设置 | 强制思考等级：`minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
-| `AGY_BRIDGE_MINIMAL_AGENT` | 关闭 | 设为 `1` 去掉 agy 自带的提示组件，见下文「精简 agent」 |
+| `AGY_BRIDGE_MINIMAL_AGENT` | 关闭 | 设为 `1` 去掉 agy 自带的提示组件；Magpie 界面保存的开关优先，见下文「精简 agent」 |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | 进程空闲多久后回收（会话仍可续接） |
 | `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | 回收后的会话可续接的时长（6 小时） |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | 会话状态文件路径 |
@@ -236,7 +236,19 @@ docker logs --since 10m magpie 2>&1 | grep -F '[agy-usage]'
 | `AGY_BRIDGE_PREFILL` | 开启 | 设为 `0` 恢复对 assistant 预填尾巴的原生 400 拒绝，见「助手预填」 |
 | `AGY_BRIDGE_PREFILL_CARRIER_NOTE` | 英文系统提示行 | 预填片段渲染时的提示行文本（发给模型） |
 
-## 精简 agent（`AGY_BRIDGE_MINIMAL_AGENT=1`）
+## 精简 agent
+
+从 0.2.3 起，在 Magpie **提供商 → agy-cli → 编辑 → 插件选项** 中，打开或关闭
+**精简 Agent 提示词**，然后点保存即可，不需要修改 Compose 或重启容器。
+这个开关对 agy-cli 的所有账号生效，由 Magpie 保存，重启后保留。
+
+保存后从新的对话轮次生效；正在生成回复或等待工具结果的请求会按原配置完成。
+切换模式后，下一轮会根据客户端携带的历史重建会话，避免继续使用旧提示词。
+升级前保存的会话没有记录此模式，因此首次续接也会根据客户端历史重建一次。
+
+没有界面设置时，默认关闭；已有 `AGY_BRIDGE_MINIMAL_AGENT=1` 环境变量会作为开关的初始默认值。
+界面保存的开或关优先于环境变量。旧版 Magpie 或 OpenCode 不提供该开关时，仍可用环境变量设置。
+如果更新插件后看不到“插件选项”，请更新 Magpie。
 
 默认情况下，agy 用它自己的系统提示词跑每个请求，客户端的系统提示词附加在后面（agy 声明
 支持 `systemPrompt.append` 时放进会话，否则作为 `<external_system_instructions>` 放在
@@ -250,7 +262,7 @@ agy 发出之前去掉计费那一行，其余几行换成同义的说法（"bui
 DeepSeek Harness 的 `@` 路径说明段（"Tokens prefixed with @ are paths…"）也和 Antigravity 提供商一样
 换成同义的说法再发：原文照发时 `gemini-4-argon` 大多很快答完、不思考、只走一步（#1028）。
 
-设为 `1` 后，临时 agent 带上 `excludeDefaultComponents: true`：发往上游的请求里不再有
+打开开关（或通过环境变量设为 `1`）后，临时 agent 带上 `excludeDefaultComponents: true`：发往上游的请求里不再有
 agy 自己的系统提示词，只剩插件的一行工具说明和客户端的系统提示词（同样以上面两种方式之一
 发送）。原作者实测每次模型调用的输入从约 8,400 token 降到约 500 token。代价是上游看到的
 不再是 agy 自己的请求形态，所以默认关闭，由你自行决定是否开启。
