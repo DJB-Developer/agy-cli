@@ -110,9 +110,9 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.9。现有账号保留，可继续添加其他账号。
+已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.10。现有账号保留，可继续添加其他账号。
 
-0.2.9 恢复 CLI `/usage` 额度查询，套餐仍通过 HTTP 补充查询，保留模型组路由和套餐 ID 识别。
+0.2.10 修复账号被停用时警告被当成正常回复的问题；保留 CLI 额度、HTTP 套餐和模型组路由。
 套餐失败或超时仅省略套餐，不影响额度、登录和聊天；聊天仍走 ACP，无需重新导入账号。
 
 0.2.7 同步社区 0.1.49 的会话续接修复：保存会话按实际发送给 CLI 的提示词校验。
@@ -340,3 +340,28 @@ agy，不消耗额度。
 ## License
 
 MIT。版权声明见 [LICENSE](LICENSE)，上游来源与逐项变更见 [NOTICE.md](NOTICE.md)。
+
+
+## 账号服务停用与故障切换（0.2.10）
+
+当 CLI 返回明确的 `This service has been disabled in this account for violation of Terms of Service...`
+或结构化的 `403 / PERMISSION_DENIED / TOS_VIOLATION`，插件将其视为该账号的服务停用。
+识别聊天末尾警告、CLI 重试行、ACP 错误及当前回合日志；CLI 额度查询出现同样错误也会记录。
+普通 403、地区不支持、登录过期、429 或套餐 HTTP 查询失败不会被标记为服务停用。
+
+非流式请求返回 HTTP 403；流式请求发出 `permission_error`，携带数值 `status: 403`、
+`code: TOS_VIOLATION` 和停用原因，避免把警告当成成功回答。Magpie 上游的账号故障切换机制
+会在回答尚未发出时尝试其他可用账号；如果希望所有账号失败后换供应商，需要在 Magpie
+路由组里配置备用模型，并让客户端请求该路由组。已输出部分回答后不能保证无缝切换。
+请同时保持 Magpie 更新，以使用其 agy-cli 账号停用识别和流式错误状态处理。
+
+停用状态按账号保存在 `<账号目录>/bridge-state/service-status.json`；旧默认账号的文件
+与 `sessions.json` 同目录。文件只存原因代码和检测时间，不存 token 或对话。
+后续聊天直接返回 403，不再调用该账号的 CLI；刷新额度显示停用原因并通过 Magpie 的
+`signIn: expired` 标记将账号移出可用列表（界面可能统称为登录失效，原因中会明确服务停用）。
+刷新 token、刷新额度和重启不会自动解除停用。若写文件失败，会记录日志并在本次运行期间阻止使用。
+
+**额度/套餐可查不代表聊天权限正常**：本功能依赖 CLI 实际返回停用信号，不主动发送探测对话。
+已知被停用但插件尚未见过错误的账号，请先在 Magpie 手动关闭。
+申诉通过后，先停止 Magpie/插件，删除该账号的 `service-status.json`，再启动并刷新额度；
+必要时在 Magpie 重新启用该账号。不要仅因为 token 刷新成功就解除标记。

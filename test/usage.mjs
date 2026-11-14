@@ -881,3 +881,10 @@ test("quota UI retains redacted auth details until the credential changes", asyn
   assert.equal((await f.logs()).length, runs + 2)
   forgetStoredSignIn({ dead: true })
 })
+
+test("structured CLI TOS errors retain suspension classification", () => {
+  assert.throws(() => parseUsageReport({ status: "FAILED", error: {
+    code: 403, status: "PERMISSION_DENIED", message: "Service disabled",
+    details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "TOS_VIOLATION" }],
+  } }), error => error.kind === "suspended")
+})

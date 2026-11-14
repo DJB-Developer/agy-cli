@@ -8,6 +8,7 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
+import { createServiceStatus, isServiceSuspension, SUSPENSION_MESSAGE, TOS_MESSAGE } from "./service-status.mjs"
 import { backgroundBlocked as defaultBackgroundBlocked, cannotSignIn, forgetStoredSignIn as defaultForgetStoredSignIn, isDead, parseRefreshToken, storedSignInNow as defaultStoredSignInNow } from "./signin.mjs"
 import { sanitizePatternFields } from "./re2-pattern.mjs"
 import { startLogin } from "./login.mjs"
@@ -35,6 +36,7 @@ const minimalAgent = () => readMinimalAgentOption
 // sessions, model catalogs and control sockets. No request can see another
 // profile's live session, even when its history or tool IDs are identical.
 function createAccountRuntime(account = DEFAULT_ACCOUNT) {
+const serviceStatus = createServiceStatus(path.join(path.dirname(sessionStateFile()), "service-status.json"))
 // models parses global flags only before its subcommand; ACP has its own
 // parser and takes them after `acp` (verified with native agy 1.5.9).
 const spawnAgy = (file, args, opts = {}) => account.dir ? nativeSpawnAgy(file,
@@ -42,6 +44,7 @@ const spawnAgy = (file, args, opts = {}) => account.dir ? nativeSpawnAgy(file,
   { ...opts, env: accountEnv(opts.env || process.env, account) }) : nativeSpawnAgy(file, args, opts)
 const storedSignInNow = () => account.dir ? accountSignIn(account) : defaultStoredSignInNow()
 const backgroundBlocked = async opts => {
+  if (serviceStatus.get()) return SUSPENSION_MESSAGE
   if (!account.dir) return defaultBackgroundBlocked(opts)
   const signIn = accountSignIn(account)
   return cannotSignIn(signIn) || (isDead(signIn) ? "agy's sign-in no longer works" : "")
@@ -149,9 +152,11 @@ const AGENT_ERROR_MARKERS = [
   "\n⚠ There was a network issue connecting to the server, please try again.\n",
   "\n⚠ Your AI credits balance is too low to continue.\n",
   "\n⚠ RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n",
+  `\n⚠ ${TOS_MESSAGE}\n`,
 ]
 const AGENT_ERROR_CORES = AGENT_ERROR_MARKERS.map((marker) => marker.trim())
 const CREDITS_CORE = AGENT_ERROR_CORES[2]
+const TOS_CORE = `⚠ ${TOS_MESSAGE}`
 // agy 1.5.8 writes each failed attempt of a model call into the reply as one
 // line, then tries again in the same turn (#1136). The line is agy's.
 const ATTEMPT_CORE = "⚠ API error (attempt "
@@ -1383,6 +1388,7 @@ class Turn {
     }
     for (const core of AGENT_ERROR_CORES) {
       const marker = text.lastIndexOf(core)
+      if (core === TOS_CORE && marker >= 0 && !(marker > 0 ? text[marker - 1] === "\n" : !this.textTail || this.textTail === "\n")) continue
       if (marker >= 0 && !text.slice(marker + core.length).trim()) {
         const start = text[marker - 1] === "\n" ? marker - 1 : marker
         this.heldText = text.slice(start)
@@ -1392,7 +1398,10 @@ class Turn {
     }
     for (let keep = Math.min(text.length, HOLD_MAX); keep > 0; keep--) {
       const tail = text.slice(-keep)
+      const at = text.length - keep
+      const lineStart = at > 0 ? text[at - 1] === "\n" : !this.textTail || this.textTail === "\n"
       if (AGENT_ERROR_MARKERS.some((marker) => marker.startsWith(tail)) ||
+        (lineStart && TOS_CORE.startsWith(tail)) ||
         (keep > 1 && (RETRY_MARKER.startsWith(tail) || ATTEMPT_MARKER.startsWith(tail)))) {
         this.heldText = tail
         text = text.slice(0, -keep)
@@ -1425,12 +1434,12 @@ class Turn {
       if (end === text.length && !final) {
         // agy waits before its next try with the line still open
         const open = attempt ? ATTEMPT_LINE.exec(text.slice(at, end))?.[1]?.trim() : ""
-        if (open && refused429(open)) this.refusedDetail ||= open
+        if (open && (refused429(open) || isServiceSuspension(open))) this.refusedDetail ||= open
         this.openBanner = start
         return text
       }
       if (attempt) this.attemptDetail = ATTEMPT_LINE.exec(text.slice(at, end))?.[1]?.trim() || this.attemptDetail
-      if (attempt && refused429(this.attemptDetail)) this.refusedDetail ||= this.attemptDetail
+      if (attempt && (refused429(this.attemptDetail) || isServiceSuspension(this.attemptDetail))) this.refusedDetail ||= this.attemptDetail
       if (text[end] === "\n") end++
       text = text.slice(0, start) + text.slice(end)
       from = start
@@ -1959,6 +1968,7 @@ class Proc {
   }
 
   startTurn(content, messages, model, selection) {
+    if (serviceStatus.get()) throw this.#formatAgentError(TOS_MESSAGE)
     if (this.dead) throw this.deadError
     if (this.retiring) throw new BusyError("agy bridge: this conversation's process is being retired")
     if (this.turn) throw new BusyError("agy bridge: this conversation still has an unfinished response")
@@ -2090,6 +2100,7 @@ class Proc {
         turn.promptInFlight = true
         let result
         try {
+          if (serviceStatus.get()) throw this.#formatAgentError(TOS_MESSAGE)
           result = await this.conn.request("session/prompt", {
             sessionId: this.sessionId,
             prompt: promptParts.length ? promptParts : [{ type: "text", text: "" }],
@@ -2126,11 +2137,12 @@ class Proc {
         lateCalls = late
       }
     } catch (error) {
+      if (isServiceSuspension(error.acpError) || isServiceSuspension(error.message)) error = this.#formatAgentError(TOS_MESSAGE)
       if (turn.cancelRequested && !this.dead) {
         turn.complete({ stopReason: "cancelled" })
         return
       }
-      if (error instanceof AgentTurnError && !this.dead && !turn.calls.length) {
+      if (error instanceof AgentTurnError && error.keepProcess && !this.dead && !turn.calls.length) {
         // agy kept the session; a retry of the same request continues in it.
         this.expectedMessages = turn.baseHistory
         turn.fail(error)
@@ -2149,6 +2161,7 @@ class Proc {
 
   async #agentError(turn) {
     const core = turn.agentErrorCore
+    if (isServiceSuspension(core) || isServiceSuspension(turn.attemptDetail)) return this.#formatAgentError(TOS_MESSAGE)
     // A failed connection is in the reply's last attempt line, not the log's
     // executor error (#1136).
     const detail = await lastAgentError(this.logPath, turn.logOffset) || turn.attemptDetail ||
@@ -2160,6 +2173,12 @@ class Proc {
   }
 
   #formatAgentError(detail) {
+    if (isServiceSuspension(detail)) {
+      serviceStatus.mark()
+      return Object.assign(new AgentTurnError(SUSPENSION_MESSAGE, "permission_error"), {
+        statusCode: 403, code: "TOS_VIOLATION", keepProcess: false,
+      })
+    }
     // The system prompt turned away, not a quota (cloak.mjs): a 400 the next
     // member of a group is asked after, and the client doesn't retry. It says
     // what Antigravity answered (a 429).
@@ -2607,12 +2626,15 @@ async function lastAgentError(file, offset) {
   for (const line of text.split("\n")) {
     const match = /\] (?:agent executor error|failed to construct executor|inference connection failed[^:]*): (.+)$/.exec(line) ||
       /\] (?:Run|CallWithRetry): attempt \d+ failed \((.+)\), retrying in /.exec(line)
-    if (match) found = match[1]
+    if (match) {
+      found = match[1]
+      if (isServiceSuspension(found)) return TOS_MESSAGE
+    }
   }
   if (!found) return ""
   const cut = found.lastIndexOf("generating and executing: ")
   if (cut >= 0) found = found.slice(cut + "generating and executing: ".length)
-  return found.trim().slice(0, 1000)
+  return isServiceSuspension(found) ? TOS_MESSAGE : found.trim().slice(0, 1000)
 }
 
 // Where the next retry banner of either kind starts, from `from` on.
@@ -2890,6 +2912,7 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
 
 // Caller holds the conversation lock; recovery must not acquire it recursively.
 async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew = false, lockedKeys = new Set([convKey])) {
+  if (serviceStatus.get()) throw new Error(SUSPENSION_MESSAGE)
   await evictIdle()
   let existing = pool.get(convKey)
   if (existing?.turn?.cancelRequested) {
@@ -5512,7 +5535,9 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             closeBlock()
             send("error", {
               type: "error",
-              error: { type: event.error?.kind || "api_error", message: String(event.error?.message ?? event.error) },
+              error: { type: event.error?.kind || "api_error", message: String(event.error?.message ?? event.error),
+                ...(event.error?.statusCode ? { status: event.error.statusCode } : {}),
+                ...(event.error?.code ? { code: event.error.code } : {}) },
             })
             if (!event.error?.keepProcess) {
               dropFromPool(proc)
@@ -5679,10 +5704,10 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
   if (buffer.trim()) processBlock(buffer)
 
   if (streamError) {
-    const status = streamError.type === "rate_limit_error" ? 429 : 502
+    const status = streamError.code === "TOS_VIOLATION" ? 403 : streamError.type === "rate_limit_error" ? 429 : 502
     return new Response(JSON.stringify({ type: "error", error: streamError }), {
       status,
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...(status === 403 ? { "X-Magpie-Sign-In": "expired" } : {}) },
     })
   }
   return new Response(JSON.stringify(message), {
@@ -5759,6 +5784,7 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, a
 
 const createPlugin = async () => {
   const readUsage = createUsageReader(findAgy, {
+    serviceStatus,
     // Read this account's current/saved catalog without starting extra CLI
     // queries inside Magpie's bounded usage call. Include raw effort IDs and
     // the aliases exposed by provider.models, so either request form is scoped.
@@ -5848,6 +5874,7 @@ const createPlugin = async () => {
             }
 
             const agy = findAgy()
+            if (serviceStatus.get()) return jsonError(403, SUSPENSION_MESSAGE, "TOS_VIOLATION", { headers: { "X-Magpie-Sign-In": "expired" } })
             if (!agy) return jsonError(503, "agy CLI not found on this machine")
             // nothing stored to sign agy in with: agy would only start its
             // own Google sign-in, so the account is told to sign in again
@@ -6038,6 +6065,10 @@ const createPlugin = async () => {
               const turn = await begin(proc, history)
               return streamResponse(proc, turn, body, init.signal)
             } catch (error) {
+              if (isServiceSuspension(error.acpError) || isServiceSuspension(error.message)) {
+                serviceStatus.mark()
+                return jsonError(403, SUSPENSION_MESSAGE, "TOS_VIOLATION", { headers: { "X-Magpie-Sign-In": "expired" } })
+              }
               return jsonError(error.statusCode ?? 502, error.message, error.code, { noRetry: error.noRetry })
             }
           },
@@ -6086,7 +6117,7 @@ function jsonError(status, message, code, { extra, headers, noRetry = false } = 
   return new Response(
     JSON.stringify({
       type: "error",
-      error: { type: status === 400 ? "invalid_request_error" : "api_error",
+      error: { type: status === 403 ? "permission_error" : status === 400 ? "invalid_request_error" : "api_error",
         ...(code ? { code } : {}), message: String(message || "unknown error"), ...(extra ?? {}) },
     }),
     { status, headers: { "Content-Type": "application/json",

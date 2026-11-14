@@ -5,6 +5,7 @@ import path from "node:path"
 import { agySpawnSpec, childEnv as agyChildEnv } from "./platform.mjs"
 import { cannotSignIn, isDead, noteDead, storedSignIn } from "./signin.mjs"
 import { fetchAccountPlan } from "./plan.mjs"
+import { isServiceSuspension, SUSPENSION_MESSAGE } from "./service-status.mjs"
 
 const DEFAULT_TIMEOUT_MS = 15_000
 const MAX_TIMEOUT_MS = 18_000 // Magpie bounds an auth.usage call to 20 seconds.
@@ -75,6 +76,7 @@ const text = value => typeof value === "string" ? value.trim() : ""
 const field = (value, camel, snake) => value?.[camel] ?? value?.[snake]
 
 function commandFailure(output) {
+  if (isServiceSuspension(output)) return new UsageError(SUSPENSION_MESSAGE, { kind: "suspended" })
   if (/not (?:logged|signed) in|unauthenticated|authentication required|login required|please (?:log|sign) in|sign in again/i.test(output)) {
     return new UsageError("agy usage needs authentication. Run `agy` in a terminal to sign in again.", { kind: "auth" })
   }
@@ -140,6 +142,7 @@ function modelsByGroup(groups, models) {
 // agy's command report is not its token-usage object or a model-availability list.
 // Unknown quota is not evidence of exhaustion or a full allowance.
 export function parseUsageReport(value, { models = [] } = {}) {
+  if (isServiceSuspension(value)) throw new UsageError(SUSPENSION_MESSAGE, { kind: "suspended" })
   let report
   try { report = typeof value === "string" ? JSON.parse(value) : value } catch {
     throw new UsageError("agy returned an invalid usage report.")
@@ -433,7 +436,7 @@ const NEEDS_SIGN_IN = "Sign in again from this account's Sign in in magpie, or r
 //   that stored sign-in dead: agy isn't run again until another is stored.
 // - any other failure isn't run again for backoff(n).
 export function createUsageReader(resolveAgy, options = {}) {
-  const { signIn = () => storedSignIn({ fresh: true }), now = () => Date.now(), queryUsage = fetchUsage, ...fetchOptions } = options
+  const { signIn = () => storedSignIn({ fresh: true }), now = () => Date.now(), queryUsage = fetchUsage, serviceStatus, ...fetchOptions } = options
   const pending = new Map()
   let held = null
   let failedAuth = null
@@ -444,6 +447,7 @@ export function createUsageReader(resolveAgy, options = {}) {
     return { windows: [], error: withDetail(`${why}. ${NEEDS_SIGN_IN}`, detail, source), signIn: "expired" }
   }
   return async () => {
+    if (serviceStatus?.get()) return serviceStatus.usage()
     let stored
     try { stored = await signIn() } catch { stored = { state: "unknown" } }
     const why = cannotSignIn(stored)
@@ -463,11 +467,14 @@ export function createUsageReader(resolveAgy, options = {}) {
         pending.set(pendingKey, query)
       }
       const result = { ...structuredClone(await pending.get(pendingKey)), signIn: saidExpired ? "renewed" : "kept" }
+      if (serviceStatus?.get()) return serviceStatus.usage()
       held = null
       failedAuth = null
       saidExpired = false
       return result
     } catch (error) {
+      if (error?.kind === "suspended") serviceStatus?.mark()
+      if (serviceStatus?.get()) return serviceStatus.usage()
       const message = error instanceof UsageError ? withDetail(error.message, error.detail, error.source) : "agy usage query failed. Check network and credential permissions."
       if (error?.kind === "cancel") return { windows: [], error: message, signIn: "kept" }
       const auth = error?.kind === "auth" || error?.kind === "timeout" && stored?.state === "present" && stored.expired &&

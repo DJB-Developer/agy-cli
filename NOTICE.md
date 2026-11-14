@@ -121,3 +121,10 @@ A1–A16、U1–U6 逐项并入。两边都有、且 `acb8d84` 写法更新的�
 本仓独立实现 HTTP 查询、超时和错误脱敏，继续复用自身模型组路由；未引入其聊天执行器或 OAuth 续期实现。
 0.2.8 中 CLI `/usage` 仅用于需要新 access token 时的续期；0.2.9 恢复每次额度刷新均通过 CLI。
 0.2.9 移除 HTTP 配额模块及固定 Hub User-Agent，保留 HTTP 套餐查询与套餐 ID 映射；原 U1–U6 的跨平台进程处理继续用于 CLI 额度查询。
+
+
+## 10. 服务停用识别（0.2.10）
+
+错误信号参考 [CLIProxyAPI 的 TOS 检测](https://github.com/router-for-me/CLIProxyAPI/blob/e96d4c4818851cf0e96d27b2bc8b67379e449d9e/internal/runtime/executor/antigravity_executor_credits.go)：
+只将明确的账号服务停用信号作为持久状态，不把普通 403 等同封禁。本仓独立实现 CLI 错误解析、
+按账号持久化和 Magpie 错误上报；未引入 HTTP 聊天执行器、OAuth 续期或跨账号重试循环。

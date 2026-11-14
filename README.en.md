@@ -150,7 +150,7 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.9 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to 0.2.10 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
 
 0.2.9 restores CLI `/usage` quotas with optional HTTP plan lookup, retaining
 model-group routing and plan ID recognition. Plan failures do not affect quota,
@@ -447,3 +447,34 @@ under `test/`), so they never start the real agy and use no quota.
 
 MIT. Copyright notices live in [LICENSE](LICENSE); upstream provenance and the
 list of changes are in [NOTICE.md](NOTICE.md).
+
+
+## Service suspension and failover (0.2.10)
+
+Explicit CLI service-disabled/TOS wording or structured 403 PERMISSION_DENIED with
+TOS_VIOLATION marks only that profile suspended. Detection covers terminal warning
+chunks, retry lines, ACP errors, current-turn logs and CLI quota failures. Generic
+403s, region restrictions, expired credentials, quota limits and optional HTTP plan
+failures do not mark a suspension. Chat remains on `agy acp`.
+
+Whole responses return HTTP 403. Streams emit `permission_error` with numeric
+`status: 403`, `code: TOS_VIOLATION` and the suspension reason, rather than successful
+assistant text. Current Magpie can fail over to another available account before
+answer content is sent. For another provider after all accounts fail, configure a
+fallback model in a Magpie routing group and request that group. Seamless switching
+after partial output is not guaranteed. Keep Magpie updated for its agy-cli
+suspension recognition and stream-status handling.
+
+The mark persists in `<profile>/bridge-state/service-status.json`, or beside the
+legacy default profile's `sessions.json`. It stores only a reason code and detection
+time. Subsequent chat requests fail locally without launching CLI. Usage shows the
+reason and reports `signIn: expired` through Magpie's available account-state API;
+the host may label this as an expired sign-in, while the reason identifies suspension.
+Token refresh, quota refresh and restart do not clear the mark. Persistence failure
+is logged and the current runtime stays blocked.
+
+Quota and plan success cannot prove inference eligibility. Detection requires an
+actual CLI error; no extra inference probes are sent. Manually turn off any account
+already known to be suspended until a signal has been observed. After a successful
+appeal, stop Magpie/the plugin, remove only that profile's `service-status.json`,
+restart and refresh usage, then re-enable the account in Magpie if needed.

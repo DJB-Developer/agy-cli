@@ -571,6 +571,7 @@ export async function createBridgeKit(options = {}) {
     if (cache.has(key)) return cache.get(key)
     let module
     if (key === "./usage.mjs") module = sourceModule(USAGE_FILE, "", usageUrl)
+    else if (key === "./service-status.mjs") module = sourceModule(path.join(REPO_DIR, "service-status.mjs"), "", new URL("./service-status.mjs", indexUrl).href)
     else if (key === "./plan.mjs") module = sourceModule(path.join(REPO_DIR, "plan.mjs"), "", new URL("./plan.mjs", indexUrl).href)
     else if (key === "./platform.mjs") module = sourceModule(PLATFORM_FILE, "", platformUrl)
     else if (key === "./array-items.mjs") module = sourceModule(ARRAY_ITEMS_FILE, "", arrayItemsUrl)

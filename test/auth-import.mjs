@@ -487,3 +487,149 @@ test("Magpie's named-account quota hook exposes the original error with credenti
     assert.equal(kit.otherSpawns.length, count)
   })
 })
+
+const TOS_MESSAGE = "This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product."
+test("TOS warning becomes a permission error, persists per account, and never becomes a successful reply", async () => {
+  await withKit({}, async kit => {
+    const [a, b] = await Promise.all([add(kit, "suspended"), add(kit, "healthy")])
+    const requestA = await client(kit, authOf(a))
+    const requestB = await client(kit, authOf(b))
+    kit.defaultPrompt = async agent => {
+      const warning = "\n⚠ " + TOS_MESSAGE + "\n"
+      for (const char of warning) await agent.text(char)
+      return { stopReason: "end_turn" }
+    }
+    const response = await requestA(baseBody({ stream: false }))
+    assert.equal(response.status, 403, "CLI suspension must not be a successful assistant answer")
+    const error = (await response.json()).error
+    assert.equal(error.type, "permission_error")
+    assert.equal(error.code, "TOS_VIOLATION")
+    assert.match(error.message, /violation of Terms of Service/)
+    const usage = await kit.plugin.auth.usage(async () => authOf(a))
+    assert.match(usage.error, /violation of Terms of Service/)
+    assert.equal(usage.signIn, "expired", "host must remove suspended credentials from rotation")
+    const before = kit.acpSpawns.length
+    assert.equal((await requestA(baseBody())).status, 403)
+    assert.equal(kit.acpSpawns.length, before, "do not start another CLI for suspended account")
+    kit.defaultPrompt = async agent => { await agent.text("healthy reply"); return { stopReason: "end_turn" } }
+    const reply = await readSse(await requestB(baseBody()))
+    assert.equal(reply.content[0].text, "healthy reply")
+  })
+})
+
+test("a suspension warning split at every character without a leading newline is still an error", async () => {
+  await withKit({}, async kit => {
+    kit.defaultPrompt = async agent => {
+      for (const char of "⚠ " + TOS_MESSAGE) await agent.text(char)
+      return { stopReason: "end_turn" }
+    }
+    const reply = await readSse(await kit.request(baseBody()))
+    assert.equal(reply.error?.status, 403)
+    assert.equal(reply.error?.code, "TOS_VIOLATION")
+    assert.equal(reply.content.length, 0)
+  })
+})
+
+for (const mode of ["attempt", "rpc", "log"]) {
+  test(`TOS ${mode} fails as 403, blocks after restart and token refresh, and has explicit recovery`, { timeout: 5000 }, async () => {
+    await withKit({}, async kit => {
+      const a = await add(kit, "suspended")
+      const request = await client(kit, authOf(a))
+      kit.defaultPrompt = async agent => {
+        if (mode === "rpc") throw new Error(TOS_MESSAGE)
+        if (mode === "log") {
+          const logfile = agent.args[agent.args.indexOf("--log-file") + 1]
+          const error = { code: 403, status: "PERMISSION_DENIED", message: "Service disabled",
+            padding: "x".repeat(1100), details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "TOS_VIOLATION" }] }
+          fs.appendFileSync(logfile, `E123] agent executor error: ${JSON.stringify({ error })}\nE123] agent executor error: retry failed\n`)
+          await agent.text("\n⚠ Agent execution terminated due to error.\n")
+          return { stopReason: "end_turn" }
+        }
+        await agent.text("\n⚠ API error (attempt 1): " + TOS_MESSAGE)
+        await new Promise(() => {})
+      }
+      const reply = await readSse(await request(baseBody()))
+      assert.equal(reply.error?.status, 403)
+      assert.equal(reply.error?.code, "TOS_VIOLATION")
+      assert.equal(reply.content.length, 0)
+      const statusFile = path.join(rootOf(kit), "suspended", "bridge-state", "service-status.json")
+      const saved = fs.readFileSync(statusFile, "utf8")
+      assert.equal(JSON.parse(saved).reason, "TOS_VIOLATION")
+      assert.doesNotMatch(saved, /token|@gmail|access-/)
+      const tokenFile = fileOf(kit, "suspended")
+      const token = JSON.parse(fs.readFileSync(tokenFile, "utf8"))
+      token.token.access_token = "new-access-token"
+      token.token.expiry = "2099-01-01T00:00:00Z"
+      fs.writeFileSync(tokenFile, JSON.stringify(token))
+      assert.equal((await request(baseBody())).status, 403)
+      await kit.finishChildren()
+      const opts = { env: { AGY_BRIDGE_ACCOUNTS_DIR: rootOf(kit), AGY_PATH: kit.agyPath } }
+      await withKit(opts, async restarted => {
+        const ask = await client(restarted, authOf(a))
+        const result = await ask(baseBody())
+        assert.equal(result.status, 403)
+        assert.equal(result.headers.get("X-Magpie-Sign-In"), "expired")
+        assert.equal(restarted.acpSpawns.length, 0)
+        assert.equal((await restarted.plugin.auth.usage(async () => authOf(a))).signIn, "expired")
+      })
+      // Operator recovery after appeal, with the old hosts stopped.
+      fs.rmSync(statusFile)
+      await withKit(opts, async recovered => {
+        recovered.defaultPrompt = async agent => { await agent.text("restored"); return { stopReason: "end_turn" } }
+        const ask = await client(recovered, authOf(a))
+        assert.equal((await readSse(await ask(baseBody()))).content[0].text, "restored")
+      })
+    })
+  })
+}
+
+for (const detail of ["PERMISSION_DENIED (code 403): access denied", "Eligibility check failed: not currently available in your location.", "RESOURCE_EXHAUSTED (code 429): quota exhausted"]) {
+  test(`non-suspension CLI error does not persist a ban: ${detail}`, async () => {
+    await withKit({}, async kit => {
+      kit.defaultPrompt = async () => { throw new Error(detail) }
+      const failed = await readSse(await kit.request(baseBody()))
+      assert.ok(failed.error)
+      assert.notEqual(failed.error.code, "TOS_VIOLATION")
+      kit.defaultPrompt = async agent => { await agent.text("still usable"); return { stopReason: "end_turn" } }
+      assert.equal((await readSse(await kit.request(baseBody()))).content[0].text, "still usable")
+    })
+  })
+}
+
+test("quoting the TOS warning within an explanation is ordinary answer text", async () => {
+  for (const text of [`agy says: ⚠ ${TOS_MESSAGE}`, `⚠ ${TOS_MESSAGE}\nThis is an example, not your account status.`]) {
+    await withKit({}, async kit => {
+      kit.defaultPrompt = async agent => { for (const c of text) await agent.text(c); return { stopReason: "end_turn" } }
+      const reply = await readSse(await kit.request(baseBody()))
+      assert.equal(reply.error, null)
+      assert.equal(reply.content.map(b => b.text || "").join(""), text)
+    })
+  }
+})
+
+test("CLI quota suspension blocks chat; HTTP plan is never used to decide a ban", async () => {
+  await withKit({
+    onSpawn: (_file, args) => args.includes("--version") ? { stdout: "1.5.9\n" }
+      : args.includes("/usage") ? { stdout: JSON.stringify({ status: "FAILED", error: TOS_MESSAGE }) } : 0,
+    fetch: () => assert.fail("a failed CLI quota must not query HTTP plan"),
+  }, async kit => {
+    const a = await add(kit, "a")
+    const usage = await kit.plugin.auth.usage(async () => authOf(a))
+    assert.equal(usage.signIn, "expired")
+    assert.match(usage.error, /TOS_VIOLATION/)
+    const request = await client(kit, authOf(a))
+    assert.equal((await request(baseBody())).status, 403)
+    assert.equal(kit.acpSpawns.length, 0)
+  })
+})
+
+test("structured suspension in ACP error data blocks the account during session setup", async () => {
+  await withKit({ sessionNewError: { code: -32603, message: "Upstream error", data: { error: {
+    code: 403, status: "PERMISSION_DENIED", details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "TOS_VIOLATION" }],
+  } } } }, async kit => {
+    const result = await kit.request(baseBody())
+    assert.equal(result.status, 403)
+    assert.equal((await result.json()).error.code, "TOS_VIOLATION")
+    assert.equal((await kit.plugin.auth.usage()).signIn, "expired")
+  })
+})
