@@ -11,7 +11,7 @@ const MAX_OUTPUT_BYTES = 1024 * 1024
 const DIAGNOSTIC_LIMIT = 4096
 
 // CLI output may include OAuth URLs, credentials or an account email. Keep
-// diagnostic wording, but never intentionally copy those values into logs.
+// diagnostic wording, but never intentionally copy those values into logs or UI.
 const SECRET_FIELD = /^(?:authorization|proxy[-_]?authorization|cookie|set[-_]?cookie|(?:access|refresh|id|session)[-_]?token|token|(?:api[-_]?)?key|client[-_]?secret|secret|password|credential|code|code[-_]?verifier|state)$/i
 const diagnosticCode = value => /^(?:[1-5]\d{2}|OK|Cancelled|Unknown|InvalidArgument|DeadlineExceeded|NotFound|AlreadyExists|PermissionDenied|ResourceExhausted|FailedPrecondition|Aborted|OutOfRange|Unimplemented|Internal|Unavailable|DataLoss|Unauthenticated)$/i.test(String(value))
 
@@ -58,7 +58,7 @@ export function sanitizeUsageDiagnostic(value) {
 }
 
 // kind: "auth" (agy says it needs a sign-in), "timeout" (output: what agy
-// had printed by then, logged only after redaction), "cancel", or none.
+// had printed by then, exposed only after redaction), "cancel", or none.
 class UsageError extends Error {
   constructor(message, { kind = "", output = "" } = {}) {
     super(message)
@@ -81,7 +81,7 @@ function commandFailure(output) {
   const network = /\b(?:eof|timeout|timed out|deadline exceeded|no such host|connection (?:refused|reset)|network|proxy|tls|ssl|certificate)\b/i.test(output)
   if (network) return new UsageError(`agy usage ${eligibility ? "eligibility check " : ""}failed on a network request. Check network or proxy settings.`)
   if (/not eligible|unsupported (?:country|region)|does not support google tos/i.test(output)) return new UsageError("agy reports that this account is not eligible for Antigravity.")
-  if (eligibility) return new UsageError("agy's account eligibility check failed. See the agy-usage log for details.")
+  if (eligibility) return new UsageError("agy's account eligibility check failed.")
   return new UsageError("agy could not read usage. Run `agy` in a terminal to check its status.")
 }
 
@@ -335,6 +335,11 @@ export async function fetchUsage(agy, {
     return parseUsageReport(result.stdout)
   } catch (error) {
     if (error?.kind !== "cancel") {
+      let detail = ""
+      try { detail = sanitizeUsageDiagnostic(error?.output || (result ? `${result.stderr}\n${result.stdout}` : "")) } catch {}
+      // Magpie renders auth.usage().error. Carry only the bounded, redacted
+      // detail to that boundary; never concatenate raw subprocess output there.
+      if (error instanceof UsageError) error.detail = detail
       // This boundary runs once per actual CLI query, including a shared
       // query's failure. Cached backoff responses never repeat the log.
       try {
@@ -342,7 +347,7 @@ export async function fetchUsage(agy, {
           event: "usage_failed", account: sanitizeUsageDiagnostic(accountName), stage,
           cliVersion, exitCode: result?.code ?? null,
           error: error instanceof UsageError ? error.message : "Could not query agy usage.",
-          detail: sanitizeUsageDiagnostic(error?.output || (result ? `${result.stderr}\n${result.stdout}` : "")),
+          detail,
         }))
       } catch {} // Diagnostic failures must not change auth or query behavior.
     }
@@ -391,17 +396,19 @@ export function createUsageReader(resolveAgy, options = {}) {
   const { signIn = () => storedSignIn(), now = () => Date.now(), ...fetchOptions } = options
   const pending = new Map()
   let held = null
+  let failedAuth = null
   let saidExpired = false
-  const expired = (why) => {
+  const withDetail = (message, detail) => detail ? `${message}\nCLI error (redacted):\n${detail}` : message
+  const expired = (why, detail) => {
     saidExpired = true
-    return { windows: [], error: `${why}. ${NEEDS_SIGN_IN}`, signIn: "expired" }
+    return { windows: [], error: withDetail(`${why}. ${NEEDS_SIGN_IN}`, detail), signIn: "expired" }
   }
   return async () => {
     let stored
     try { stored = await signIn() } catch { stored = { state: "unknown" } }
     const why = cannotSignIn(stored)
     if (why) return expired(why)
-    if (isDead(stored)) return expired("agy's sign-in no longer works")
+    if (isDead(stored)) return expired("agy's sign-in no longer works", failedAuth?.fp === stored.fp ? failedAuth.detail : "")
     const key = stored?.state === "present" ? stored.fp : "unknown"
     if (held && held.key === key && now() < held.until) {
       return { windows: [], error: held.error, signIn: held.auth ? "expired" : "kept" }
@@ -416,16 +423,18 @@ export function createUsageReader(resolveAgy, options = {}) {
       }
       const result = { ...structuredClone(await pending.get(agy)), signIn: saidExpired ? "renewed" : "kept" }
       held = null
+      failedAuth = null
       saidExpired = false
       return result
     } catch (error) {
-      const message = error instanceof UsageError ? error.message : "agy usage query failed. Check the CLI and temporary-directory permissions."
+      const message = error instanceof UsageError ? withDetail(error.message, error.detail) : "agy usage query failed. Check the CLI and temporary-directory permissions."
       if (error?.kind === "cancel") return { windows: [], error: message, signIn: "kept" }
       const auth = error?.kind === "auth" || error?.kind === "timeout" && stored?.state === "present" && stored.expired &&
         (!String(error.output ?? "").trim() || SIGN_IN_TALK.test(error.output))
       if (auth && stored?.state === "present") {
         noteDead(stored)
-        return expired("agy's sign-in no longer works")
+        failedAuth = { fp: stored.fp, detail: error.detail }
+        return expired("agy's sign-in no longer works", error.detail)
       }
       const n = held?.key === key ? held.n + 1 : 1
       held = { key, n, until: now() + backoff(n), error: message, auth }

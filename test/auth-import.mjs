@@ -277,3 +277,21 @@ test("a late browser close cannot delete a new import after its error cleanup", 
     assert.equal(fs.existsSync(fileOf(kit, "retry")), true)
   })
 })
+
+test("Magpie's named-account quota hook exposes the original error with credentials removed", async () => {
+  await withKit({ onSpawn: (_file, args) => {
+    if (args.includes("--version")) return { stdout: "1.5.9\n" }
+    if (args.includes("/usage")) return { stdout: JSON.stringify({ status: "FAILED", error: "Your current account is not eligible: country association unavailable", refresh_token: "private-account-token" }) }
+    return 0
+  } }, async kit => {
+    const saved = await add(kit, "quota-ui")
+    const result = await kit.plugin.auth.usage(async () => authOf(saved))
+    assert.equal(result.signIn, "kept")
+    assert.match(result.error, /CLI error \(redacted\):/)
+    assert.match(result.error, /country association unavailable/)
+    assert.doesNotMatch(result.error, /private-account-token/)
+    const count = kit.otherSpawns.length
+    assert.deepEqual(await kit.plugin.auth.usage(async () => authOf(saved)), result)
+    assert.equal(kit.otherSpawns.length, count)
+  })
+})

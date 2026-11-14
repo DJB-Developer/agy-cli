@@ -149,7 +149,7 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.1 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to 0.2.2 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
 The marketplace and npm commands below install the upstream community version, without this repository's changes.
 
 From the Magpie community plugins: find "Antigravity (local agy CLI)" on
@@ -267,9 +267,13 @@ Check the `magpie` container logs in 1Panel, or run on the server:
 docker logs --since 10m magpie 2>&1 | grep -F '[agy-usage]'
 ```
 
-After updating, refresh the affected account's quota and inspect its `account`
-and `detail` fields. A generic eligibility-check failure now asks you to check
-the log instead of asserting that the account is ineligible.
+Since 0.2.2, Magpie's quota error also includes redacted original CLI output after
+`CLI error (redacted):`, limited to 4096 characters with a truncation marker when
+needed. Update and reload the plugin, then refresh the affected account's quota
+to read the details directly in Magpie. Details remain available during failure
+backoff; changed credentials or a successful query clear the old details.
+Only explicit ineligibility or unsupported-region errors produce an account
+eligibility conclusion.
 
 
 ## Environment variables

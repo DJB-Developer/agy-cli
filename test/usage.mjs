@@ -496,7 +496,7 @@ test("reports sanitized failures and preserves the bridge sign-in; failures back
     assert.deepEqual(result.windows, [])
     assert.equal(result.signIn, signIn)
     assert.match(result.error, expected)
-    assert.doesNotMatch(result.error, /secret|https:/)
+    assert.doesNotMatch(result.error, /secret@example\.com|https:/)
     const runs = (await f.logs()).length
     f.env.TEST_MODE = ""
     // held: agy isn't run again until the backoff ends
@@ -710,7 +710,8 @@ test("diagnostics log one redacted failure per shared CLI query, not per waiter 
   assert.equal(entry.exitCode, 1)
   assert.match(entry.detail, /unsupported country CN/)
   assert.doesNotMatch(lines[0], /private-refresh-value/)
-  assert.ok(results.every(result => result.signIn === "kept" && !result.error.includes("CN")))
+  assert.ok(results.every(result => result.signIn === "kept" && result.error.includes("unsupported country CN")))
+  assert.ok(results.every(result => result.error.includes("CLI error (redacted):") && !result.error.includes("private-refresh-value")))
   await read()
   assert.equal(lines.length, 1)
   clock += 6 * 60 * 60 * 1000
@@ -730,6 +731,8 @@ test("diagnostics retain errors inside a JSON stdout report even with exit code 
   assert.equal(entry.exitCode, 0)
   assert.match(entry.detail, /additional verification required/)
   assert.doesNotMatch(entry.detail, /private-json-value/)
+  assert.match(result.error, /additional verification required/)
+  assert.doesNotMatch(result.error, /private-json-value/)
 })
 
 test("diagnostics include output captured before timeout and do not change query errors", { timeout: 10000 }, async t => {
@@ -769,4 +772,25 @@ test("diagnostics bound large unbroken CLI output without expensive email matchi
     const safe = sanitizeUsageDiagnostic(input)
     assert.ok(safe.length < 4150)
   }
+})
+
+test("quota UI retains redacted auth details until the credential changes", async t => {
+  forgetStoredSignIn({ dead: true })
+  const f = await fixture(t, { TEST_MODE: "fail", TEST_ERROR: 'Authentication required: refresh was revoked\nrefresh_token="private-ui-token"' })
+  let stored = { state: "present", fp: "ui-auth-diagnostic", canRenew: true, expired: false }
+  const read = createUsageReader(() => f.executable, { ...f.options, signIn: async () => stored, diagnostic: () => {} })
+  const first = await read()
+  assert.equal(first.signIn, "expired")
+  assert.match(first.error, /refresh was revoked/)
+  assert.doesNotMatch(first.error, /private-ui-token/)
+  assert.deepEqual(await read(), first)
+  const runs = (await f.logs()).length
+  assert.equal(runs, 2)
+  stored = { ...stored, fp: "ui-auth-renewed" }
+  f.env.TEST_MODE = ""
+  const renewed = await read()
+  assert.equal(renewed.signIn, "renewed")
+  assert.equal(renewed.error, undefined)
+  assert.equal((await f.logs()).length, runs + 2)
+  forgetStoredSignIn({ dead: true })
 })

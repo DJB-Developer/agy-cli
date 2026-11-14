@@ -109,7 +109,7 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.1。现有账号保留，可继续添加其他账号。
+已安装时，在 Magpie 插件页将这个 GitHub 插件更新到 0.2.2。现有账号保留，可继续添加其他账号。
 以下市场和 npm 命令安装的是上游社区版本，不包含本仓库的改动。
 
 从 Magpie 社区插件市场安装（推荐）：在 Magpie 的 Plugins 页找到「Antigravity (local agy CLI)」点安装，或在终端运行：
@@ -206,9 +206,10 @@ magpie quota refresh agy-cli --json
 docker logs --since 10m magpie 2>&1 | grep -F '[agy-usage]'
 ```
 
-更新插件后刷新报错账号的额度，再查看对应 `account` 的 `detail`。
-仅“资格检查失败”的错误会提示查看日志；只有 CLI 明确报告账号不符合条件或地区不支持时，
-才显示账号资格相关的结论。
+从 0.2.2 起，Magpie 界面的额度错误提示也会在 `CLI error (redacted):` 后显示脱敏后的 CLI 原始输出，
+最多保留 4096 个字符，超长内容标记为截断。更新并重新加载插件后，刷新报错账号的额度即可查看，
+无需进入容器日志。失败退避期间仍保留错误详情；更换凭据或成功查询后不再显示旧详情。
+只有 CLI 明确报告账号不符合条件或地区不支持时，才显示账号资格相关的结论。
 
 
 ## 环境变量
