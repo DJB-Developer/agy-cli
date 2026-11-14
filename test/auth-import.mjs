@@ -44,7 +44,7 @@ for (const platform of ["linux", "darwin", "win32"]) {
   })
 }
 
-test("Magpie uses CLI quota and optional HTTP plans; plan failures never block routing or ACP chat", async () => {
+test("Magpie uses CLI quota and optional HTTP plans; ordinary plan failures never block routing or ACP chat", async () => {
   const calls = []
   let mode = "ok", planSignal
   await withKit({
@@ -607,7 +607,7 @@ test("quoting the TOS warning within an explanation is ordinary answer text", as
   }
 })
 
-test("CLI quota suspension blocks chat; HTTP plan is never used to decide a ban", async () => {
+test("CLI quota suspension blocks chat before optional HTTP plan lookup", async () => {
   await withKit({
     onSpawn: (_file, args) => args.includes("--version") ? { stdout: "1.5.9\n" }
       : args.includes("/usage") ? { stdout: JSON.stringify({ status: "FAILED", error: TOS_MESSAGE }) } : 0,
@@ -671,5 +671,64 @@ test("concurrent model openings keep each profile's CLI and tool results separat
       for (let j = 0; j < done.length; j++) if (j !== i) assert.ok(!text.includes(`private-result-${j}`), text)
     }
     assert.equal(entered, 4, "tool continuation must reuse its original CLI turn")
+  })
+})
+
+test("quota refresh observes explicit HTTP TOS suspension even when CLI quota succeeds", async () => {
+  const httpCalls = []
+  let cliReads = 0
+  await withKit({
+    env: { AGY_BRIDGE_STORED_SIGNIN: "" },
+    fetch: async (url, init) => {
+      assert.equal(url, "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
+      httpCalls.push(init.headers.Authorization)
+      if (init.headers.Authorization === "Bearer access-a") return Response.json({ error: {
+        code: 403, status: "PERMISSION_DENIED", message: "Service disabled",
+        details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "TOS_VIOLATION" }],
+        refresh_token: "must-not-reach-status-or-ui",
+      } }, { status: 403 })
+      return Response.json({ paidTier: { id: "g1-pro-tier" } })
+    },
+    onSpawn: (_file, args) => {
+      if (args.includes("--version")) return { stdout: "1.5.9\n" }
+      if (!args.includes("/usage")) return 0
+      cliReads++
+      const file = path.join(profileOf(args), "antigravity-cli", "antigravity-oauth-token")
+      const saved = JSON.parse(fs.readFileSync(file, "utf8"))
+      saved.token.access_token = `access-${nameOf(args)}`
+      saved.token.expiry = "2099-01-01T00:00:00Z"
+      fs.writeFileSync(file, JSON.stringify(saved))
+      return { stdout: JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups: [
+        { name: "Gemini Models", buckets: [{ id: "gemini-weekly", window: "weekly", remainingFraction: 0.8 }] },
+      ] } } }) }
+    },
+  }, async kit => {
+    const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
+    const readA = () => kit.plugin.auth.usage(async () => authOf(a))
+    const [suspended, healthy, duplicate] = await Promise.all([readA(), kit.plugin.auth.usage(async () => authOf(b)), readA()])
+    assert.equal(httpCalls.length, 2, "both accounts must actually reach the metadata endpoint")
+    assert.equal(suspended.signIn, "expired", "CLI quota success must not hide an explicit metadata suspension")
+    assert.match(suspended.error, /403.*TOS_VIOLATION/)
+    assert.doesNotMatch(suspended.error, /must-not-reach/)
+    assert.equal(duplicate.error, suspended.error)
+    assert.equal(suspended.plan, undefined)
+    assert.equal(healthy.signIn, "kept")
+    assert.equal(healthy.plan, "Google AI Pro")
+    assert.equal(healthy.windows[0].used, 20)
+    assert.equal(cliReads, 2)
+    assert.equal(httpCalls.length, 2, "reuse the existing plan request; coalesce concurrent refreshes")
+    assert.equal(kit.acpSpawns.length, 0, "status refresh must not send an inference probe")
+    const persisted = fs.readFileSync(path.join(rootOf(kit), "a", "bridge-state", "service-status.json"), "utf8")
+    assert.equal(JSON.parse(persisted).reason, "TOS_VIOLATION")
+    assert.doesNotMatch(persisted, /access-a|refresh_token|must-not-reach/)
+    assert.equal((await readA()).signIn, "expired")
+    const requestA = await client(kit, authOf(a))
+    assert.equal((await requestA(baseBody())).status, 403)
+    assert.equal(httpCalls.length, 2)
+    assert.equal(cliReads, 2)
+    kit.defaultPrompt = async agent => { await agent.text("healthy CLI reply"); return { stopReason: "end_turn" } }
+    const requestB = await client(kit, authOf(b))
+    assert.equal((await readSse(await requestB(baseBody()))).content[0].text, "healthy CLI reply")
+    assert.equal(httpCalls.length, 2, "chat remains CLI-only")
   })
 })

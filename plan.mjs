@@ -1,4 +1,5 @@
 import { readAccessToken } from "./signin.mjs"
+import { isServiceSuspension } from "./service-status.mjs"
 
 const PLAN_URL = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 
@@ -19,6 +20,7 @@ export function planOf(load) {
 // No completed-result cache: a quota refresh also refreshes the account's plan.
 export async function fetchAccountPlan({
   signal, timeoutMs = 1500, readToken = readAccessToken, fetch: request = fetch,
+  onServiceSuspended,
   ...credentials
 } = {}) {
   if (signal?.aborted) return ""
@@ -38,8 +40,11 @@ export async function fetchAccountPlan({
       redirect: "error",
       signal: controller.signal,
     })
-    if (!response.ok) { await response.body?.cancel(); return "" }
-    // Bound metadata size; error bodies and credentials never reach logs/UI.
+    if (controller.signal.aborted || (!response.ok && response.status !== 403)) {
+      await response.body?.cancel(); return ""
+    }
+    // Inspect a bounded 403 body for an explicit service suspension. Ordinary
+    // HTTP failures still only omit the plan; raw error bodies never escape.
     const reader = response.body?.getReader()
     if (!reader) return ""
     const chunks = []
@@ -53,7 +58,13 @@ export async function fetchAccountPlan({
         chunks.push(value)
       }
     } finally { reader.releaseLock() }
-    return planOf(JSON.parse(Buffer.concat(chunks).toString("utf8")))
+    if (controller.signal.aborted) return ""
+    const body = Buffer.concat(chunks).toString("utf8")
+    if (response.status === 403) {
+      if (isServiceSuspension(body)) onServiceSuspended?.()
+      return ""
+    }
+    return planOf(JSON.parse(body))
   }
   try { return await Promise.race([query().catch(() => ""), stopped]) }
   finally { clearTimeout(timer); signal?.removeEventListener("abort", stop); controller.abort() }

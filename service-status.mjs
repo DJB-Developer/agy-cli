@@ -4,8 +4,9 @@ import path from "node:path"
 export const TOS_MESSAGE = "This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product."
 export const SUSPENSION_MESSAGE = `Antigravity service suspended (403 / TOS_VIOLATION): ${TOS_MESSAGE}`
 
-// Only inspect CLI errors, never prompts or ordinary answer text. A generic
-// 403, region restriction, expired token or exhausted quota is not a ban.
+// Only inspect CLI errors or metadata HTTP 403s, never prompts or ordinary
+// answer text. A generic 403, region restriction, expired token or exhausted
+// quota is not a ban.
 export function isServiceSuspension(value, depth = 0) {
   if (depth > 4) return false
   if (typeof value === "string") {

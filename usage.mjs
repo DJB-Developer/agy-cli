@@ -369,12 +369,19 @@ export async function fetchUsage(agy, {
     result = await run(agy, [...(geminiDir ? [`--gemini_dir=${geminiDir}`] : []), "-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`], options)
     if (result.code !== 0) throw commandFailure(result.stderr + "\n" + result.stdout)
     const usage = parseUsageReport(result.stdout, { models: getModels(agy) })
-    // Plan lookup is optional and must never invalidate working CLI quotas or
-    // sign-in. It uses this profile's freshly stored token, not another login.
+    // Ordinary plan failures remain optional. An explicit TOS suspension is
+    // a separate account signal, even if the CLI still reports quota.
+    stage = "account-metadata"
+    let suspended = false
     try {
-      const plan = await readPlan({ env, geminiDir, signal })
+      const plan = await readPlan({ env, geminiDir, signal, onServiceSuspended: () => { suspended = true } })
       if (plan) usage.plan = plan
     } catch {}
+    if (suspended) {
+      const error = new UsageError(SUSPENSION_MESSAGE, { kind: "suspended", output: SUSPENSION_MESSAGE })
+      error.source = "HTTP"
+      throw error
+    }
     return usage
   } catch (error) {
     if (error?.kind !== "cancel") {

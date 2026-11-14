@@ -133,3 +133,90 @@ test("default credentials support headless Linux and native keyrings without wri
     exec: async () => ({ code: 1, stdout: "", stderr: "locked" }),
   }), "")
 })
+
+const tosText = "This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product."
+const tosBody = { error: { code: 403, status: "PERMISSION_DENIED", message: "Service disabled", details: [
+  { "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "TOS_VIOLATION" },
+] } }
+
+test("only an explicit metadata 403 suspension reports account state, never arbitrary plan errors", async () => {
+  for (const [status, body, expected] of [
+    [403, JSON.stringify(tosBody), 1],
+    [403, tosText, 1],
+    [403, JSON.stringify({ error: { message: tosText } }), 1],
+    [403, JSON.stringify({ error: { code: 403, status: "PERMISSION_DENIED", message: "Forbidden" } }), 0],
+    [403, "Eligibility check failed: not currently available in your location.", 0],
+    [403, "TOS_VIOLATION", 0],
+    [403, "not json", 0],
+    [401, JSON.stringify(tosBody), 0],
+    [429, JSON.stringify(tosBody), 0],
+    [500, JSON.stringify(tosBody), 0],
+    [200, JSON.stringify(tosBody), 0],
+  ]) {
+    let marked = 0
+    const result = await fetchAccountPlan({ geminiDir: "/profiles/selected", env: {},
+      readToken: async options => {
+        assert.deepEqual(Object.keys(options).sort(), ["env", "geminiDir"])
+        return "fake-access"
+      },
+      fetch: async () => new Response(body, { status }),
+      onServiceSuspended: (...args) => { marked++; assert.equal(args.length, 0, "no raw upstream body leaves metadata reader") },
+    })
+    assert.equal(result, "")
+    assert.equal(marked, expected, `${status}: ${body}`)
+  }
+})
+
+test("oversized metadata denials are cancelled without marking a suspension", async () => {
+  let marked = 0, cancelled = false
+  const result = await fetchAccountPlan({ readToken: async () => "fake",
+    fetch: async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode(tosText + "x".repeat(64 * 1024))) },
+      cancel() { cancelled = true },
+    }), { status: 403 }),
+    onServiceSuspended: () => { marked++ },
+  })
+  assert.equal(result, "")
+  assert.equal(marked, 0)
+  assert.equal(cancelled, true)
+})
+
+test("metadata timeout cannot report a late 403 from fetch or an unfinished response body", async () => {
+  for (const phase of ["fetch", "body"]) {
+    let release, entered, signal, marked = 0
+    const started = new Promise(resolve => { entered = resolve })
+    const pending = fetchAccountPlan({ timeoutMs: 25, readToken: async () => "fake",
+      fetch: async (_url, init) => {
+        signal = init.signal
+        entered()
+        if (phase === "fetch") return new Promise(resolve => { release = () => resolve(Response.json(tosBody, { status: 403 })) })
+        return new Response(new ReadableStream({ start(controller) {
+          release = () => { controller.enqueue(new TextEncoder().encode(JSON.stringify(tosBody))); controller.close() }
+        } }), { status: 403 })
+      },
+      onServiceSuspended: () => { marked++ },
+    })
+    await started
+    assert.equal(await pending, "")
+    assert.equal(signal.aborted, true)
+    release()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(marked, 0, phase)
+  }
+})
+
+test("cancelling a metadata read ignores even an explicit late suspension", async () => {
+  const controller = new AbortController()
+  let release, entered, marked = 0
+  const started = new Promise(resolve => { entered = resolve })
+  const pending = fetchAccountPlan({ signal: controller.signal, readToken: async () => "fake",
+    fetch: async () => { entered(); return new Promise(resolve => { release = () => resolve(Response.json(tosBody, { status: 403 })) }) },
+    onServiceSuspended: () => { marked++ },
+  })
+  await started
+  controller.abort()
+  assert.equal(await pending, "")
+  release()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(marked, 0)
+})

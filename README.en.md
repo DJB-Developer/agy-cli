@@ -150,7 +150,7 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.11 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to 0.2.12 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
 
 0.2.9 restores CLI `/usage` quotas with optional HTTP plan lookup, retaining
 model-group routing and plan ID recognition. Plan failures do not affect quota,
@@ -278,12 +278,13 @@ no HTTP quota endpoint is called. No fixed, unverified Hub User-Agent is set.
 The plugin never exchanges refresh tokens, writes credentials or onboards accounts.
 
 Plan lookup allows at most 1.5 seconds for credential reads and HTTP combined.
-Missing tokens, HTTP 401/403/429, transport failures, timeouts, malformed responses
-and absent plans only omit the plan. CLI quota and login state remain intact;
+Missing tokens, HTTP 401/ordinary 403/429, transport failures, timeouts, malformed
+responses and absent plans only omit the plan. Except for explicit service-suspension
+403s (since 0.2.12), CLI quota and login state remain intact;
 plan failures do not trigger quota backoff or retain a stale plan. The next quota
 refresh retries plan lookup. CLI quota has a 15-second budget, capped at 18 seconds.
 Unknown windows show "Limits not available", never invented 0% or 100% readings.
-**Chat stays on `agy acp` and never waits for plan lookup; HTTP is plan-only.**
+**Chat stays on `agy acp` and never waits for plan lookup; HTTP supplies plan metadata and explicit suspension signals.**
 
 Since 0.2.4, measured windows carry an exact `models` allowlist from the selected
 account's catalog, including base aliases and listed high, low, tiered or other
@@ -454,8 +455,9 @@ list of changes are in [NOTICE.md](NOTICE.md).
 Explicit CLI service-disabled/TOS wording or structured 403 PERMISSION_DENIED with
 TOS_VIOLATION marks only that profile suspended. Detection covers terminal warning
 chunks, retry lines, ACP errors, current-turn logs and CLI quota failures. Generic
-403s, region restrictions, expired credentials, quota limits and optional HTTP plan
-failures do not mark a suspension. Chat remains on `agy acp`.
+403s, region restrictions, expired credentials, quota limits and ordinary HTTP plan
+failures do not mark a suspension. Since 0.2.12, explicit metadata suspension 403s
+can also mark the account. Chat remains on `agy acp`.
 
 Whole responses return HTTP 403. Streams emit `permission_error` with numeric
 `status: 403`, `code: TOS_VIOLATION` and the suspension reason, rather than successful
@@ -474,7 +476,7 @@ Token refresh, quota refresh and restart do not clear the mark. Persistence fail
 is logged and the current runtime stays blocked.
 
 Quota and plan success cannot prove inference eligibility. Detection requires an
-actual CLI error; no extra inference probes are sent. Manually turn off any account
+explicit CLI or metadata suspension signal; no extra inference probes are sent. Manually turn off any account
 already known to be suspended until a signal has been observed. After a successful
 appeal, stop Magpie/the plugin, remove only that profile's `service-status.json`,
 restart and refresh usage, then re-enable the account in Magpie if needed.
@@ -494,3 +496,19 @@ so tool purposes and complex parameter contracts retain more room. Catalogs that
 fit remain unchanged; tool names and schema structure are preserved. CLI chat,
 CLI quota, optional HTTP plans, model-group routing, the minimal-agent UI option
 and persistent TOS suspension detection are retained.
+
+
+## Account state during quota refresh (0.2.12)
+
+After successful CLI quota, the existing HTTP plan request also checks explicit
+service-suspension 403 responses: structured TOS_VIOLATION or the complete service
+disabled message. A positive signal persists the account mark, shows the reason in
+usage, and blocks later chat on that profile even when CLI quota still works.
+Other profiles remain usable. No extra HTTP or inference request is added.
+The existing 1.5-second metadata deadline and 64 KiB body limit apply; late results
+after timeout/cancellation cannot change status. Ordinary plan failures stay optional.
+
+This is a lightweight check, not proof of inference access: if only the chat endpoint
+refuses an account, quota/plan refresh may not expose it. Successful metadata queries
+do not display a verified chat status or clear a persisted suspension. CLI eligibility
+and region errors retain their reasons without being labelled TOS bans.
