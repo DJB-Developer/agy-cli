@@ -1,5 +1,12 @@
 # NOTICE：来源与合规说明
 
+## 独立仓库说明
+
+本仓库为 `DJB-Developer/agy-cli`，基于 `magpie-community/plugins` 的
+`packages/agy-cli`（提交 `09c05dfa9f3f6fc89d2d172faf475bbeed70f3c4`）。
+新增 refresh token 导入账号、钥匙串验证与失败恢复，以及相关测试和文档。
+下文保留上游的历史来源记录；其中包名、版本和仓库描述属于上游记录。
+
 本包（`@magpie-community/opencode-agy-cli-auth`，版本 0.1.0）源自 Antigravity 桥接插件
 `opencode-antigravity-bridge`，由 gitxm 整理为 `gitxm/yce-magpie-agy` 后提交到
 magpie-community/plugins（plugins#785），以 MIT 协议发布。**与上游无隶属关系。** 上游版权声明原样保留在 [LICENSE](LICENSE)，

@@ -1,5 +1,9 @@
 # agy-cli
 
+本仓库是 [magpie-community/plugins 的 agy-cli](https://github.com/magpie-community/plugins/tree/main/packages/agy-cli) 的独立版本，
+新增了 **refresh_token 直接导入账号**，支持粘贴 `1//...` 原始 token 或账号 JSON。
+保留上游 MIT 版权与来源说明；本仓库的改动尚未发布到 npm。
+
 把本机的 Antigravity CLI（`agy`）接成 Magpie 里的一个模型 provider。装好以后，
 OpenCode、Claude Code 等客户端经由 Magpie 调用 agy 向本插件开放的模型，请求实际由
 `agy` 进程完成。
@@ -98,6 +102,9 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
   agy 的话，请定期在终端里运行一次 `agy` 让它更新：版本过旧本身也更显眼。
 
 ## 安装
+
+以下市场和 npm 命令安装的是上游社区版本，不包含本仓库新增的 refresh token 导入功能。
+本仓库提供包含该功能的源码。
 
 从 Magpie 社区插件市场安装（推荐）：在 Magpie 的 Plugins 页找到「Antigravity (local agy CLI)」点安装，或在终端运行：
 
@@ -228,8 +235,7 @@ agy 自己的系统提示词，只剩插件的一行工具说明和客户端的�
 ## 开发
 
 ```sh
-bun test packages/agy-cli        # 在仓库根目录
-bun scripts/check.mjs agy-cli
+bun test                       # 在本仓库根目录
 ```
 
 测试用假的 agy 进程（`test/` 下的 ACP stdio 服务）跑完整的 ACP 与 MCP 链路，不调用真实

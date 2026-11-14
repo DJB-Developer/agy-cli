@@ -1,5 +1,9 @@
 # agy-cli
 
+This standalone version of [magpie-community/plugins agy-cli](https://github.com/magpie-community/plugins/tree/main/packages/agy-cli)
+adds **account import using a refresh_token**, accepting a raw `1//...` token or account JSON.
+Upstream MIT notices and attribution are retained. These changes have not been published to npm.
+
 Turn the local Antigravity CLI (`agy`) into a model provider inside Magpie. Once
 it is set up, clients such as OpenCode and Claude Code can reach the models agy
 offers this plugin through Magpie, and every request is actually carried out by
@@ -138,6 +142,9 @@ turn); the models a client gets remain agy's decision.
   it updates: an old version stands out too.
 
 ## Install
+
+The marketplace and npm commands below install the upstream community version, which does not include
+this repository's refresh-token import feature. This repository provides the source with that feature.
 
 From the Magpie community plugins: find "Antigravity (local agy CLI)" on
 Magpie's Plugins page and install it, or run:
@@ -307,8 +314,7 @@ off unless you turn it on.
 ## Development
 
 ```sh
-bun test packages/agy-cli        # from the repo root
-bun scripts/check.mjs agy-cli
+bun test                       # from this repository root
 ```
 
 The tests run the full ACP and MCP path against a fake agy (an ACP stdio server

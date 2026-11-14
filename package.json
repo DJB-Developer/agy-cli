@@ -38,8 +38,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/magpie-community/plugins.git",
-    "directory": "packages/agy-cli"
+    "url": "git+https://github.com/DJB-Developer/agy-cli.git"
   },
   "scripts": {
     "test": "bun test"

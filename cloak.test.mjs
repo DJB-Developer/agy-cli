@@ -1,11 +1,6 @@
-// cloak.mjs is a copy of packages/antigravity's TURNED_AWAY, cloak and hint
-// (#980) and its REWORDED (#1028): these fail when the two packages stop
-// agreeing.
+// Standalone regressions for agy-cli; cross-package parity belongs to the upstream monorepo.
 import { expect, test } from "bun:test"
-import { REWORDED, TURNED_AWAY, cloak, hint, outgoing, turnsAway } from "./cloak.mjs"
-import { _internal as antigravity } from "../antigravity/index.mjs"
-
-const ZW = "​"
+import { REWORDED, cloak, hint, outgoing, turnsAway } from "./cloak.mjs"
 
 const samples = [
   "x-anthropic-billing-header: cc_version=2.1.0.abc; cc_entrypoint=cli; cch=1a2b3;",
@@ -49,24 +44,7 @@ test("a turned-away line wrapped or widened by white space is reworded too", () 
   expect(turnsAway(samples[10])).toBe(false)
 })
 
-test("agy-cli and antigravity reword and explain the same lines", () => {
-  for (const line of [...TURNED_AWAY, ...samples.filter((s) => turnsAway(s)).map((s) => s.replace(/[A-Za-z0-9]{3,}/g, (w) => w[0] + ZW + w[1] + ZW + w.slice(2)))]) {
-    expect(antigravity.turnsAway(line)).toBe(true)
-    expect(cloak(line)).toBe(antigravity.cloak(line))
-    expect(hint(line)).toBe(antigravity.hint(line))
-  }
-  for (const s of samples) {
-    expect(turnsAway(s)).toBe(antigravity.turnsAway(s))
-    expect(cloak(s)).toBe(antigravity.cloak(s))
-    expect(hint(s)).toBe(antigravity.hint(s))
-  }
-})
-
 const DSH = "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host. A trailing slash marks a directory: list it when its contents matter. Anything else is a file: use the read tool when its contents are needed, and do not claim to have inspected it before reading. @\"...\" quotes a path containing spaces."
-
-// the system text antigravity sends for s (its shape() runs outgoing on it)
-const antigravitySends = (s) =>
-  antigravity.shape({ systemInstruction: { parts: [{ text: s }] }, contents: [] }, "gemini-3-flash", "", "").systemInstruction.parts[0].text
 
 test("DeepSeek Harness's @-path paragraph goes reworded, the rest as written (#1028)", () => {
   const sys = "You are DeepSeek Harness.\n\n" + DSH + "\n\nBe brief."
@@ -77,12 +55,6 @@ test("DeepSeek Harness's @-path paragraph goes reworded, the rest as written (#1
   expect(both).toContain("When the user writes @ followed by a path")
 })
 
-test("agy-cli and antigravity send the same system text, reworded", () => {
-  for (const [from, to] of REWORDED) {
-    expect(outgoing(from)).toBe(to)
-    expect(antigravitySends(from)).toBe(to)
-  }
-  for (const s of [...samples.filter(Boolean), DSH, "Lead.\n" + DSH + "\n" + DSH, "x-anthropic-billing-header: cc\n" + DSH]) {
-    expect(outgoing(s)).toBe(antigravitySends(s))
-  }
+test("outgoing applies every declared system-text replacement", () => {
+  for (const [from, to] of REWORDED) expect(outgoing(from)).toBe(to)
 })
