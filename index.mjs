@@ -891,6 +891,18 @@ class AgentTurnError extends Error {
   }
 }
 
+// A rejected prompt can quote upstream's "code 429". Name its actual status
+// so Magpie does not retry it as quota exhaustion. Preserve explicit account
+// errors (especially 403/TOS_VIOLATION) and leave ordinary rate limits alone.
+function streamErrorOf(error) {
+  const type = error?.kind || "api_error"
+  const out = { type, message: String(error?.message ?? error) }
+  if (error?.statusCode) out.status = error.statusCode
+  else if (type === "invalid_request_error") out.status = 400
+  if (error?.code) out.code = error.code
+  return out
+}
+
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`
 }
@@ -2259,9 +2271,14 @@ class Proc {
       throw new Error("agy bridge: no prompt in flight for MCP call")
     }
     const name = message.name
-    const args = message.arguments ?? {}
+    let args = message.arguments ?? {}
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("agy bridge: invalid tool arguments")
-    if (!this.tools.some((tool) => tool.name === name)) throw new Error(`agy bridge: undeclared tool ${name}`)
+    const tool = this.tools.find((item) => item.name === name)
+    if (!tool) throw new Error(`agy bridge: undeclared tool ${name}`)
+    // agy consumes its internal toolSummary instead of forwarding it to MCP.
+    if (name === "run_command" && tool.inputSchema?.properties?.toolSummary && !Object.hasOwn(args, "toolSummary")) {
+      args = { ...args, toolSummary: "Run command" }
+    }
     const signature = stableJSON(args)
     const running = turn.calls.find((call) => call.deferred && !call.lateDelivered &&
       call.name === name && stableJSON(call.arguments) === signature)
@@ -4069,6 +4086,10 @@ function normalizeTools(body) {
       throw new UnsupportedContent(`an invalid schema for tool ${tool.name}`)
     }
     const inputSchema = ensureGeminiArrayItems(sanitizeInputSchema(expandToolSchema(rawSchema)))
+    // agy adds its own required toolSummary; a duplicate invalidates the schema.
+    if (tool.name === "run_command" && Array.isArray(inputSchema.required)) {
+      inputSchema.required = inputSchema.required.filter((key) => key !== "toolSummary")
+    }
     tools.push({
       name: tool.name,
       description: typeof tool.description === "string" ? tool.description : "",
@@ -5569,9 +5590,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             closeBlock()
             send("error", {
               type: "error",
-              error: { type: event.error?.kind || "api_error", message: String(event.error?.message ?? event.error),
-                ...(event.error?.statusCode ? { status: event.error.statusCode } : {}),
-                ...(event.error?.code ? { code: event.error.code } : {}) },
+              error: streamErrorOf(event.error),
             })
             if (!event.error?.keepProcess) {
               dropFromPool(proc)
@@ -5594,7 +5613,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
           closeBlock()
           send("error", {
             type: "error",
-            error: { type: "api_error", message: String(error?.message ?? error) },
+            error: streamErrorOf(error),
           })
           proc.finalizeTurn(turn)
           detach()
@@ -5738,7 +5757,7 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
   if (buffer.trim()) processBlock(buffer)
 
   if (streamError) {
-    const status = streamError.code === "TOS_VIOLATION" ? 403 : streamError.type === "rate_limit_error" ? 429 : 502
+    const status = streamError.code === "TOS_VIOLATION" ? 403 : streamError.status || (streamError.type === "rate_limit_error" ? 429 : 502)
     return new Response(JSON.stringify({ type: "error", error: streamError }), {
       status,
       headers: { "Content-Type": "application/json", ...(status === 403 ? { "X-Magpie-Sign-In": "expired" } : {}) },
@@ -6120,6 +6139,11 @@ const createPlugin = async () => {
         // Never force a refresh here: Magpie times models() out after about two seconds.
         const catalog = await loadModelCatalog(agy, { probeOffered: true })
         const out = {}
+        // A temporary static/Gemini-only list must not erase Magpie's saved
+        // model picks. Each account runtime tracks its own catalog/probe state.
+        if (cachedModelCatalog.isFallback || (!acpOfferedModels && (modelCatalogRefreshPromise || offeredProbePromise))) {
+          out[Symbol.for("magpie.fellBack")] = true
+        }
         for (const model of catalog.models) {
           const imageModel = /^(?:gemini-|claude-)/.test(model.id)
           out[model.id] = {

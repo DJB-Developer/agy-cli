@@ -15,6 +15,10 @@
 这些修复适配到本仓的账号独立运行时，保留本仓登录、额度、套餐及界面配置功能。
 0.2.7 同步 `1c3c58be56ebdbcdac38a30e6f733e125573ab04`（社区 agy-cli 0.1.49），
 保存会话按实际发送的提示词校验，保留本仓各账号目录和精简 Agent 模式隔离。
+0.2.14 选择性同步以下 MIT 上游修复，均适配到本仓账号独立运行时：
+- `491cea357d2289c8250d8b1fd281ffcadb746693`：`run_command.toolSummary` 兼容及测试（@andrew-zyf、@yetone；社区 0.1.63 发布）。
+- `e4c825b5544d99a688d92ed32e688ae5f768e731`：仅模型目录 fallback 标记和相关测试，不同步单账号替换登录（@yetone）。
+- `84c2a4794981d55f367cb75cf6c9196e1639e9c3`：请求拒绝的显式 400，保留本仓 403/TOS 错误字段和停用逻辑（@yetone）。
 下文保留上游的历史来源记录；其中包名、版本和仓库描述属于上游记录。
 
 本包（`@magpie-community/opencode-agy-cli-auth`，版本 0.1.0）源自 Antigravity 桥接插件

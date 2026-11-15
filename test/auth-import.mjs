@@ -783,3 +783,80 @@ test("quota refresh observes explicit HTTP TOS suspension even when CLI quota su
     assert.equal(httpCalls.length, 2, "chat remains CLI-only")
   })
 })
+
+test("model fallback marker stays with its account and clears after that account warms", async () => {
+  await withKit({}, async kit => {
+    const a = await add(kit, "a"), b = await add(kit, "b")
+    const marker = Symbol.for("magpie.fellBack")
+    const rows = args => ["high", "low"].map(effort => [`gemini-test-${nameOf(args)}-${effort}`, `Account ${nameOf(args)} (${effort})`])
+    kit.offeredModels = rows
+    kit.modelsBehavior = ({ args }) => nameOf(args) === "b" ? { code: 1 } : { stdout: modelsOutput(rows(args)) }
+    const models = account => kit.plugin.provider.models({}, { auth: authOf(account) })
+    await models(a)
+    await kit.plugin.provider.warming?.()
+    const ready = await models(a)
+    assert.equal(ready[marker], undefined)
+    assert.ok(ready["gemini-test-a"])
+    const cold = await models(b)
+    assert.equal(cold[marker], true)
+    assert.equal((await models(a))[marker], undefined, "one failed catalog must not mark another account")
+    assert.equal(cold["gemini-test-a"], undefined)
+    // Permit the failed account's refresh backoff to expire.
+    kit.clock.advance(10 * 60_000)
+    kit.modelsBehavior = ({ args }) => ({ stdout: modelsOutput(rows(args)) })
+    await models(b)
+    await kit.plugin.provider.warming?.()
+    const warmed = await models(b)
+    assert.equal(warmed[marker], undefined)
+    assert.ok(warmed["gemini-test-b"])
+    assert.equal(warmed["gemini-test-a"], undefined)
+  })
+})
+
+test("run_command summary repair respects each account's tool schema", async () => {
+  await withKit({}, async kit => {
+    const a = await add(kit, "a"), b = await add(kit, "b")
+    const listed = new Map()
+    kit.defaultPrompt = async agent => {
+      listed.set(nameOf(agent.args), (await agent.listTools()).result.tools[0].inputSchema)
+      await agent.tool("run_command", { command: "pwd" })
+    }
+    const schema = withSummary => ({ type: "object", properties: { command: { type: "string" },
+      ...(withSummary ? { toolSummary: { type: "string" } } : {}) },
+      required: withSummary ? ["command", "toolSummary"] : ["command"], additionalProperties: false })
+    const ask = async (account, withSummary) => {
+      const request = await client(kit, authOf(account))
+      return readSse(await request(baseBody({ tools: [{ name: "run_command", input_schema: schema(withSummary) }] })))
+    }
+    const [ra, rb] = await Promise.all([ask(a, true), ask(b, false)])
+    assert.deepEqual(ra.content.find(c => c.type === "tool_use").input, { command: "pwd", toolSummary: "Run command" })
+    assert.deepEqual(rb.content.find(c => c.type === "tool_use").input, { command: "pwd" })
+    assert.deepEqual(listed.get("a").required, ["command"])
+    assert.equal(listed.get("b").properties.toolSummary, undefined)
+  })
+})
+
+for (const stream of [true, false]) {
+  test(`prompt refusal is 400, not a ban; healthy account still chats (stream=${stream})`, async () => {
+    await withKit({}, async kit => {
+      const a = await add(kit, "a"), b = await add(kit, "b")
+      kit.defaultPrompt = async agent => {
+        if (nameOf(agent.args) === "a") {
+          await agent.text("\n⚠ API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n")
+          await agent.text("\n⚠ Agent execution terminated due to error.\n")
+        } else await agent.text("healthy")
+        return { stopReason: "end_turn" }
+      }
+      const request = await client(kit, authOf(a))
+      const response = await request(baseBody({ stream, system: "RFC 2119 keywords: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL." }))
+      const reply = stream ? await readSse(response) : await response.json()
+      if (!stream) assert.equal(response.status, 400)
+      assert.equal(reply.error.type, "invalid_request_error")
+      assert.equal(reply.error.status, 400)
+      assert.equal(reply.error.code, undefined)
+      assert.equal(fs.existsSync(path.join(rootOf(kit), "a", "bridge-state", "service-status.json")), false)
+      const healthy = await client(kit, authOf(b))
+      assert.equal((await readSse(await healthy(baseBody()))).content[0].text, "healthy")
+    })
+  })
+}

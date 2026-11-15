@@ -150,7 +150,7 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.13 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to 0.2.14 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
 
 0.2.9 restores CLI `/usage` quotas with optional HTTP plan lookup, retaining
 model-group routing and plan ID recognition. Plan failures do not affect quota,
@@ -538,3 +538,12 @@ guaranteed. Old 402 rest history may remain, but a disabled account leaves futur
 routing. Recovery is manual after a successful appeal: remove the service-state
 file as described above and re-enable the account. Turning this switch off leaves
 only local blocking, not automatic changes to Magpie's enabled-account list.
+
+
+## Upstream compatibility fixes (0.2.14)
+
+- Avoid duplicate required `toolSummary` fields on `run_command`. Restore a default summary only when the client declares the property and agy omits it; preserve supplied summaries and other tools.
+- Mark temporary static/probing model lists as fallback so Magpie preserves saved model selections. Catalog state remains account-local.
+- Emit explicit status 400 for recognized request-content rejections (including HTTP 400 for non-streaming replies). Ordinary quota errors remain 429; TOS errors retain 403, `TOS_VIOLATION`, and automatic account quarantine.
+
+This release does not adopt upstream's single-account replacement login, system-prompt relocation, or CLI installer. Multi-account isolation, model-group quota routing, HTTP plan lookup, and UI options remain intact. Chat and quota queries still use agy CLI; Magpie 0.1.4246's installer hook is not required.
