@@ -580,6 +580,7 @@ export async function createBridgeKit(options = {}) {
     else if (key === "./cloak.mjs") module = sourceModule(CLOAK_FILE, "", cloakUrl)
     else if (key === "./login.mjs") module = sourceModule(LOGIN_FILE, "", loginUrl)
     else if (key === "./re2-pattern.mjs") module = sourceModule(RE2_PATTERN_FILE, "", re2Url)
+    else if (key === "./turn-outcome.mjs") module = sourceModule(path.join(REPO_DIR, "turn-outcome.mjs"), "", new URL("./turn-outcome.mjs", indexUrl).href)
     else if (key === "./step-usage.mjs") module = sourceModule(STEP_USAGE_FILE, "", stepUsageUrl)
     else if (key === "./accounts.mjs") module = sourceModule(path.join(REPO_DIR, "accounts.mjs"), "", new URL("./accounts.mjs", indexUrl).href)
     else if (key === "./signin.mjs") module = sourceModule(SIGNIN_FILE, "", signinUrl)

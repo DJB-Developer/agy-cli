@@ -28,6 +28,8 @@ for (const [name, mocks] of [
   ["headless-signin.mjs", false],
   ["catalog.mjs", false],
   ["step-usage.mjs", false],
+  ["turn-outcome.mjs", false],
+  ["turn-outcome-integration.mjs", false],
   ["tool-schema.mjs", false],
   ["tool-summary.mjs", false],
   ["tool-budget.mjs", false],

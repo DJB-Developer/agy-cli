@@ -18,6 +18,7 @@ import { expandToolSchema } from "./tool-schema.mjs"
 import { fitTools } from "./tool-budget.mjs"
 import { hint, outgoing, turnsAway } from "./cloak.mjs"
 import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
+import { watchPromptOutcome, recoveryTime } from "./turn-outcome.mjs"
 
 import { DEFAULT_ACCOUNT, accountEnv, accountArgs, accountSignIn, accountName, resolveAccount,
   accountResult, reserveAccount, writeAccountToken, publishAccount, discardAccount } from "./accounts.mjs"
@@ -900,7 +901,22 @@ function streamErrorOf(error) {
   if (error?.statusCode) out.status = error.statusCode
   else if (type === "invalid_request_error") out.status = 400
   if (error?.code) out.code = error.code
+  if (error?.resetAt) {
+    out.reset_at = error.resetAt
+    out.resets_at = Math.ceil(Date.parse(error.resetAt) / 1000)
+  }
   return out
+}
+
+function withRecovery(error, resetAt) {
+  if (!resetAt || error.code === "TOS_VIOLATION" ||
+      (error.kind !== "rate_limit_error" && !(error.statusCode >= 500))) return error
+  error.resetAt = resetAt
+  // Protocol translators may discard custom fields. Also name the absolute
+  // instant in the reset phrasing Magpie understands; never a rolling guess.
+  const second = new Date(Math.ceil(Date.parse(resetAt) / 1000) * 1000).toISOString()
+  error.message += ` Retry window resets at ${second.slice(0, 19).replace("T", " ")} UTC+0.`
+  return error
 }
 
 function shellQuote(value) {
@@ -2116,6 +2132,13 @@ class Proc {
         unpark(this.convKey)
         this.hasSentFirstTurn = true
         const promptNumber = turn.beginPrompt(promptParts, lateCalls)
+        // Independent of usage accounting: an error step must still be checked
+        // when token measurement is disabled or its schema is unavailable.
+        const checkOutcome = watchPromptOutcome({
+          root: account.dir || process.env.AGY_BRIDGE_CONVERSATIONS_DIR || path.join(os.homedir(), ".gemini"),
+          ...(account.dir || !process.env.AGY_BRIDGE_CONVERSATIONS_DIR ? {} : { directory: [] }),
+          sessionId: this.sessionId,
+        })
         turn.promptInFlight = true
         let result
         try {
@@ -2124,6 +2147,13 @@ class Proc {
             sessionId: this.sessionId,
             prompt: promptParts.length ? promptParts : [{ type: "text", text: "" }],
           })
+        } catch (error) {
+          // Optional database evidence must never downgrade a positive ban
+          // signal already supplied by the CLI itself.
+          if (isServiceSuspension(error.acpError) || isServiceSuspension(error.message)) throw error
+          const failure = !turn.cancelRequested && checkOutcome(Date.now())
+          if (failure) throw this.#outcomeError(failure)
+          throw error
         } finally {
           turn.promptInFlight = false
         }
@@ -2134,13 +2164,18 @@ class Proc {
           return
         }
         turn.endText()
+        let knownError = null
         if (turn.agentError) {
-          throw await this.#agentError(turn)
-        }
-        if (result?.stopReason === "refusal") {
+          knownError = await this.#agentError(turn)
+        } else if (result?.stopReason === "refusal") {
           const detail = await lastAgentError(this.logPath, turn.logOffset)
-          if (detail) throw this.#formatAgentError(detail)
+          if (detail) knownError = this.#formatAgentError(detail)
         }
+        if (knownError?.code === "TOS_VIOLATION") throw knownError
+        const failure = result?.stopReason !== "cancelled" && checkOutcome(Date.now())
+        if (knownError && failure?.code === "AGY_TURN_FAILED") throw knownError
+        if (failure) throw this.#outcomeError(failure)
+        if (knownError) throw knownError
         turn.flushText()
         // agy ended the turn without waiting for a long-running client tool:
         // deliver its real result in a follow-up prompt of the same response.
@@ -2191,6 +2226,22 @@ class Proc {
     return this.#formatAgentError(detail)
   }
 
+  #outcomeError(failure) {
+    if (failure.code === "TOS_VIOLATION") return this.#formatAgentError(TOS_MESSAGE)
+    let error
+    if (failure.status === 429 && failure.code !== "QUOTA_EXHAUSTED") {
+      // Keep our existing recognized prompt-refusal classification (400).
+      error = this.#formatAgentError(`${failure.code} (code 429): ${failure.message}`)
+    } else {
+      error = new AgentTurnError(`agy bridge: ${failure.message}`,
+        failure.status === 429 ? "rate_limit_error" : failure.status === 400 ? "invalid_request_error" :
+          failure.status === 403 ? "permission_error" : "api_error")
+    }
+    error.statusCode = error.kind === "invalid_request_error" ? 400 : failure.status
+    error.code = failure.code
+    return withRecovery(error, failure.resetAt)
+  }
+
   #formatAgentError(detail) {
     if (isServiceSuspension(detail)) {
       serviceStatus.mark()
@@ -2208,10 +2259,10 @@ class Proc {
       )
     }
     if (/QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|code 429\b/i.test(detail)) {
-      return new AgentTurnError(
+      return withRecovery(new AgentTurnError(
         `agy bridge: Antigravity quota or rate limit reached${detail ? ": " + detail : ""}${refused429(detail) ? " — Antigravity answers this same bare 429 to a system prompt it turns away whatever quota is left, so if quota is left it is not a quota and waiting won't help: something in this agent's system prompt is being matched" : ""}`,
         "rate_limit_error",
-      )
+      ), recoveryTime(detail, Date.now()))
     }
     return new AgentTurnError(`agy bridge: agy stopped the turn because of an error${detail ? ": " + detail : ""}`)
   }
@@ -5760,7 +5811,10 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
     const status = streamError.code === "TOS_VIOLATION" ? 403 : streamError.status || (streamError.type === "rate_limit_error" ? 429 : 502)
     return new Response(JSON.stringify({ type: "error", error: streamError }), {
       status,
-      headers: { "Content-Type": "application/json", ...(status === 403 ? { "X-Magpie-Sign-In": "expired" } : {}) },
+      headers: { "Content-Type": "application/json", ...(streamError.code === "TOS_VIOLATION" ? { "X-Magpie-Sign-In": "expired" } : {}),
+        ...(streamError.reset_at && (status === 429 || status >= 500) ? {
+          "Retry-After": String(Math.max(0, Math.ceil((Date.parse(streamError.reset_at) - Date.now()) / 1000))),
+        } : {}) },
     })
   }
   return new Response(JSON.stringify(message), {

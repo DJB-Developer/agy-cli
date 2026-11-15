@@ -150,7 +150,7 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.14 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to 0.2.15 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
 
 0.2.9 restores CLI `/usage` quotas with optional HTTP plan lookup, retaining
 model-group routing and plan ID recognition. Plan failures do not affect quota,
@@ -547,3 +547,16 @@ only local blocking, not automatic changes to Magpie's enabled-account list.
 - Emit explicit status 400 for recognized request-content rejections (including HTTP 400 for non-streaming replies). Ordinary quota errors remain 429; TOS errors retain 403, `TOS_VIOLATION`, and automatic account quarantine.
 
 This release does not adopt upstream's single-account replacement login, system-prompt relocation, or CLI installer. Multi-account isolation, model-group quota routing, HTTP plan lookup, and UI options remain intact. Chat and quota queries still use agy CLI; Magpie 0.1.4246's installer hook is not required.
+
+
+## Per-prompt database errors and recovery hints (0.2.15)
+
+In addition to existing ACP, warning and log handling, the bridge reads only the current account/session's final step added by the current `session/prompt`. A terminal native error no longer becomes a successful `end_turn`. Historical errors, model quotations, recovered intermediate retries and cancelled responses are not treated as terminal database errors.
+
+- Uses each profile's `antigravity-cli/conversations`, independently of token accounting. Missing, locked, incompatible or identity-check-failing stores yield no extra evidence; existing checks continue. No database writes or polling.
+- For quota/temporary-service failures, accepts explicit future `quotaResetTimeStamp`, then `quotaResetDelay`, then `retryDelay`. No guessed reset for missing/invalid metadata.
+- SSE errors carry ISO `reset_at` and Unix-second `resets_at` (rounded up); whole errors also carry `Retry-After`. Absolute, zoned reset wording survives translators that discard custom fields. A retry hint does not guarantee successful recovery.
+- Explicit TOS denial retains 403/`TOS_VIOLATION`, persistent account blocking and automatic quarantine, without an automatic recovery date. Generic 403 is not a permanent TOS ban; recognized request rejection remains 400.
+- Output is not buffered until completion. A late database error cannot retract already-streamed text/tool calls and does not transparently replay tools.
+
+Chat and quota still use agy CLI; existing HTTP plan lookup, model-group routing, multi-account isolation and UI options remain unchanged. Update and reload the plugin; no credential migration or container changes are required.

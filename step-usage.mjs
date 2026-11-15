@@ -343,3 +343,7 @@ export function modelUsageAfter(file, cursor) {
     return steps === null ? null : { source: "steps", steps }
   })
 }
+
+// Shared with the prompt-outcome reader: identical read-only/WAL handling on
+// Bun and Node; the outcome reader separately validates profile/file ownership.
+export { withStore as readConversationStore }

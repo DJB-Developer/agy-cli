@@ -19,6 +19,12 @@
 - `491cea357d2289c8250d8b1fd281ffcadb746693`：`run_command.toolSummary` 兼容及测试（@andrew-zyf、@yetone；社区 0.1.63 发布）。
 - `e4c825b5544d99a688d92ed32e688ae5f768e731`：仅模型目录 fallback 标记和相关测试，不同步单账号替换登录（@yetone）。
 - `84c2a4794981d55f367cb75cf6c9196e1639e9c3`：请求拒绝的显式 400，保留本仓 403/TOS 错误字段和停用逻辑（@yetone）。
+0.2.15 的 `turn-outcome.mjs` 参考并改编自 `pingdotgg/t3code` 提交
+`0b489dada1f00db39c99074239c09c006f223aee` 的
+`apps/server/src/provider/acp/AntigravityTurnOutcome.ts`、`AntigravityProfilePaths.ts` 及其测试：
+仅检查本轮最后的错误步骤、读取恢复提示、验证会话文件身份。
+上游为 MIT，Copyright (c) 2026 T3 Tools Inc.；许可正文与版权保留于 LICENSE。
+本仓适配 CLI 的 `antigravity-cli/conversations` 路径、Bun/Node 只读 SQLite、多账号封禁和 Magpie 错误协议，未采用 T3 Code 的 HTTP 额度查询。
 下文保留上游的历史来源记录；其中包名、版本和仓库描述属于上游记录。
 
 本包（`@magpie-community/opencode-agy-cli-auth`，版本 0.1.0）源自 Antigravity 桥接插件
