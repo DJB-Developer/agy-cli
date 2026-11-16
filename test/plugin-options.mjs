@@ -6,6 +6,7 @@ import { baseBody, continueWithToolResults, createBridgeKit, readSse, MESSAGES_U
 
 const hostInput = saved => ({ magpie: { option(provider, key) {
   assert.equal(provider, "agy-cli")
+  if (key === "request_timings") return false
   assert.equal(key, "minimal_agent")
   return saved.on
 } } })

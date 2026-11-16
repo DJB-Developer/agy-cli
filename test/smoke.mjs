@@ -1182,13 +1182,17 @@ let nativeConv
 
 {
   const bodyA = { model, metadata: { user_id: "ambiguous-A" }, messages: [{ role: "user", content: "TOOL identical history" }], tools: [echoTool] }
-  const bodyB = { ...bodyA, metadata: { user_id: "ambiguous-B" } }
+  // Ambiguity is only possible inside one caller scope; another user is now
+  // excluded before matching renamed tool IDs. Concurrent models can still
+  // leave two same-scope tool calls with identical histories and arguments.
+  const bodyB = { ...bodyA, model: "agy-cli/claude-test-medium" }
   const [a, b] = await Promise.all([callFetch(bodyA), callFetch(bodyB)])
   const [eventsA, eventsB] = await Promise.all([readSSE(a), readSSE(b)])
   const ambiguous = continuation(bodyA, eventsA.events, "ambiguous-output")
   ambiguous.messages.at(-2).content.find(block => block.type === "tool_use").id = "TU-ambiguous"
   ambiguous.messages.at(-1).content[0].tool_use_id = "TU-ambiguous"
-  check("ambiguous renamed calls are never guessed", (await callFetch(ambiguous)).status === 503)
+  const ambiguousResponse = await callFetch(ambiguous)
+  check("ambiguous renamed calls are never guessed", ambiguousResponse.status === 503, JSON.stringify({ status: ambiguousResponse.status, a: eventsA, b: eventsB }))
   const finals = await Promise.all([
     callFetch(continuation(bodyA, eventsA.events, "unambiguous-A")).then(readSSE),
     callFetch(continuation(bodyB, eventsB.events, "unambiguous-B")).then(readSSE),

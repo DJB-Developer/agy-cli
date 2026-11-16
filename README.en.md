@@ -337,6 +337,46 @@ Plan HTTP 401/403/429 and timeouts do not invalidate the login; quota errors
 preserve the original CLI reason.
 
 
+## Request diagnostics and session isolation (0.2.16)
+
+Enable **Request timing diagnostics** in Magpie's agy-cli plugin options. Changes apply to new requests;
+no container restart is needed. On older hosts use `AGY_BRIDGE_TIMINGS=1`; the Magpie UI value takes precedence.
+The switch is off by default. Inspect server logs, not chat output:
+
+```sh
+docker logs --since 10m magpie 2>&1 | grep -F '"event":"agy_bridge_request"'
+```
+
+There are at most 120 rows per account per minute, with dropped rows reported as `suppressed` on the next emitted row.
+Rows contain anonymous account/conversation hashes, a request ID, outcome and monotonic timings, never account names,
+raw session IDs, prompts, credentials or tool arguments.
+
+- `stages_ms.catalog` and `lock_wait` measure catalog and plugin conversation-lock waits, **not Magpie routing queues**.
+- `startup` includes `process_prepare`, `initialize`, `session_new` / `session_resume` and model configuration. Nested spans are not additive.
+- `prompt_dispatch_ms`, `acp_first_output_ms`, `acp_first_text_ms` measure time from request entry to prompt dispatch and native CLI output.
+- `first_output_ms` / `first_text_ms` measure the bridge's first content event / text, excluding SSE headers and heartbeat pings. Output includes thinking/tools.
+- `after_first_output_ms` can include tool waits and usage settlement, not just generation. `usage_settlement` measures response token accounting, **not account quota queries**.
+- `total_ms` covers this plugin response; `session` is `new`, `reused`, `resumed` or `tool_continuation`; `resume` gives fixed fallback reasons.
+- `status` classifies the outcome, including in-stream errors; it is not necessarily the outer HTTP 200. Cancellation is logged as `cancelled` / `499`, not returned as HTTP 499.
+- Non-streaming first-text timings refer to the internal stream, not client-visible JSON delivery. Proxy buffering and client network latency are not measured.
+
+**Multi-user callers must supply stable, non-colliding session identities.** Send
+`X-Magpie-Session: <server-generated user-and-chat-unique ID>` on every turn and tool-result request.
+The plugin scopes sessions by Magpie's forwarded `X-Magpie-Session` / `X-Magpie-Subagent` headers and
+`metadata.user_id` / `metadata.session_id` when the host preserves these body fields. Do not assume arbitrary
+metadata survives OpenAI-to-Anthropic conversion. `identity_source` reports `magpie_header`, `metadata`, or
+`legacy`; legacy history matching alone cannot distinguish different users with identical requests.
+These fields are correlation hints, not authentication: the application must authenticate users and bind their IDs server-side.
+
+Live tool results cannot cross a user/session boundary. Parked checkpoints also bind the account profile,
+working directory, history and instructions. Old unbound or incompatible checkpoints are not resumed;
+a new session replays only the request's own history. Credentials are unchanged. Resume diagnostics do not include raw CLI errors.
+
+Cancellation covers catalog/lock waits, startup, streaming and non-streaming generation. An acknowledged
+cancel can still reuse a history-matched session. An unacknowledged cancel stops its process after at most
+15 seconds of grace and invalidates its checkpoint. A completed tool response is not a disconnect: the
+next HTTP request may still return its tool results. This work does not change account routing or add automatic request/tool replay.
+
 ## Environment variables
 
 | Name | Default value | What it does |
@@ -344,6 +384,8 @@ preserve the original CLI reason.
 | `AGY_PATH` | PATH lookup | Path to the agy executable |
 | `AGY_BRIDGE_ACCOUNTS_DIR` | `magpie-agy-cli/accounts` under the XDG config directory | Root for named profiles and state |
 | `AGY_BRIDGE_MAX_PROCS` | 16 | Maximum agy processes per account |
+| `AGY_BRIDGE_TIMINGS` | off | Set to `1` for content-free timing logs; Magpie UI setting takes precedence |
+| `AGY_BRIDGE_CANCEL_SETTLE_MS` | 15000 | Cancellation acknowledgement grace; can be reduced, capped at 15 seconds |
 | `AGY_BRIDGE_THINKING` | on | Set to `0` to stop forwarding thought summaries |
 | `AGY_BRIDGE_EFFORT` | unset | Force a thinking level: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` |
 | `AGY_BRIDGE_MINIMAL_AGENT` | off | Set to `1` to drop agy's own prompt components; Magpie's saved UI switch takes precedence. See "Minimal agent" below |

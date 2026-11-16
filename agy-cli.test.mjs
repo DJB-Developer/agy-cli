@@ -15,6 +15,8 @@ function run(args, timeout) {
 }
 
 for (const [name, mocks] of [
+  ["p0-lifecycle.mjs", false],
+  ["request-lifecycle.mjs", false],
   ["platform.mjs", true],
   ["compat.mjs", true],
   ["prefill.mjs", false],

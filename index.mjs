@@ -19,6 +19,7 @@ import { fitTools } from "./tool-budget.mjs"
 import { hint, outgoing, turnsAway } from "./cloak.mjs"
 import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import { watchPromptOutcome, recoveryTime } from "./turn-outcome.mjs"
+import { createRequestTrace, waitWithSignal, throwIfAborted } from "./request-lifecycle.mjs"
 
 import { DEFAULT_ACCOUNT, accountEnv, accountArgs, accountSignIn, accountName, resolveAccount,
   accountResult, reserveAccount, writeAccountToken, publishAccount, discardAccount } from "./accounts.mjs"
@@ -31,6 +32,7 @@ process.once("exit", () => { for (const cleanup of runtimeCleanups) cleanup() })
 // retain the environment fallback; a saved UI false overrides an env true.
 let readMinimalAgentOption = null
 let readAutoDisableOption = null
+let readRequestTimingsOption = null
 const minimalAgent = () => readMinimalAgentOption
   ? readMinimalAgentOption() === true
   : process.env.AGY_BRIDGE_MINIMAL_AGENT === "1"
@@ -114,7 +116,7 @@ const RESUME_TTL_MS = positiveTimeout(process.env.AGY_BRIDGE_RESUME_TTL_MS, 6 * 
 function ideCallDeadline() {
   return positiveTimeout(process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS, 150_000)
 }
-const CANCEL_SETTLE_MS = 15_000
+const CANCEL_SETTLE_MS = Math.min(15_000, positiveTimeout(process.env.AGY_BRIDGE_CANCEL_SETTLE_MS, 15_000))
 const MAX_MCP_COMMIT_WAIT_MS = 60_000
 function mcpCommitWaitMs() {
   const raw = process.env.AGY_BRIDGE_MCP_COMMIT_WAIT_MS
@@ -211,6 +213,12 @@ let shimDirPromise
 function positiveTimeout(value, fallback) {
   const parsed = Number(value)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+async function waitBounded(promise, ms) {
+  let timer
+  try { return await Promise.race([promise, new Promise(resolve => { timer = setTimeout(resolve, ms) })]) }
+  finally { clearTimeout(timer) }
 }
 
 function configuredTimeout(name, fallback) {
@@ -1648,6 +1656,8 @@ class Proc {
     this.workDir = opts.workDir
     this.instructions = opts.instructions || ""
     this.userId = opts.userId || ""
+    this.sessionScope = opts.sessionScope || ""
+    this.trace = opts.trace
     this.openingText = openingTextOf(opts.messages?.[0])
     this.openingImages = openingImagesOf(opts.messages?.[0])
     this.resumeFrom = opts.resume || null
@@ -1693,16 +1703,23 @@ class Proc {
     allProcs.add(this)
   }
 
-  async start() {
-    await ensureControlServer()
-    const bin = await ensureShimDir()
-    sessions.set(this.token, this)
-    this.workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-bridge-"))
-    const agentDir = path.join(this.workspace, ".agents", "agents", AGENT_NAME)
-    await fs.promises.mkdir(agentDir, { recursive: true })
-    await fs.promises.writeFile(path.join(agentDir, "agent.md"), agentDefinition(this.minimalAgent), { mode: 0o600 })
-    this.logPath = path.join(this.workspace, "agy-acp.log")
+  async start(signal) {
+    throwIfAborted(signal)
+    const bin = await this.measure("process_prepare", async () => {
+      await ensureControlServer()
+      throwIfAborted(signal)
+      const bin = await ensureShimDir()
+      throwIfAborted(signal)
+      sessions.set(this.token, this)
+      this.workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-bridge-"))
+      const agentDir = path.join(this.workspace, ".agents", "agents", AGENT_NAME)
+      await fs.promises.mkdir(agentDir, { recursive: true })
+      await fs.promises.writeFile(path.join(agentDir, "agent.md"), agentDefinition(this.minimalAgent), { mode: 0o600 })
+      this.logPath = path.join(this.workspace, "agy-acp.log")
+      return bin
+    })
 
+    throwIfAborted(signal)
     const args = [
       "acp",
       "--agent", AGENT_NAME,
@@ -1757,7 +1774,7 @@ class Proc {
       )), timeoutMs)
     })
     try {
-      await Promise.race([this.#handshake(), timeout])
+      await waitWithSignal(Promise.race([this.#handshake(signal), timeout]), signal)
     } catch (error) {
       if (this.dead && this.deadError && error !== this.deadError && !/timed out starting/.test(error.message)) {
         throw new Error(`agy failed before the ACP session started: ${this.deadError.message}`)
@@ -1768,14 +1785,15 @@ class Proc {
     }
   }
 
-  async #handshake() {
-    const init = await this.conn.request("initialize", {
+  async #handshake(signal) {
+    const init = await this.measure("initialize", () => this.conn.request("initialize", {
       protocolVersion: 1,
       // The plugin's own name. agy decides which models it offers this client,
       // and the catalog follows what the session advertises.
       clientInfo: CLIENT_INFO,
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-    })
+    }))
+    throwIfAborted(signal)
     this.agentVersion = init?.agentInfo?.version ?? null
     const tooOld = agyTooOld(this.agentVersion)
     if (tooOld) throw new Error(tooOld)
@@ -1792,23 +1810,31 @@ class Proc {
     let session = null
     if (this.resumeFrom && resumable) {
       try {
-        session = await this.conn.request("session/resume", {
+        session = await this.measure("session_resume", () => this.conn.request("session/resume", {
           sessionId: this.resumeFrom.sessionId,
           cwd: this.workspace,
           mcpServers: [],
           ...meta,
-        })
-        if (!session || typeof session !== "object") throw new Error("empty session/resume result")
+        }))
+        throwIfAborted(signal)
+        if (!session || typeof session !== "object" || (session.sessionId && session.sessionId !== this.resumeFrom.sessionId)) throw new Error("invalid session/resume result")
         this.sessionId = this.resumeFrom.sessionId
         this.resumed = true
         this.hasSentFirstTurn = true
         this.expectedMessages = this.resumeFrom.expectedMessages.map((message) => ({ ...message }))
       } catch {
+        throwIfAborted(signal)
+        if (this.dead || this.stopping) throw new Error("agy stopped during session resume")
+        this.trace?.context({ resume: "failed_new_session" })
         session = null
       }
+    } else if (this.resumeFrom) {
+      this.trace?.context({ resume: "unsupported_new_session" })
     }
     if (!this.resumed) {
-      session = await this.conn.request("session/new", { cwd: this.workspace, mcpServers: [], ...meta })
+      throwIfAborted(signal)
+      session = await this.measure("session_new", () => this.conn.request("session/new", { cwd: this.workspace, mcpServers: [], ...meta }))
+      throwIfAborted(signal)
       if (!session?.sessionId) throw new Error("agy session/new returned no sessionId")
       this.sessionId = session.sessionId
     }
@@ -1816,9 +1842,12 @@ class Proc {
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
     noteOfferedModels(this.configOptions, session?.models)
-    if (this.model) await this.#setModel(this.model, this.selection, this.resumed)
+    if (this.resumed) this.trace?.context({ resume: "resumed" })
+    if (this.model) await this.measure("model_selection", () => this.#setModel(this.model, this.selection, this.resumed))
     if (this.tools.length) await this.#waitForToolList(this.toolsVersion)
   }
+
+  measure(stage, fn) { return this.trace ? this.trace.measure(stage, fn) : fn() }
 
   async #setConfig(config, value) {
     const result = await this.conn.request("session/set_config_option", {
@@ -1974,7 +2003,9 @@ class Proc {
     turn.arm()
     turn.noteAcpToolUpdate(update)
     if (turn.cancelRequested) return
+    if (update.sessionUpdate === "tool_call" || (["agent_message_chunk", "agent_thought_chunk"].includes(update.sessionUpdate) && update.content?.text)) this.trace?.mark("acp_first_output_ms")
     if (update.sessionUpdate === "agent_message_chunk") {
+      if (update.content?.text) this.trace?.mark("acp_first_text_ms")
       const text = update.content?.type === "text" ? update.content.text : ""
       if (text) {
         turn.sawGenerationOutput = true
@@ -2089,7 +2120,7 @@ class Proc {
     }
     if (this.dead || this.stopping || this.retiring) return false
     if (!turn.done && !turn.finalized && !this.cancelTurn(turn, [])) return false
-    await Promise.race([turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
+    await waitBounded(turn.settled, CANCEL_SETTLE_MS)
     if (turn.done && !turn.finalized) this.finalizeTurn(turn)
     if (!turn.finalized || this.dead || this.stopping || this.historyInvalid || this.turn) return false
     this.expectedMessages = history.map((message) => ({ ...message }))
@@ -2109,7 +2140,7 @@ class Proc {
   async #runTurn(turn, content, model, selection) {
     try {
       turn.arm()
-      if (model) await this.#setModel(model, selection)
+      if (model) await this.measure("model_selection", () => this.#setModel(model, selection))
       const stepUsageEnabled = this.stepUsageTrusted &&
         !/^(?:0|false|off|no|disabled)$/i.test(process.env.AGY_BRIDGE_STEP_USAGE || "")
       turn.stepsFile = stepUsageEnabled ? sessionDbPath(this.sessionId, account.dir ? { AGY_BRIDGE_CONVERSATIONS_DIR: path.join(account.dir, "antigravity-cli", "conversations") } : process.env) : null
@@ -2140,6 +2171,7 @@ class Proc {
           sessionId: this.sessionId,
         })
         turn.promptInFlight = true
+        this.trace?.mark("prompt_dispatch_ms")
         let result
         try {
           if (serviceStatus.get()) throw this.#formatAgentError(TOS_MESSAGE)
@@ -2280,6 +2312,9 @@ class Proc {
     this.conn.notify("session/cancel", { sessionId: this.sessionId })
     const timer = setTimeout(() => {
       if (!turn.finalized) {
+        this.historyInvalid = true
+        unpark(this.convKey)
+        logBridgeEvent(this, turn, "cancel_timeout", "cancel_not_acknowledged", { reqId: turn.cancelReqId })
         dropFromPool(this)
         this.stop().catch(() => {})
       }
@@ -2568,11 +2603,11 @@ class Proc {
           await execOnce("taskkill", ["/T", "/F", "/PID", String(child.pid)], { timeoutMs: 3_000 })
         } else {
           try { child.kill("SIGTERM") } catch {}
-          await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 3_000))])
+          await waitBounded(closed, 3_000)
         }
         if (alive()) {
           try { child.kill("SIGKILL") } catch {}
-          await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 1_000))])
+          await waitBounded(closed, 1_000)
         }
       }
     }
@@ -2754,7 +2789,8 @@ function readStateFile() {
 function validEntry(entry) {
   return entry && typeof entry.key === "string" && typeof entry.sessionId === "string" &&
     typeof entry.historyHash === "string" && typeof entry.instructionsHash === "string" &&
-    Number.isFinite(entry.at) && Date.now() - entry.at <= RESUME_TTL_MS
+    /^[A-Za-z0-9_-]{1,200}$/.test(entry.sessionId) &&
+    Number.isFinite(entry.at) && entry.at <= Date.now() && Date.now() - entry.at <= RESUME_TTL_MS
 }
 
 function loadParked() {
@@ -2847,6 +2883,7 @@ function park(proc) {
     instructionsHash: digest(sentInstructionsIdentity(proc.instructions)),
     minimalAgent: proc.minimalAgent,
     workDir: proc.workDir,
+    binding: sessionBinding(proc),
     at: Date.now(),
   })
   while (parked.size > MAX_PARKED) parked.delete(parked.keys().next().value)
@@ -2860,8 +2897,19 @@ function takeParked(convKey, opts) {
   parked.delete(convKey)
   unparked.add(convKey)
   saveParked()
+  if (!validEntry(entry)) {
+    opts.trace?.context({ resume: "invalid_checkpoint" })
+    return null
+  }
+  if (entry.binding !== sessionBinding(opts)) {
+    opts.trace?.context({ resume: "binding_mismatch" })
+    return null
+  }
   if (entry.minimalAgent !== opts.minimalAgent || Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
-    entry.instructionsHash !== digest(sentInstructionsIdentity(opts.instructions))) return null
+    entry.instructionsHash !== digest(sentInstructionsIdentity(opts.instructions))) {
+    opts.trace?.context({ resume: "context_mismatch" })
+    return null
+  }
   const incoming = digest(historyKey(opts.history))
   if (entry.historyHash === incoming) return { sessionId: entry.sessionId, expectedMessages: opts.history }
   // Sans-inputs resume needs the hashes written by current park(). Old
@@ -2870,7 +2918,10 @@ function takeParked(convKey, opts) {
   const incomingIds = toolUseIdentitiesKey(opts.history)
   const idsOk = incomingIds != null && entry.toolUseIdentitiesHash === digest(incomingIds)
   const sansOk = entry.historyHashSansInputs === incomingSans || entry.historyHash === incomingSans
-  if (!idsOk || !sansOk) return null
+  if (!idsOk || !sansOk) {
+    opts.trace?.context({ resume: "history_mismatch" })
+    return null
+  }
   return { sessionId: entry.sessionId, expectedMessages: opts.history }
 }
 
@@ -2938,25 +2989,23 @@ idleTimer.unref()
 
 const acquireLocks = new Map()
 
-async function withAcquireLock(key, fn) {
+async function withAcquireLock(key, fn, signal) {
   const previous = acquireLocks.get(key) || Promise.resolve()
-  let release
-  const current = new Promise((resolve) => { release = resolve })
-  acquireLocks.set(key, current)
-  await previous
-  try {
-    return await fn()
-  } finally {
-    release()
-    if (acquireLocks.get(key) === current) acquireLocks.delete(key)
-  }
+  const task = previous.then(() => { throwIfAborted(signal); return fn() })
+  // A cancelled waiter must not release the owner ahead of it, or let a later
+  // waiter enter early. Keep the chain; instrumentFetch cancels the caller
+  // independently, while this task still owns its locks until cleanup finishes.
+  const tail = task.then(() => {}, () => {})
+  acquireLocks.set(key, tail)
+  tail.then(() => { if (acquireLocks.get(key) === tail) acquireLocks.delete(key) })
+  return task
 }
 
-async function withAcquireLocks(keys, fn) {
+async function withAcquireLocks(keys, fn, signal) {
   const unique = [...new Set(keys.filter(Boolean))].sort()
   const run = (index) => {
     if (index >= unique.length) return fn()
-    return withAcquireLock(unique[index], () => run(index + 1))
+    return withAcquireLock(unique[index], () => run(index + 1), signal)
   }
   return run(0)
 }
@@ -2970,7 +3019,10 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
   let extra = null
   for (let attempt = 0; ; attempt++) {
     const keys = extra && extra !== convKey ? [convKey, extra] : [convKey]
+    const endQueue = opts.trace?.span("lock_wait")
     const outcome = await withAcquireLocks(keys, async () => {
+      endQueue?.()
+      throwIfAborted(opts.signal)
       const locked = new Set(keys)
       if (isFreshConversation && !forceNew && !pool.get(convKey)) {
         const candidate = findLiveContinuedProc(opts)
@@ -2978,8 +3030,9 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
         if (needed && !locked.has(needed) && attempt < 2) return { retry: needed }
       }
       const value = await acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew, locked)
+      throwIfAborted(opts.signal)
       return { value: begin ? { ...value, turn: await begin(value.proc, value.history) } : value }
-    })
+    }, opts.signal).finally(() => endQueue?.())
     if (outcome.retry) {
       extra = outcome.retry
       continue
@@ -2990,8 +3043,10 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
 
 // Caller holds the conversation lock; recovery must not acquire it recursively.
 async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew = false, lockedKeys = new Set([convKey])) {
+  throwIfAborted(opts.signal)
   if (serviceStatus.get()) throw new Error(SUSPENSION_MESSAGE)
   await evictIdle()
+  throwIfAborted(opts.signal)
   if (isFreshConversation && !forceNew && !opts.hasToolResults) {
     // Concurrent models share the original acquisition lock, but secondary
     // processes have suffixed pool keys. Resends must check those owners too.
@@ -3005,7 +3060,8 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
   }
   let existing = pool.get(convKey)
   if (existing?.turn?.cancelRequested) {
-    await Promise.race([existing.turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
+    await waitBounded(existing.turn.settled, CANCEL_SETTLE_MS)
+    throwIfAborted(opts.signal)
   }
   if (existing && !existing.dead && existing.turn && !existing.retiring &&
     staleTurnVerdict(existing, existing.turn).stale) {
@@ -3062,11 +3118,14 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     }
     const continuedFresh = isFreshConversation && existing.hasSentFirstTurn &&
       isContinuedOpening(existing, Array.isArray(opts.messages) ? opts.messages[0] : null)
-    const compatible = !forceNew && !existing.dead && !existing.retiring &&
+    const compatible = !forceNew && !existing.dead && !existing.retiring && !existing.historyInvalid &&
+      (existing.sessionScope || existing.userId || "") === (opts.sessionScope || opts.userId || "") &&
       existing.minimalAgent === opts.minimalAgent &&
       existing.workDir === opts.workDir && sameInstructions(existing.instructions, opts.instructions) &&
       (existing.matchesHistory(matchedHistory) || continuedFresh)
     if (compatible && (!(isFreshConversation && existing.hasSentFirstTurn) || continuedFresh)) {
+      await existing.updateTools(opts.tools)
+      throwIfAborted(opts.signal)
       if (continuedFresh) {
         const first = Array.isArray(opts.messages) ? opts.messages[0] : null
         // Snapshot the unsent tail before openingText advances to this turn.
@@ -3074,7 +3133,8 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
         existing.openingText = openingTextOf(first) || existing.openingText
         existing.openingImages = openingImagesOf(first)
       }
-      await existing.updateTools(opts.tools)
+      existing.trace = opts.trace
+      opts.trace?.context({ session: "reused" })
       return { proc: existing, history: matchedHistory }
     }
     why = forceNew ? "forced" : existing.dead ? "dead" : existing.retiring ? "retiring" :
@@ -3091,15 +3151,18 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       throw new BusyError(`agy bridge: ${maxProcs()} agy processes are running and all have unfinished responses`)
     }
   }
+  throwIfAborted(opts.signal)
   const resume = forceNew || isFreshConversation ? null : takeParked(convKey, opts)
   const proc = new Proc(agyPath, key, { ...opts, resume })
   try {
-    await proc.start()
+    await proc.measure("startup", () => proc.start(opts.signal))
+    throwIfAborted(opts.signal)
   } catch (error) {
     await proc.stop().catch(() => {})
     throw error
   }
   pool.set(key, proc)
+  opts.trace?.context({ session: proc.resumed ? "resumed" : "new", session_reason: why })
   // Why this request got a new agy session, so a cache that never hits can be
   // traced to the check that failed (#1058). Counts only, never content.
   logSessionEvent(proc, why, {
@@ -3283,7 +3346,9 @@ async function reclaimStaleTurn(proc, turn, note = "agy bridge: stale tool turn 
 // `ctx.attempts` set means the no-progress repeat limit was reached: a quiet
 // turn is then reclaimed even if it is not provably stale (never an attached one).
 async function recoverStaleTurn(ctx) {
+  const endQueue = ctx.acquireOpts.trace?.span("lock_wait")
   return withAcquireLock(ctx.convKey, async () => {
+    endQueue?.()
     const current = pool.get(ctx.convKey)
     const held = current?.turn
     const forced = ctx.attempts != null
@@ -3320,7 +3385,7 @@ async function recoverStaleTurn(ctx) {
     const turn = await ctx.begin(proc, history)
     logBridgeEvent(proc, turn, "replay_started", reason, ctx.acquireOpts, { ...extra, replaced_turn_id: held.turnId })
     return { kind: "replayed", proc, turn }
-  })
+  }, ctx.acquireOpts.signal).finally(() => endQueue?.())
 }
 
 function stableJSON(value) {
@@ -3742,14 +3807,14 @@ function isContinuedOpening(proc, firstMessage) {
 function findLiveContinuedProc(opts) {
   const first = Array.isArray(opts?.messages) ? opts.messages[0] : null
   if (!first) return null
-  const userId = opts.userId || ""
+  const scope = opts.sessionScope || opts.userId || ""
   let best = null
   let bestLen = -1
   let tied = false
   for (const proc of pool.values()) {
     if (proc.dead || proc.retiring || proc.turn) continue
     if (proc.minimalAgent !== opts.minimalAgent) continue
-    if ((proc.userId || "") !== userId) continue
+    if ((proc.sessionScope || proc.userId || "") !== scope || proc.historyInvalid) continue
     if (proc.workDir !== opts.workDir) continue
     if (!sameInstructions(proc.instructions, opts.instructions)) continue
     if (!proc.hasSentFirstTurn) continue
@@ -3900,7 +3965,11 @@ function lastAssistantCalls(messages) {
 }
 
 function matchToolResults(body, blocks) {
+  const scope = requestScope(body)
   const direct = blocks.map(block => ({ block, match: toolCalls.get(block.tool_use_id) }))
+  if (direct.some(item => item.match && (item.match.proc.sessionScope || item.match.proc.userId || "") !== scope)) {
+    throw Object.assign(new Error("agy bridge: tool results belong to a different user or session"), { statusCode: 409 })
+  }
   if (direct.every(item => item.match)) return direct
   const { history } = trailingMessages(body)
   const calls = lastAssistantCalls(history)
@@ -3909,6 +3978,7 @@ function matchToolResults(body, blocks) {
     blocks.some(block => !byID.has(block.tool_use_id))) return direct
   let found = null
   for (const proc of allProcs) {
+    if ((proc.sessionScope || proc.userId || "") !== scope) continue
     if (!proc.turn || proc.turn.finalized || !proc.matchesHistory(history)) continue
     const shown = lastAssistantCalls(proc.expectedMessages)
     if (shown.length !== calls.length || shown.some((call, index) =>
@@ -3973,6 +4043,28 @@ function sameInstructions(a, b) {
   return instructionsIdentity(a) === instructionsIdentity(b)
 }
 
+const TRANSPORT_SCOPE = Symbol("magpie-session-scope")
+
+// Explicit opaque session IDs disambiguate identical openings. Missing IDs retain
+// legacy history matching; this is not authentication and must come from a trusted host.
+function requestScope(body) {
+  const metadata = body.metadata || {}
+  for (const key of ["user_id", "session_id"]) {
+    if (metadata[key] != null && (typeof metadata[key] !== "string" || metadata[key].length > 1024)) {
+      throw Object.assign(new Error(`metadata.${key} must be a string of at most 1024 characters`), { statusCode: 400 })
+    }
+  }
+  const user = metadata.user_id || ""
+  const [session = "", subagent = ""] = body[TRANSPORT_SCOPE] || []
+  return user || metadata.session_id || session || subagent
+    ? JSON.stringify([user, metadata.session_id || "", session, subagent]) : ""
+}
+
+function sessionBinding(opts) {
+  return digest(JSON.stringify([path.resolve(account.dir || path.join(os.homedir(), ".gemini")),
+    opts.sessionScope || opts.userId || "", opts.workDir ?? null]))
+}
+
 // The model is not part of the key: agy switches models inside a live session.
 function conversationKey(rawBody) {
   const body = canonicalBody(rawBody)
@@ -3984,7 +4076,7 @@ function conversationKey(rawBody) {
   // does not change the key. Agent billing headers and opening reminder clocks
   // are stripped; user text is not.
   const firstText = first ? historyKey([first]) : ""
-  const discriminator = body.metadata?.user_id || ""
+  const discriminator = requestScope(body)
   const source = discriminator + "\n" + system + "\n===\n" + firstText
   return createHash("sha256").update(source).digest("hex")
 }
@@ -5451,7 +5543,7 @@ function thinkingSignature(sessionId, thinking) {
     createHmac("sha256", THINKING_KEY).update(String(sessionId) + "\n" + thinking).digest("base64url")
 }
 
-function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.registerResponse(body)) {
+function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.registerResponse(body), trace) {
   const encoder = new TextEncoder()
   const responseContent = []
   const forwardThinking = FORWARD_THINKING && body.thinking?.type !== "disabled"
@@ -5468,6 +5560,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
       : { type: "thinking", thinking: open.text }] : []),
   ]
 
+  const readAbort = new AbortController()
   return new ReadableStream({
     async start(controller) {
       const send = (event, data) => controller.enqueue(encoder.encode(sseEvent(event, data)))
@@ -5490,6 +5583,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
       }
       const emitDelta = (type, text) => {
         if (!text) return
+        trace?.output(type)
         if (open?.type !== type) {
           closeBlock()
           send("content_block_start", {
@@ -5507,6 +5601,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
         })
       }
       const emitToolUse = (call) => {
+        trace?.output("tool")
         closeBlock()
         send("content_block_start", {
           type: "content_block_start",
@@ -5526,7 +5621,9 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
       }
       const detach = () => {
         finished = true
+        readAbort.abort()
         turn.detach()
+        if (proc.trace === trace) proc.trace = null
         if (pingTimer) clearInterval(pingTimer)
         pingTimer = null
         if (signal && abortHandler) signal.removeEventListener("abort", abortHandler)
@@ -5548,6 +5645,8 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
       }
       const abort = () => {
         if (finished) return
+        trace?.finish("cancelled", 499)
+        turn.cancelReqId = trace?.id
         detach()
         if (!proc.cancelTurn(turn, partial())) {
           dropFromPool(proc)
@@ -5582,7 +5681,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
         }, PING_INTERVAL_MS)
 
         for (;;) {
-          const event = await turn.next()
+          const event = await turn.next(0, readAbort.signal)
           if (finished) return
           if (event.type === "text") {
             emitDelta("text", event.text)
@@ -5602,7 +5701,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             for (;;) {
               const remaining = batchDeadline - performance.now()
               if (!turn.events.length && (remaining <= 0 || turn.done || turn.cancelRequested || turn.finalized)) break
-              const next = turn.events.length ? turn.events.shift() : await turn.next(remaining, signal)
+              const next = turn.events.length ? turn.events.shift() : await turn.next(remaining, readAbort.signal)
               if (finished) return
               if (!next) break
               if (next.type !== "tool") {
@@ -5617,10 +5716,11 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
               }
               if (performance.now() >= batchDeadline) break
             }
-            const usage = await settleUsage(proc, turn, step, responseContent)
+            const usage = await (trace ? trace.measure("usage_settlement", () => settleUsage(proc, turn, step, responseContent)) : settleUsage(proc, turn, step, responseContent))
             if (finished) return
             stopMessage("tool_use", usage, false, step.usageKind === "agy_model_call")
             proc.recordAssistantResponse(turn, responseContent)
+            trace?.finish("tool_use", 200)
             detach()
             controller.close()
             return
@@ -5628,11 +5728,12 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
           if (event.type === "result") {
             closeBlock()
             turn.rawUsage = event.result.usage ?? turn.rawUsage
-            const usage = await settleUsage(proc, turn, step, responseContent, event.result)
+            const usage = await (trace ? trace.measure("usage_settlement", () => settleUsage(proc, turn, step, responseContent, event.result)) : settleUsage(proc, turn, step, responseContent, event.result))
             if (finished) return
             stopMessage(STOP_REASONS[event.result.stopReason] || "end_turn", usage, true, event.result.stopReason !== "cancelled")
             proc.recordAssistantResponse(turn, responseContent)
             proc.finalizeTurn(turn)
+            trace?.finish(event.result.stopReason === "cancelled" ? "cancelled" : "completed", 200)
             detach()
             controller.close()
             return
@@ -5649,6 +5750,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             }
             if (finished) return
             proc.finalizeTurn(turn)
+            trace?.finish("error", event.error?.statusCode ?? (event.error?.kind === "rate_limit_error" ? 429 : event.error?.kind === "invalid_request_error" ? 400 : 502))
             detach()
             controller.close()
             return
@@ -5660,6 +5762,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
         dropFromPool(proc)
         await proc.stop().catch(() => {})
         if (finished) return
+        trace?.finish("error", error?.statusCode ?? 502)
         try {
           closeBlock()
           send("error", {
@@ -5823,11 +5926,12 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
   })
 }
 
-function streamResponse(proc, turn, body, signal) {
+function streamResponse(proc, turn, body, signal, trace) {
+  if (trace) trace.streaming = true
   turn.attach()
   const step = turn.registerResponse(body)
   const msgId = "msg_" + randomUUID().replace(/-/g, "").slice(0, 24)
-  const stream = makeAnthropicStream(proc, turn, body, msgId, signal, step)
+  const stream = makeAnthropicStream(proc, turn, body, msgId, signal, step, trace)
   if (body.stream === false) {
     return jsonResponseFromStream(stream, body.model, msgId)
   }
@@ -5887,6 +5991,34 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, a
     proc.omittedHistoryTokens = promptClipped ? rawEstimate - sentEstimate : 0
   }
   return proc.startTurn(contentParts, body.messages, model, selection)
+}
+
+let timingWindow = 0, timingRows = 0, timingDropped = 0
+function emitRequestTrace(row) {
+  const now = Date.now()
+  if (now - timingWindow >= 60_000) { timingWindow = now; timingRows = 0 }
+  if (timingRows++ >= 120) { timingDropped++; return }
+  if (timingDropped) { row.suppressed = timingDropped; timingDropped = 0 }
+  try { process.stderr.write("[agy-bridge] " + JSON.stringify(row) + "\n") } catch {}
+}
+function instrumentFetch(handler) {
+  return async (input, init = {}) => {
+    const signal = init.signal ?? input?.signal
+    const trace = createRequestTrace({ enabled: readRequestTimingsOption ? readRequestTimingsOption() === true : process.env.AGY_BRIDGE_TIMINGS === "1", emit: emitRequestTrace })
+    trace.context({ account: digest(account.dir || "default").slice(0, 12) })
+    try {
+      throwIfAborted(signal)
+      // Honour Request objects as well as the fetch(url, init) shape.
+      const body = init.body ?? (typeof input?.text === "function" ? await waitWithSignal(input.text(), signal) : undefined)
+      const response = await waitWithSignal(handler(input, { ...init, body, signal, headers: init.headers ?? input?.headers }, trace), signal)
+      if (!trace.streaming) trace.finish(response.status >= 400 ? "rejected" : "completed", response.status)
+      return response
+    } catch (error) {
+      trace.finish(signal?.aborted ? "cancelled" : "error", signal?.aborted ? 499 : 502)
+      throwIfAborted(signal)
+      throw error
+    }
+  }
 }
 
 const createPlugin = async () => {
@@ -5956,7 +6088,7 @@ const createPlugin = async () => {
         return {
           baseURL: "agy://local",
           apiKey: "agy",
-          fetch: async (fetchInput, init = {}) => {
+          fetch: instrumentFetch(async (fetchInput, init = {}, trace) => {
             const requestUrl = typeof fetchInput === "string"
               ? fetchInput
               : fetchInput instanceof URL
@@ -5996,6 +6128,11 @@ const createPlugin = async () => {
               const raw = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body)
               body = JSON.parse(raw)
               validateBody(body)
+              const headers = new Headers(init.headers || {})
+              const transport = [headers.get("x-magpie-session") || "", headers.get("x-magpie-subagent") || ""]
+              if (transport.some(id => id.length > 1024)) throw Object.assign(new Error("Magpie session headers must be at most 1024 characters"), { statusCode: 400 })
+              body[TRANSPORT_SCOPE] = transport
+              requestScope(body)
             } catch (error) {
               return jsonError(error.statusCode ?? 400, error.message)
             }
@@ -6006,9 +6143,11 @@ const createPlugin = async () => {
             // derives a key, instructions or history from the body.
             const layout = requestLayout(body)
             body = { ...canonicalBody(body), model: requestedModel }
-            const model = resolveAgyModel(await loadModelCatalog(agy), requestedModel, body)
+            const model = resolveAgyModel(await trace.measure("catalog", () => waitWithSignal(loadModelCatalog(agy), init.signal)), requestedModel, body)
+            throwIfAborted(init.signal)
             const selection = { model: requestedModel, effort: requestedEffort(body) }
             const convKey = conversationKey(body)
+            trace.context({ conv: digest(convKey).slice(0, 12), explicit_session: !!(body.metadata?.session_id || body[TRANSPORT_SCOPE]?.[0]), identity_source: body[TRANSPORT_SCOPE]?.[0] ? "magpie_header" : body.metadata?.session_id ? "metadata" : "legacy", nonstream: body.stream === false })
             const trailing = trailingMessages(body)
             const isFresh = trailing.history.length === 0
             const resultBlocks = extractToolResults(body)
@@ -6018,17 +6157,18 @@ const createPlugin = async () => {
 
             try {
               const tools = normalizeTools(body)
+              const resultMatches = resultBlocks.length ? matchToolResults(body, resultBlocks) : []
               for (const message of body.messages) {
                 if (message.role !== "assistant" || !Array.isArray(message.content)) continue
                 for (const block of message.content) {
                   if (block?.type !== "tool_use") continue
                   const entry = toolCalls.get(block.id)
-                  if (!entry || entry.call.clientSeen) continue
+                  if (!entry || entry.call.clientSeen || (entry.proc.sessionScope || entry.proc.userId || "") !== requestScope(body)) continue
                   entry.call.clientSeen = true
                   entry.turn.touchClient()
                 }
               }
-              const reqId = "req_" + randomBytes(4).toString("hex")
+              const reqId = trace.id
               rememberRequestMeta(reqId, { layout, nonstream: body.stream === false })
               // Same conversation, other layout: one key, no replacement session.
               // Routine for some clients, so reported only in verbose mode.
@@ -6038,12 +6178,12 @@ const createPlugin = async () => {
               }
               const acquireOpts = { model, selection, minimalAgent: minimalAgent(), tools, workDir, instructions, history: trailing.history,
                 messages: body.messages, layout, nonstream: body.stream === false, reqId, convKey,
-                hasToolResults: resultBlocks.length > 0, userId: body.metadata?.user_id || "" }
+                hasToolResults: resultBlocks.length > 0, userId: body.metadata?.user_id || "", sessionScope: requestScope(body), signal: init.signal, trace }
               let answeredIds = null
-              const begin = (proc, history) => beginTurn(proc, history, body, callerWorkDir, model, selection, answeredIds)
+              const begin = (proc, history) => { throwIfAborted(init.signal); return beginTurn(proc, history, body, callerWorkDir, model, selection, answeredIds) }
               let keptSession = false
               if (resultBlocks.length) {
-                const matches = matchToolResults(body, resultBlocks)
+                const matches = resultMatches
                 const found = matches.filter((item) => item.match)
                 if (found.length) {
                   if (found.length !== matches.length) {
@@ -6110,14 +6250,18 @@ const createPlugin = async () => {
                     proc.abandonTurn(turn)
                     await proc.stop()
                   } else {
+                    throwIfAborted(init.signal)
+                    trace.context({ session: "tool_continuation" })
+                    proc.trace = trace
                     if (!proc.dead && !turn.done) {
                       // A tool catalog that lost or changed tools applies to the
                       // rest of this turn; a model change applies from the next prompt.
                       await proc.updateTools(tools)
+                      throwIfAborted(init.signal)
                       proc.continueWith(results)
                       proc.recordToolResults(turn, body.messages)
                     }
-                    return streamResponse(proc, turn, body, init.signal)
+                    return streamResponse(proc, turn, body, init.signal, trace)
                   }
                 }
                 const held = pool.get(convKey)
@@ -6139,7 +6283,7 @@ const createPlugin = async () => {
                   // replay this request's own tool round once, under one lock.
                   const recovery = await recoverStaleTurn({ agy, convKey, proc: held, turn: held.turn,
                     body, resultBlocks, acquireOpts, isFresh, begin, attempts })
-                  if (recovery.kind === "replayed") return streamResponse(recovery.proc, recovery.turn, body, init.signal)
+                  if (recovery.kind === "replayed") return streamResponse(recovery.proc, recovery.turn, body, init.signal, trace)
                   if (recovery.kind === "active") {
                     return jsonError(409, "agy bridge: no active MCP call matches these tool results")
                   }
@@ -6170,15 +6314,16 @@ const createPlugin = async () => {
                 resultBlocks.length > 0 && !keptSession,
                 begin,
               )
-              return streamResponse(proc, turn, body, init.signal)
+              return streamResponse(proc, turn, body, init.signal, trace)
             } catch (error) {
+              throwIfAborted(init.signal)
               if (isServiceSuspension(error.acpError) || isServiceSuspension(error.message)) {
                 serviceStatus.mark()
                 return jsonError(403, SUSPENSION_MESSAGE, "TOS_VIOLATION", { headers: { "X-Magpie-Sign-In": "expired" } })
               }
               return jsonError(error.statusCode ?? 502, error.message, error.code, { noRetry: error.noRetry })
             }
-          },
+          }),
         }
       },
     },
@@ -6315,6 +6460,8 @@ export const AntigravityBridgePlugin = async (input = {}) => {
     ? () => input.magpie.option("agy-cli", "minimal_agent") : null
   readAutoDisableOption = typeof input.magpie?.option === "function"
     ? () => input.magpie.option("agy-cli", "auto_disable_suspended") : null
+  readRequestTimingsOption = typeof input.magpie?.option === "function"
+    ? () => input.magpie.option("agy-cli", "request_timings") : null
   const legacy = await pluginFor(DEFAULT_ACCOUNT)
   const selected = async getAuth => resolveAccount(typeof getAuth === "function" ? await getAuth() : undefined,
     { allowMissing: typeof getAuth !== "function" })
@@ -6337,6 +6484,13 @@ export const AntigravityBridgePlugin = async (input = {}) => {
         description: "Use the local Magpie web account toggle after explicit TOS denial. Requires the existing MAGPIE_WEB_KEY and web listener on port 3430. Credentials are kept; recovery is manual.",
         descriptions: { zh: "明确检测到 TOS 封禁后，通过容器内 3430 端口的管理接口关闭该账号。复用已有 MAGPIE_WEB_KEY，保留账号凭据，解封后需手动恢复。接口失败时仍在插件内拦截，并显示原因。" },
         default: true,
+      }, {
+        key: "request_timings",
+        label: "Request timing diagnostics",
+        labels: { zh: "请求耗时诊断", "zh-TW": "請求耗時診斷" },
+        description: "Write bounded, content-free request timing rows to server logs. No prompts, credentials, tool arguments or account names. Applies to new requests.",
+        descriptions: { zh: "将分段耗时写入服务器日志，不记录提示词、凭据、工具参数或账号名称。每账号每分钟最多 120 条，从新请求生效。" },
+        default: process.env.AGY_BRIDGE_TIMINGS === "1",
       }],
       methods: [
         { ...legacy.auth.methods[0], label: "Use the existing CLI account (legacy default)" },

@@ -253,6 +253,46 @@ Magpie 界面的额度错误提示会在 `CLI error (redacted):` 后显示脱敏
 套餐 HTTP 的 401、普通 403、429 和网络超时不会把登录标记为失效；只有明确的服务停用 403 会隔离账号。额度失败保留 CLI 返回的具体原因。
 
 
+## 请求耗时诊断与会话隔离（0.2.16）
+
+在 Magpie **提供商 → agy-cli → 编辑 → 插件选项** 打开 **请求耗时诊断** 并保存；
+从新请求生效，不需要重启容器。旧宿主可用 `AGY_BRIDGE_TIMINGS=1`，Magpie 界面值优先。
+诊断默认关闭，写入容器日志而不是聊天正文：
+
+```sh
+docker logs --since 10m magpie 2>&1 | grep -F '"event":"agy_bridge_request"'
+```
+
+每账号每分钟最多 120 行，超出的行数在下一条可输出记录的 `suppressed` 中报告。
+日志包含请求 ID、账号/会话哈希、状态和单调时钟耗时；不记录账号名称、原始会话 ID、提示词、凭据或工具参数。
+
+- `stages_ms.catalog`：等待模型目录；`lock_wait`：插件内会话锁等待（**不含 Magpie 路由排队**）。
+- `stages_ms.startup`：冷启动总耗时，包含 `process_prepare`、`initialize`、`session_new` / `session_resume`、模型配置等阶段；嵌套阶段不能相加。
+- `prompt_dispatch_ms`、`acp_first_output_ms` / `acp_first_text_ms`：从插件收到请求到首次 prompt 发出、CLI 首事件/首正文。
+- `first_output_ms` / `first_text_ms`：到插件输出首个内容事件/首正文；前者也包括思考和工具。不是 SSE `message_start` 或心跳时间。
+- `after_first_output_ms`：首事件之后到本次响应结束，可能包含工具等待及额度计量，不能当作纯模型生成速度；`usage_settlement` 单独记录响应 token 计量耗时，**不是账号额度查询**。
+- `total_ms`：本次插件请求时长；`session` 为 `new`、`reused`、`resumed` 或 `tool_continuation`；`resume` 说明恢复失败/绑定不匹配等原因。
+- `status` 是结果分类（包括 SSE 内的错误），不一定是流式 HTTP 的外层 200；取消记为 `cancelled` / `499`，不是将 HTTP 499 发给客户端。
+- 非流式响应的首字时间也是内部流的时间，用户仍要等整条 JSON；反向代理缓冲、客户端网络耗时不在这里测量。
+
+**多用户接入必须提供稳定且不冲突的会话标识。** Chat Agent 调用 Magpie 时可携带
+`X-Magpie-Session: <服务端生成的用户与会话唯一标识>`，每轮及工具回传保持一致。
+插件使用 Magpie 转发的 `X-Magpie-Session`、`X-Magpie-Subagent`，以及请求体
+`metadata.user_id` / `metadata.session_id` 共同隔离会话。后两项只在宿主实际保留该字段时生效，
+不能假设 OpenAI → Anthropic 转换会保留任意 metadata。
+诊断中 `identity_source: magpie_header` 表示收到了会话头，`metadata` 表示收到显式体内会话 ID；
+`legacy` 表示仍依赖用户标识/历史匹配。没有身份字段的相同历史不能保证不同用户隔离。
+标识用于关联而非身份认证：后端必须鉴权并绑定用户，不要允许不可信客户端冒用其他用户的会话标识。
+
+跨用户/会话的活跃工具结果不会送入原会话；缓存恢复还校验账号 profile、工作目录、历史和提示词。
+旧的无绑定缓存或不匹配记录不恢复，改为使用本次请求自己的历史新建会话；不会删除账号登录。
+恢复失败只记录固定原因，不把 CLI 原始错误写入耗时日志。
+
+取消覆盖目录等待、会话锁等待、启动握手、流式和非流式生成。
+正常取消并完成 ACP 确认后，匹配历史的会话仍可复用；取消未确认默认等 15 秒后停止进程并释放槽位，
+失控会话不会再次恢复。完整工具响应正常结束不等于取消，仍允许下一请求回传工具结果。
+本次不修改 Magpie 的账号路由策略，也不增加隐式重试或工具重放。
+
 ## 环境变量
 
 | 变量 | 默认值 | 作用 |
@@ -260,6 +300,8 @@ Magpie 界面的额度错误提示会在 `CLI error (redacted):` 后显示脱敏
 | `AGY_PATH` | 按 PATH 查找 | 指定 agy 可执行文件 |
 | `AGY_BRIDGE_ACCOUNTS_DIR` | XDG 配置目录下的 `magpie-agy-cli/accounts` | 多账号凭据与状态根目录 |
 | `AGY_BRIDGE_MAX_PROCS` | 16 | 每个账号的 agy 进程池上限 |
+| `AGY_BRIDGE_TIMINGS` | 关闭 | 设为 `1` 输出无正文的分段耗时；Magpie「请求耗时诊断」界面值优先 |
+| `AGY_BRIDGE_CANCEL_SETTLE_MS` | 15000 | 等待取消确认的上限，可调低，不可超过 15 秒 |
 | `AGY_BRIDGE_THINKING` | 开启 | 设为 `0` 关闭思考摘要 |
 | `AGY_BRIDGE_EFFORT` | 未设置 | 强制思考等级：`minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
 | `AGY_BRIDGE_MINIMAL_AGENT` | 关闭 | 设为 `1` 去掉 agy 自带的提示组件；Magpie 界面保存的开关优先，见下文「精简 agent」 |

@@ -46,7 +46,7 @@ export const CATALOG_TTL_MS = 5 * 60 * 1000
 const RUNTIME_SPECIFIER = "agy-testkit:runtime"
 const RUNTIME_NAMES = ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "process", "fetch"]
 const RUNTIME_PRELUDE = `import { ${RUNTIME_NAMES.join(", ")} } from ${JSON.stringify(RUNTIME_SPECIFIER)};\n`
-const TEST_SEAMS = "Turn, allProcs, pool, execOnce, findAgy, canonicalBody, conversationKey, renderInitialPromptParts, reapOnExit"
+const TEST_SEAMS = "withAcquireLock, park, takeParked, parked, Turn, allProcs, pool, execOnce, findAgy, canonicalBody, conversationKey, renderInitialPromptParts, reapOnExit"
 const TEST_EXPORTS = `
 const { ${TEST_SEAMS} } = defaultRuntime;
 export { Turn as __agyTestTurn, allProcs as __agyTestAllProcs, pool as __agyTestPool,
@@ -261,6 +261,8 @@ class FakeAgy {
     } else if (method === "session/new" && this.kit.sessionNewError) {
       // Real agy 1.5.3 not signed in: {"code":-32000,"message":"Authentication required"}.
       this.send({ id, error: this.kit.sessionNewError })
+    } else if (method === "session/resume" && this.kit.sessionResumeError) {
+      this.send({ id, error: this.kit.sessionResumeError })
     } else if (method === "session/resume" && this.kit.sessionResume && params?.sessionId) {
       this.sessionId = params.sessionId
       if (this.token) this.control({ kind: "list" })
@@ -435,6 +437,7 @@ export async function createBridgeKit(options = {}) {
     spawnSyncs: [],
     execFiles: [],
     modelsBehavior: options.modelsBehavior ?? { stdout: modelsOutput(BASE_MODEL_ROWS) },
+    stderr: [],
     prompts: [],
     promptSerial: 0,
     defaultPrompt: null,
@@ -445,6 +448,7 @@ export async function createBridgeKit(options = {}) {
     supportsImages: options.supportsImages ?? false,
     sessionNewDelayMs: options.sessionNewDelayMs ?? 0,
     sessionResume: options.sessionResume ?? false,
+    sessionResumeError: options.sessionResumeError ?? null,
     agentVersion: options.agentVersion ?? "1.5.0",
     setModels: [],
     acpLog: [],
@@ -474,6 +478,7 @@ export async function createBridgeKit(options = {}) {
   const fakeProcess = new Proxy(process, {
     get(target, property) {
       if (property === "env") return kit.env
+      if (property === "stderr" && options.captureStderr) return { write(text) { kit.stderr.push(String(text)); return true } }
       // Windows paths (nc.exe, taskkill) run on any test machine.
       if (property === "platform" && options.platform) return options.platform
       if (property === "execPath" && options.execPath) return options.execPath
@@ -580,6 +585,7 @@ export async function createBridgeKit(options = {}) {
     else if (key === "./cloak.mjs") module = sourceModule(CLOAK_FILE, "", cloakUrl)
     else if (key === "./login.mjs") module = sourceModule(LOGIN_FILE, "", loginUrl)
     else if (key === "./re2-pattern.mjs") module = sourceModule(RE2_PATTERN_FILE, "", re2Url)
+    else if (key === "./request-lifecycle.mjs") module = sourceModule(path.join(REPO_DIR, "request-lifecycle.mjs"), "", new URL("./request-lifecycle.mjs", indexUrl).href)
     else if (key === "./turn-outcome.mjs") module = sourceModule(path.join(REPO_DIR, "turn-outcome.mjs"), "", new URL("./turn-outcome.mjs", indexUrl).href)
     else if (key === "./step-usage.mjs") module = sourceModule(STEP_USAGE_FILE, "", stepUsageUrl)
     else if (key === "./accounts.mjs") module = sourceModule(path.join(REPO_DIR, "accounts.mjs"), "", new URL("./accounts.mjs", indexUrl).href)

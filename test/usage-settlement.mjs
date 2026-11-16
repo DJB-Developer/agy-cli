@@ -365,7 +365,7 @@ test("并行工具调用合并为一次响应，只结算一次", async () => {
 test("跨事件循环的 13 个并行 MCP 调用合并：旧版 14 次 HTTP，新版 2 次", async () => {
   const observe = async (legacy, stream) => withKit({
     ...(legacy ? { indexTransform: (source) => {
-      const pattern = /            const emittedIds = new Set\(\[event.call.id\]\)[\s\S]*?(?=            const usage = await settleUsage)/
+      const pattern = /            const emittedIds = new Set\(\[event.call.id\]\)[\s\S]*?(?=            const usage = await )/
       assert.match(source, pattern, "旧版对照必须只恢复原来的即时队列排空逻辑")
       return source.replace(pattern, '            while (turn.events[0]?.type === "tool") emitToolUse(turn.events.shift().call)\n')
     } } : {}),
