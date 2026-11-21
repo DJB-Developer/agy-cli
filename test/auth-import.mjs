@@ -19,9 +19,30 @@ async function client(kit, auth) {
   const loaded = await kit.plugin.auth.loader(typeof auth === "function" ? auth : async () => auth)
   return body => loaded.fetch(MESSAGES_URL, { method: "POST", body: JSON.stringify(body) })
 }
+function setAccess(kit, name, { access = `access-${name}`, expiry = "2099-01-01T00:00:00Z" } = {}) {
+  kit.env.AGY_BRIDGE_STORED_SIGNIN = ""
+  const file = fileOf(kit, name)
+  const saved = JSON.parse(fs.readFileSync(file, "utf8"))
+  saved.token.access_token = access
+  saved.token.expiry = expiry
+  fs.writeFileSync(file, JSON.stringify(saved))
+}
+const summary = (remaining = 0.8) => ({ groups: [
+  { displayName: "Gemini Models", buckets: [{ bucketId: "gemini-weekly", window: "weekly", remainingFraction: remaining }] },
+  { displayName: "Claude and GPT models", buckets: [{ bucketId: "3p-5h", window: "5h", remainingFraction: 0 }] },
+] })
 async function withKit(options, fn) {
-  const kit = await createBridgeKit(options)
-  try { await fn(kit) } finally { await kit.dispose() }
+  let unexpectedHttp = 0
+  const kit = await createBridgeKit({
+    fetch: async () => { unexpectedHttp++; throw Error("Unexpected external HTTP") },
+    // Keep the old transport healthy for reverse checks: failures must prove
+    // that quota reads still spawned CLI, not merely that its version was absent.
+    onSpawn: (_file, args) => args.includes("--version") ? { stdout: "1.5.9\n" }
+      : args.includes("/usage") ? { stdout: JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: summary() } }) } : 0,
+    ...options,
+  })
+  try { await fn(kit); assert.equal(unexpectedHttp, 0, "tests must not make unmocked HTTP requests") }
+  finally { await kit.dispose() }
 }
 
 for (const platform of ["linux", "darwin", "win32"]) {
@@ -45,67 +66,59 @@ for (const platform of ["linux", "darwin", "win32"]) {
   })
 }
 
-test("Magpie uses CLI quota and optional HTTP plans; ordinary plan failures never block routing or ACP chat", async () => {
+test("Magpie uses HTTP quota and optional HTTP plans without spawning CLI queries or blocking ACP chat", async () => {
   const calls = []
   let mode = "ok", planSignal
   await withKit({
     env: { AGY_BRIDGE_STORED_SIGNIN: "" },
     fetch: async (url, init) => {
       calls.push({ url, token: init.headers.Authorization })
+      assert.equal(init.headers["User-Agent"], undefined, "do not send the unverified Hub identity")
+      if (url.endsWith(":retrieveUserQuotaSummary")) return Response.json(summary())
+      if (url.endsWith(":fetchAvailableModels")) return Response.json({ models: {} })
       assert.equal(url, "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
       assert.deepEqual(JSON.parse(init.body), { metadata: { ideType: "ANTIGRAVITY" } })
-      assert.equal(init.headers["User-Agent"], undefined, "do not send the unverified Hub identity")
       if (mode === "network") throw Error("private network error")
       if (mode === "invalid") return new Response("invalid json")
       if (mode === "timeout") { planSignal = init.signal; return new Promise(() => {}) }
       if (typeof mode === "number") return new Response("private upstream error", { status: mode })
-      // No project is needed for CLI quotas; ID-only tiers must still display.
       return Response.json({ paidTier: { id: init.headers.Authorization === "Bearer access-a" ? "g1-pro-tier" : "g1-ultra-tier" } })
-    },
-    onSpawn: (_file, args) => {
-      if (args.includes("--version")) return { stdout: "1.5.9\n" }
-      if (!args.includes("/usage")) return 0
-      const file = path.join(profileOf(args), "antigravity-cli", "antigravity-oauth-token")
-      const saved = JSON.parse(fs.readFileSync(file, "utf8"))
-      saved.token.access_token = `access-${nameOf(args)}`
-      saved.token.expiry = "2099-01-01T00:00:00Z"
-      fs.writeFileSync(file, JSON.stringify(saved))
-      return { stdout: JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups: [
-        { name: "Gemini Models", buckets: [{ id: "gemini-weekly", window: "weekly", remainingFraction: 0.8 }] },
-        { name: "Claude and GPT models", buckets: [{ id: "3p-5h", window: "5h", remainingFraction: 0 }] },
-      ] } } }) }
     },
   }, async kit => {
     const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
+    setAccess(kit, "a"); setAccess(kit, "b")
+    assert.equal(calls.length, 0, "import must not perform HTTP metadata probes")
     await Promise.all([kit.plugin.provider.models({}, { auth: authOf(a) }), kit.plugin.provider.models({}, { auth: authOf(b) })])
+    await kit.plugin.provider.warming?.()
+    const reads = kit.otherSpawns.length
     const readA = () => kit.plugin.auth.usage(async () => authOf(a))
     const [usageA, usageB, duplicateA] = await Promise.all([readA(), kit.plugin.auth.usage(async () => authOf(b)), readA()])
     assert.equal(usageA.plan, "Google AI Pro", usageA.error)
     assert.equal(usageB.plan, "Google AI Ultra", usageB.error)
     assert.equal(duplicateA.plan, usageA.plan)
-    assert.equal(calls.length, 2, "one optional HTTP plan query per account, including concurrent callers")
+    const planCalls = () => calls.filter(call => call.url.endsWith(":loadCodeAssist"))
+    assert.equal(planCalls().length, 2, "one plan query per account, including concurrent callers")
+    const keys = calls.map(call => `${call.token} ${call.url}`)
+    assert.equal(new Set(keys).size, keys.length, "concurrent callers share the whole metadata query")
     assert.deepEqual(new Set(calls.map(call => call.token)), new Set(["Bearer access-a", "Bearer access-b"]))
-    const cliReads = () => kit.otherSpawns.filter(s => s.args.includes("/usage")).length
-    assert.equal(cliReads(), 2)
+    assert.equal(kit.otherSpawns.length, reads, "HTTP metadata must not spawn --version or /usage")
     assert.deepEqual(usageA.windows.map(w => w.used), [20, 100])
     assert.ok(usageA.windows.every(w => !w.aside && w.models.length), JSON.stringify(usageA.windows))
     assert.ok(usageA.windows[0].models.every(id => id.startsWith("gemini-")))
     assert.ok(usageA.windows[1].models.every(id => /^(claude|gpt)-/.test(id)))
     for (mode of [401, 403, 429, 500, "network", "invalid", "timeout"]) {
-      const before = cliReads()
+      kit.clock.advance(10 * 60_000)
       const failed = await readA()
       assert.equal(failed.plan, undefined, `omit stale plan on ${mode}`)
       assert.deepEqual(failed.windows, usageA.windows)
       assert.equal(failed.signIn, "kept")
       assert.equal(failed.error, undefined)
-      assert.equal(cliReads(), before + 1, "every refresh reads CLI quota, even with a valid token")
+      assert.equal(kit.otherSpawns.length, reads)
     }
     assert.equal(planSignal.aborted, true)
     mode = "ok"
-    assert.equal((await readA()).plan, "Google AI Pro", "plan failure must not trigger quota/auth backoff")
-    mode = 403
-    const failed = await readA()
-    assert.equal(failed.plan, undefined)
+    kit.clock.advance(10 * 60_000)
+    assert.equal((await readA()).plan, "Google AI Pro", "plan failure must not trigger auth backoff")
     const before = calls.length
     kit.defaultPrompt = async agent => { await agent.text("CLI reply"); return { stopReason: "end_turn" } }
     const request = await client(kit, authOf(a))
@@ -132,6 +145,33 @@ test("failed and duplicate imports leave existing accounts and live requests unt
       assert.equal(fs.existsSync(path.join(rootOf(kit), "broken")), false)
       assert.equal(fs.readFileSync(fileOf(kit, "existing"), "utf8"), previous)
     } finally { kit.module.__agyTestAllProcs.delete(active) }
+  })
+})
+
+test("a removed Magpie row can reattach its saved profile without replacing credentials or service state", async () => {
+  await withKit({}, async kit => {
+    const original = await add(kit, "restore-me")
+    assert.equal(original.type, "success")
+    // Magpie owns its account rows; removing one leaves this CLI profile on disk.
+    const tokenBefore = fs.readFileSync(fileOf(kit, "restore-me"), "utf8")
+    const statusFile = path.join(rootOf(kit), "restore-me", "bridge-state", "service-status.json")
+    const status = JSON.stringify({ version: 1, reason: "TOS_VIOLATION" })
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+    fs.writeFileSync(statusFile, status)
+    const duplicate = await add(kit, "restore-me", "1//replacement-token")
+    assert.equal(duplicate.type, "failed")
+    assert.match(duplicate.error, /Use a saved named account/)
+    assert.match(duplicate.error, /removing.*Magpie.*does not delete/i)
+    assert.doesNotMatch(duplicate.error, /1\/\/replacement-token/)
+    const saved = await kit.plugin.auth.methods[3].authorize({ name: "RESTORE-ME" })
+    assert.equal(saved.method, "auto", saved.error)
+    assert.deepEqual(await saved.callback(), original)
+    assert.equal(fs.readFileSync(fileOf(kit, "restore-me"), "utf8"), tokenBefore)
+    assert.equal(fs.readFileSync(statusFile, "utf8"), status, "reattaching must not clear a suspension")
+    assert.equal(kit.modelsSpawns.length, 1, "restoring a reference does not import or revalidate another token")
+    const usage = await kit.plugin.auth.usage(async () => authOf(await saved.callback()))
+    assert.match(usage.error, /TOS_VIOLATION/)
+    assert.equal(kit.acpSpawns.length, 0, "restoring a reference does not restart a blocked account")
   })
 })
 
@@ -261,26 +301,16 @@ test("tool-result images steer within each named account's session without cross
 
 test("models and usage are scoped to host-selected auth and conflicting API environment cannot override it", async () => {
   await withKit({ env: { AGY_BRIDGE_STORED_SIGNIN: "", GEMINI_API_KEY: "global-key", AGY_ADC_AUTH: "1", WSL_INTEROP: "real-wsl" },
-    fetch: async url => {
-      assert.equal(url, "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
-      return Response.json({})
-    },
-    onSpawn: (_file, args, opts) => {
-      if (args.includes("--version")) return { stdout: "1.5.9\n" }
-      if (!args.includes("/usage")) return 0
-      assert.equal(opts.env.GEMINI_API_KEY, "")
-      assert.equal(opts.env.AGY_ADC_AUTH, "")
-      const file = path.join(profileOf(args), "antigravity-cli", "antigravity-oauth-token")
-      const saved = JSON.parse(fs.readFileSync(file, "utf8"))
-      saved.token.access_token = `access-${nameOf(args)}`
-      saved.token.expiry = "2099-01-01T00:00:00Z"
-      fs.writeFileSync(file, JSON.stringify(saved))
-      return { stdout: JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups: [{ name: "Gemini Models", buckets: [
-        { id: "weekly", remainingFraction: nameOf(args) === "a" ? 0.8 : 0.3 },
-      ] }] } } }) }
+    fetch: async (url, init) => {
+      assert.ok(["Bearer access-a", "Bearer access-b"].includes(init.headers.Authorization))
+      if (url.endsWith(":loadCodeAssist")) return Response.json({})
+      if (url.endsWith(":fetchAvailableModels")) return Response.json({ models: {} })
+      assert.ok(url.endsWith(":retrieveUserQuotaSummary"))
+      return Response.json(summary(init.headers.Authorization === "Bearer access-a" ? 0.8 : 0.3))
     },
   }, async kit => {
     const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
+    setAccess(kit, "a"); setAccess(kit, "b")
     const rows = args => ["high", "low"].map(effort => [`gemini-3.8-flash-${nameOf(args)}-${effort}`, `Account ${nameOf(args)} (${effort})`])
     kit.modelsBehavior = ({ args }) => ({ stdout: modelsOutput(rows(args)) })
     kit.offeredModels = rows
@@ -471,23 +501,57 @@ test("a late browser close cannot delete a new import after its error cleanup", 
   })
 })
 
-test("Magpie's named-account quota hook exposes the original error with credentials removed", async () => {
-  await withKit({ onSpawn: (_file, args) => {
-    if (args.includes("--version")) return { stdout: "1.5.9\n" }
-    if (args.includes("/usage")) return { stdout: JSON.stringify({ status: "FAILED", error: "Your current account is not eligible: country association unavailable", refresh_token: "private-account-token" }) }
-    return 0
+test("Magpie's named-account HTTP quota hook exposes the original error with credentials removed", async () => {
+  const calls = []
+  await withKit({ fetch: async url => {
+    calls.push(url)
+    if (url.endsWith(":loadCodeAssist")) return Response.json({ paidTier: { id: "g1-pro-tier" } })
+    return Response.json({ error: { code: 403, message: "Your current account is not eligible: country association unavailable", refresh_token: "private-account-token" } }, { status: 403 })
   } }, async kit => {
     const saved = await add(kit, "quota-ui")
+    setAccess(kit, "quota-ui")
+    const count = kit.otherSpawns.length
     const result = await kit.plugin.auth.usage(async () => authOf(saved))
     assert.equal(result.signIn, "kept")
-    assert.match(result.error, /CLI error \(redacted\):/)
+    assert.match(result.error, /HTTP.*redacted/i)
     assert.match(result.error, /country association unavailable/)
     assert.doesNotMatch(result.error, /private-account-token/)
-    const count = kit.otherSpawns.length
-    assert.deepEqual(await kit.plugin.auth.usage(async () => authOf(saved)), result)
+    assert.equal(result.plan, "Google AI Pro", "quota errors must not discard a successfully queried plan")
+    assert.ok(calls.length > 0)
     assert.equal(kit.otherSpawns.length, count)
+    assert.equal(fs.existsSync(path.join(rootOf(kit), "quota-ui", "bridge-state", "service-status.json")), false)
   })
 })
+
+for (const failure of [401, 403, 429, "expired"]) {
+  test(`HTTP quota ${failure} does not poison CLI authentication or infer a service ban`, async () => {
+    let calls = 0
+    await withKit({ fetch: async url => {
+      calls++
+      if (url.endsWith(":loadCodeAssist")) return Response.json({})
+      return Response.json({ error: { message: "Metadata not available" } }, { status: failure })
+    } }, async kit => {
+      const saved = await add(kit, "recoverable")
+      setAccess(kit, "recoverable", { expiry: failure === "expired" ? "2000-01-01T00:00:00Z" : "2099-01-01T00:00:00Z" })
+      const before = kit.otherSpawns.length
+      const result = await kit.plugin.auth.usage(async () => authOf(saved))
+      assert.equal(result.signIn, "kept", result.error)
+      assert.ok(result.error)
+      assert.deepEqual(result.windows, [])
+      assert.equal(kit.otherSpawns.length, before, "metadata failures cannot launch hidden CLI prompts")
+      if (failure === "expired") assert.equal(calls, 0, "expired credentials must not be sent to HTTP")
+      else assert.ok(calls > 0)
+      const httpBeforeChat = calls
+      const request = await client(kit, authOf(saved))
+      kit.defaultPrompt = async agent => { await agent.text("CLI still usable"); return { stopReason: "end_turn" } }
+      const reply = await readSse(await request(baseBody()))
+      assert.equal(reply.error, null)
+      assert.equal(reply.content[0].text, "CLI still usable")
+      assert.equal(calls, httpBeforeChat)
+      assert.equal(fs.existsSync(path.join(rootOf(kit), "recoverable", "bridge-state", "service-status.json")), false)
+    })
+  })
+}
 
 const TOS_MESSAGE = "This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product."
 test("quota-detected TOS automatically turns off that Magpie account and keeps its credentials", async () => {
@@ -507,13 +571,11 @@ test("quota-detected TOS automatically turns off that Magpie account and keeps i
       }
       return req
     },
-    onSpawn: (_file, args) => {
-      if (args.includes("--version")) return { stdout: "1.5.9\n" }
-      if (args.includes("/usage")) return { stdout: JSON.stringify({ status: "ERROR", error: TOS_MESSAGE }) }
-      return 0
-    },
+    fetch: async url => url.endsWith(":loadCodeAssist") ? Response.json({})
+      : new Response(TOS_MESSAGE, { status: 403 }),
   }, async kit => {
     const [a, b] = await Promise.all([add(kit, "blocked"), add(kit, "healthy")])
+    setAccess(kit, "blocked")
     const read = () => kit.plugin.auth.usage(async () => authOf(a))
     const usage = await read()
     assert.equal(usage.signIn, "expired")
@@ -658,13 +720,14 @@ test("quoting the TOS warning within an explanation is ordinary answer text", as
   }
 })
 
-test("CLI quota suspension blocks chat before optional HTTP plan lookup", async () => {
+test("explicit HTTP quota suspension overrides another endpoint and a successful plan", async () => {
   await withKit({
-    onSpawn: (_file, args) => args.includes("--version") ? { stdout: "1.5.9\n" }
-      : args.includes("/usage") ? { stdout: JSON.stringify({ status: "FAILED", error: TOS_MESSAGE }) } : 0,
-    fetch: () => assert.fail("a failed CLI quota must not query HTTP plan"),
+    fetch: async url => url.endsWith(":loadCodeAssist") ? Response.json({ paidTier: { id: "g1-pro-tier" } })
+      : url.startsWith("https://daily-cloudcode-pa.googleapis.com/") ? Response.json(summary())
+      : new Response(TOS_MESSAGE, { status: 403 }),
   }, async kit => {
     const a = await add(kit, "a")
+    setAccess(kit, "a")
     const usage = await kit.plugin.auth.usage(async () => authOf(a))
     assert.equal(usage.signIn, "expired")
     assert.match(usage.error, /TOS_VIOLATION/)
@@ -725,14 +788,15 @@ test("concurrent model openings keep each profile's CLI and tool results separat
   })
 })
 
-test("quota refresh observes explicit HTTP TOS suspension even when CLI quota succeeds", async () => {
+test("quota refresh observes explicit plan HTTP TOS suspension even when HTTP quota succeeds", async () => {
   const httpCalls = []
-  let cliReads = 0
   await withKit({
     env: { AGY_BRIDGE_STORED_SIGNIN: "" },
     fetch: async (url, init) => {
+      httpCalls.push({ url, token: init.headers.Authorization })
+      if (url.endsWith(":retrieveUserQuotaSummary")) return Response.json(summary())
+      if (url.endsWith(":fetchAvailableModels")) return Response.json({ models: {} })
       assert.equal(url, "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
-      httpCalls.push(init.headers.Authorization)
       if (init.headers.Authorization === "Bearer access-a") return Response.json({ error: {
         code: 403, status: "PERMISSION_DENIED", message: "Service disabled",
         details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "TOS_VIOLATION" }],
@@ -740,25 +804,15 @@ test("quota refresh observes explicit HTTP TOS suspension even when CLI quota su
       } }, { status: 403 })
       return Response.json({ paidTier: { id: "g1-pro-tier" } })
     },
-    onSpawn: (_file, args) => {
-      if (args.includes("--version")) return { stdout: "1.5.9\n" }
-      if (!args.includes("/usage")) return 0
-      cliReads++
-      const file = path.join(profileOf(args), "antigravity-cli", "antigravity-oauth-token")
-      const saved = JSON.parse(fs.readFileSync(file, "utf8"))
-      saved.token.access_token = `access-${nameOf(args)}`
-      saved.token.expiry = "2099-01-01T00:00:00Z"
-      fs.writeFileSync(file, JSON.stringify(saved))
-      return { stdout: JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups: [
-        { name: "Gemini Models", buckets: [{ id: "gemini-weekly", window: "weekly", remainingFraction: 0.8 }] },
-      ] } } }) }
-    },
   }, async kit => {
     const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
+    setAccess(kit, "a"); setAccess(kit, "b")
     const readA = () => kit.plugin.auth.usage(async () => authOf(a))
+    const before = kit.otherSpawns.length
     const [suspended, healthy, duplicate] = await Promise.all([readA(), kit.plugin.auth.usage(async () => authOf(b)), readA()])
-    assert.equal(httpCalls.length, 2, "both accounts must actually reach the metadata endpoint")
-    assert.equal(suspended.signIn, "expired", "CLI quota success must not hide an explicit metadata suspension")
+    const plans = httpCalls.filter(call => call.url.endsWith(":loadCodeAssist"))
+    assert.equal(plans.length, 2, "both accounts must actually reach the metadata endpoint")
+    assert.equal(suspended.signIn, "expired", "quota success must not hide an explicit plan suspension")
     assert.match(suspended.error, /403.*TOS_VIOLATION/)
     assert.doesNotMatch(suspended.error, /must-not-reach/)
     assert.equal(duplicate.error, suspended.error)
@@ -766,21 +820,23 @@ test("quota refresh observes explicit HTTP TOS suspension even when CLI quota su
     assert.equal(healthy.signIn, "kept")
     assert.equal(healthy.plan, "Google AI Pro")
     assert.equal(healthy.windows[0].used, 20)
-    assert.equal(cliReads, 2)
-    assert.equal(httpCalls.length, 2, "reuse the existing plan request; coalesce concurrent refreshes")
+    assert.equal(kit.otherSpawns.length, before)
+    const keys = httpCalls.map(call => `${call.token} ${call.url}`)
+    assert.equal(new Set(keys).size, keys.length, "coalesce concurrent refreshes")
     assert.equal(kit.acpSpawns.length, 0, "status refresh must not send an inference probe")
     const persisted = fs.readFileSync(path.join(rootOf(kit), "a", "bridge-state", "service-status.json"), "utf8")
     assert.equal(JSON.parse(persisted).reason, "TOS_VIOLATION")
     assert.doesNotMatch(persisted, /access-a|refresh_token|must-not-reach/)
+    const httpBefore = httpCalls.length
     assert.equal((await readA()).signIn, "expired")
     const requestA = await client(kit, authOf(a))
     assert.equal((await requestA(baseBody())).status, 403)
-    assert.equal(httpCalls.length, 2)
-    assert.equal(cliReads, 2)
+    assert.equal(httpCalls.length, httpBefore)
+    assert.equal(kit.otherSpawns.length, before)
     kit.defaultPrompt = async agent => { await agent.text("healthy CLI reply"); return { stopReason: "end_turn" } }
     const requestB = await client(kit, authOf(b))
     assert.equal((await readSse(await requestB(baseBody()))).content[0].text, "healthy CLI reply")
-    assert.equal(httpCalls.length, 2, "chat remains CLI-only")
+    assert.equal(httpCalls.length, httpBefore, "chat remains CLI-only")
   })
 })
 

@@ -22,6 +22,7 @@ for (const [name, mocks] of [
   ["prefill.mjs", false],
   ["usage.mjs", true],
   ["plan.mjs", false],
+  ["quota-http.mjs", false],
   ["signin.mjs", false],
   ["service-status.mjs", false],
   ["quarantine.mjs", false],

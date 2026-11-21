@@ -74,7 +74,7 @@ export function reserveAccount(input) {
   const dir = path.join(accountsRoot(), name)
   fs.mkdirSync(accountsRoot(), { recursive: true, mode: 0o700 })
   try { fs.mkdirSync(dir, { mode: 0o700 }) } catch (error) {
-    if (error.code === "EEXIST") throw new Error(`Account "${name}" already exists. Use its saved profile or choose another name.`)
+    if (error.code === "EEXIST") throw new Error(`Account "${name}" already exists on disk; removing its Magpie account row does not delete CLI credentials. To add it back, choose "Use a saved named account" and enter "${name}". To use a different refresh token, choose a new account name; existing credentials are never overwritten.`)
     throw new Error("Could not create the account directory. Check configuration volume permissions.")
   }
   return { name, dir }

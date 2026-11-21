@@ -698,8 +698,40 @@ const model = "agy-cli/gemini-test"
 const legacyModel = "agy-cli/gemini-test-low"
 
 {
-  const usage = await plugin.auth.usage(async () => ({ type: "api", key: "agy" }), {})
-  check("auth.usage exposes measured CLI quota", usage.windows?.[0]?.used === 40 && usage.windows[0].name === "Gemini · 7 days")
+  // Only metadata HTTP is mocked. All later chat tests still launch the real
+  // fake-CLI subprocess/ACP transport. No host credential or network is used.
+  const originalFetch = globalThis.fetch
+  const originalAccounts = process.env.AGY_BRIDGE_ACCOUNTS_DIR
+  const originalSignIn = process.env.AGY_BRIDGE_STORED_SIGNIN
+  const accounts = path.join(stateDir, "http-accounts")
+  const profile = path.join(accounts, "smoke")
+  fs.mkdirSync(path.join(profile, "antigravity-cli"), { recursive: true })
+  fs.writeFileSync(path.join(profile, ".ready"), "1\n")
+  fs.writeFileSync(path.join(profile, "antigravity-cli", "antigravity-oauth-token"), JSON.stringify({
+    token: { access_token: "fake-smoke-access", refresh_token: "fake-smoke-refresh", expiry: "2099-01-01T00:00:00Z" },
+  }), { mode: 0o600 })
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accounts
+  process.env.AGY_BRIDGE_STORED_SIGNIN = ""
+  const calls = []
+  const before = logs().length
+  let usage
+  globalThis.fetch = async (url, init) => {
+    if (!/^https:\/\/(?:daily-)?cloudcode-pa\.googleapis\.com\/v1internal:/.test(url)) throw Error("Unexpected metadata destination")
+    calls.push({ url, auth: init.headers.Authorization })
+    if (url.endsWith("loadCodeAssist") || url.endsWith("fetchAvailableModels")) return Response.json({})
+    return Response.json({ groups: [{ displayName: "Gemini Models", buckets: [{
+      bucketId: "gemini-weekly", window: "weekly", remainingFraction: 0.6, resetTime: "2026-10-27T00:00:00Z",
+    }] }] })
+  }
+  try { usage = await plugin.auth.usage(async () => ({ type: "api", key: "agy:smoke" }), {}) }
+  finally {
+    globalThis.fetch = originalFetch
+    if (originalAccounts === undefined) delete process.env.AGY_BRIDGE_ACCOUNTS_DIR
+    else process.env.AGY_BRIDGE_ACCOUNTS_DIR = originalAccounts
+    if (originalSignIn === undefined) delete process.env.AGY_BRIDGE_STORED_SIGNIN
+    else process.env.AGY_BRIDGE_STORED_SIGNIN = originalSignIn
+  }
+  check("auth.usage exposes measured HTTP quota", usage.windows?.[0]?.used === 40 && usage.windows[0].name === "Gemini · 7 days")
   check("auth.usage preserves explicit cadence and reset", usage.windows?.[0]?.span === 604800 && usage.windows[0].resetsAt === "2026-10-27T00:00:00.000Z")
   check("auth.usage participates in routing and keeps bridge auth", usage.windows?.[0]?.aside === false && usage.signIn === "kept")
   const quotaModels = usage.windows?.[0]?.models ?? []
@@ -707,9 +739,8 @@ const legacyModel = "agy-cli/gemini-test-low"
     ["gemini-3.8-flash", "gemini-3.8-flash-high", "gemini-3.8-flash-low"].every(id => quotaModels.includes(id)) &&
     quotaModels.every(id => id.startsWith("gemini-")))
   check("auth.usage does not invent Google account identity", !usage.user && !usage.plan)
-  const calls = logs().filter(event => event.type === "usage")
-  check("auth.usage uses a separate cleaned workspace", calls.length === 1 && !fs.existsSync(calls[0].cwd))
-  check("auth.usage runs only the native usage command", calls[0]?.args.includes("/usage") && calls[0]?.args.includes("magpie-usage"))
+  check("auth.usage never launches CLI or creates a usage workspace", logs().length === before)
+  check("auth.usage queries HTTP with only selected profile access", calls.length > 0 && calls.every(call => call.auth === "Bearer fake-smoke-access"))
 }
 
 {

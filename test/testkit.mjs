@@ -576,7 +576,8 @@ export async function createBridgeKit(options = {}) {
       : `node:${specifier}`
     if (cache.has(key)) return cache.get(key)
     let module
-    if (key === "./usage.mjs") module = sourceModule(USAGE_FILE, "", usageUrl)
+    if (key === "./quota-http.mjs") module = sourceModule(path.join(REPO_DIR, "quota-http.mjs"), "", new URL("./quota-http.mjs", indexUrl).href)
+    else if (key === "./usage.mjs") module = sourceModule(USAGE_FILE, "", usageUrl)
     else if (key === "./service-status.mjs") module = sourceModule(path.join(REPO_DIR, "service-status.mjs"), "", new URL("./service-status.mjs", indexUrl).href)
     else if (key === "./quarantine.mjs") module = sourceModule(path.join(REPO_DIR, "quarantine.mjs"), "", new URL("./quarantine.mjs", indexUrl).href)
     else if (key === "./plan.mjs") module = sourceModule(path.join(REPO_DIR, "plan.mjs"), "", new URL("./plan.mjs", indexUrl).href)
