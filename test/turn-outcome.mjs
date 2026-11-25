@@ -154,3 +154,50 @@ test("a terminal error step with no payload still fails generically", () => fixt
   assert.equal(before(NOW)?.status, 502)
   assert.equal(before(NOW)?.resetAt, undefined)
 }))
+
+test("CLI reset notices preserve explicit durations without guessing malformed ones", () => {
+  assert.equal(recoveryTime("Third-party quota reached. Resets in 1h2m3.5s.", NOW), iso(3723500))
+  assert.equal(recoveryTime("Individual quota reached. Resets in 1500ms.", NOW), iso(1500))
+  assert.equal(recoveryTime("retryDelay:3s Resets in 1h.", NOW), iso(3000))
+  for (const tail of ["soon", "-1s", "0s", "1sfoo", "1h-2s", "1s.5", "999999999999999999999h"]) {
+    assert.equal(recoveryTime("Resets in " + tail, NOW), null, tail)
+  }
+})
+
+test("native 1.5 status lines and HTTP status descriptions keep the actual failure", () => {
+  for (const [text, status, code] of [
+    ["PERMISSION_DENIED (code 403): Access denied.", 403, "PERMISSION_DENIED"],
+    ["RESOURCE_EXHAUSTED (code 429): quota reached. Resets in 4m42s.", 429, "RESOURCE_EXHAUSTED"],
+    ["Error 502, Message: Bad Gateway, Status: 502 Bad Gateway", 502, "502 Bad Gateway"],
+    ["Error 403, Message: incomplete Error 503, Message: Busy, Status: UNAVAILABLE", 503, "UNAVAILABLE"],
+  ]) {
+    const result = parseErrorStep(payload(text), NOW)
+    assert.equal(result.status, status)
+    assert.equal(result.code, code)
+    assert.equal(result.noRetry, status === 403 ? true : undefined)
+    if (status === 429) assert.equal(result.resetAt, iso(282000))
+    assert.doesNotMatch(result.message, /incomplete/)
+  }
+})
+const verificationError = (info = {}) => ({ error: { code: 403, status: "PERMISSION_DENIED", details: [{
+  "@type": "type.googleapis.com/google.rpc.ErrorInfo", domain: "cloudcode-pa.googleapis.com", reason: "VALIDATION_REQUIRED",
+  metadata: { validation_url: 'https://untrusted.example/secret?x="}\\', refresh_token: "must-not-echo" }, ...info,
+}] } })
+test("structured verification is non-retryable, bounded, and never a TOS ban or URL echo", () => {
+  const text = 'native failed: ' + JSON.stringify(verificationError(), null, 2) + '\nstack trace'
+  const result = parseErrorStep(payload(text), NOW)
+  assert.equal(result.status, 403)
+  assert.equal(result.code, "VALIDATION_REQUIRED")
+  assert.equal(result.noRetry, true)
+  assert.equal(result.resetAt, undefined)
+  assert.doesNotMatch(result.message, /untrusted|must-not-echo|stack trace/)
+  for (const info of [{ domain: "untrusted.example" }, { reason: "OTHER" }, { "@type": "other" }]) {
+    const generic = parseErrorStep(payload(JSON.stringify(verificationError(info))), NOW)
+    assert.equal(generic.status, 403)
+    assert.equal(generic.code, "PERMISSION_DENIED")
+  }
+  assert.equal(parseErrorStep(payload('x'.repeat(16384) + text), NOW).code, "AGY_TURN_FAILED")
+  assert.equal(parseErrorStep(payload('{"error": incomplete'), NOW).code, "AGY_TURN_FAILED")
+  const suspended = verificationError({ reason: "TOS_VIOLATION" })
+  assert.equal(parseErrorStep(payload(text + JSON.stringify(suspended)), NOW).code, "TOS_VIOLATION")
+})

@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import childProcess from "node:child_process"
 import { syncBuiltinESMExports } from "node:module"
 import { test } from "node:test"
-import { agyCandidates, agySpawnSpec, childEnv, spawnAgy, windowsMcpShim } from "../platform.mjs"
+import { agyCandidates, agySpawnSpec, childEnv, holdsHome, spawnAgy, windowsMcpShim } from "../platform.mjs"
 
 test("Windows discovery considers exe/cmd/bat, Path and LOCALAPPDATA", () => {
   const candidates = agyCandidates({ Path: 'C:\\Program Files\\agy;D:\\tools', LOCALAPPDATA: 'C:\\Users\\Test\\AppData\\Local' }, 'C:\\Users\\Test', 'win32')
@@ -161,4 +161,15 @@ test("childEnv keeps any user-set update value, in any case, from the parent or 
   assert.deepEqual(Object.keys(windows).filter(key => /^agy_cli_disable_auto_update$/i.test(key)), ["agy_cli_disable_auto_update"])
   assert.equal(childEnv({ PATH: "p" }, { X: undefined }, "linux").AGY_CLI_DISABLE_AUTO_UPDATE, "true")
   assert.equal("X" in childEnv({ PATH: "p" }, { X: undefined }, "linux"), false)
+})
+
+// Adapted from upstream 22fd177; include dot-prefixed names and drive boundaries.
+test("holdsHome excludes home/ancestors on POSIX and Windows, not child or sibling projects", () => {
+  for (const dir of ["/Users/me", "/Users/me/", "/Users", "/"]) assert.equal(holdsHome(dir, "/Users/me", "darwin"), true)
+  for (const dir of ["/Users/me/project", "/Users/meow", "/tmp/x", ""]) assert.equal(holdsHome(dir, "/Users/me", "darwin"), false)
+  assert.equal(holdsHome("/Users", "/Users/..me", "darwin"), true)
+  assert.equal(holdsHome("c:\\users\\me", "C:\\Users\\Me", "win32"), true)
+  assert.equal(holdsHome("C:\\", "C:\\Users\\Me", "win32"), true)
+  assert.equal(holdsHome("D:\\", "C:\\Users\\Me", "win32"), false)
+  assert.equal(holdsHome("C:\\Users\\Me\\project", "C:\\Users\\Me", "win32"), false)
 })

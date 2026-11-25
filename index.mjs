@@ -1,4 +1,4 @@
-import { agyCandidates, spawnAgy as nativeSpawnAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./platform.mjs"
+import { agyCandidates, holdsHome, spawnAgy as nativeSpawnAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./platform.mjs"
 import { spawn, spawnSync } from "node:child_process"
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
@@ -162,10 +162,18 @@ const AGENT_ERROR_MARKERS = [
   "\n⚠ Your AI credits balance is too low to continue.\n",
   "\n⚠ RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n",
   `\n⚠ ${TOS_MESSAGE}\n`,
+  `\n⚠ PERMISSION_DENIED (code 403): ${TOS_MESSAGE}\n`,
+  "\n⚠ Verification Required\n",
 ]
 const AGENT_ERROR_CORES = AGENT_ERROR_MARKERS.map((marker) => marker.trim())
 const CREDITS_CORE = AGENT_ERROR_CORES[2]
-const TOS_CORE = `⚠ ${TOS_MESSAGE}`
+const VERIFY_CORE = "⚠ Verification Required"
+// Native CLI terminal notices, not arbitrary mentions in a model answer.
+// Upstream plugins 0.1.81/0.1.95/0.1.114; preserve local account quarantine.
+const QUOTA_CORES = ["⚠ Individual quota reached", "⚠ Third-party quota reached"]
+const BUSY_CORE = "⚠ Our servers are experiencing high traffic right now"
+const ENDING_CORES = [...QUOTA_CORES, BUSY_CORE]
+const LINE_CORES = [...AGENT_ERROR_CORES, ...ENDING_CORES]
 // agy 1.5.8 writes each failed attempt of a model call into the reply as one
 // line, then tries again in the same turn (#1136). The line is agy's.
 const ATTEMPT_CORE = "⚠ API error (attempt "
@@ -182,7 +190,7 @@ const refused429 = (detail) => /code 429\b/i.test(detail) && /resource has been 
 // It is agy's, not the model's, and the turn goes on (#1124).
 const RETRY_MARKER = "\n⚠ Model produced invalid output.\n"
 const RETRY_CORE = RETRY_MARKER.trim()
-const HOLD_MAX = Math.max(...AGENT_ERROR_MARKERS.map((marker) => marker.length)) - 1
+const HOLD_MAX = Math.max(...LINE_CORES.map(core => core.length + 1)) - 1
 const FORWARD_THINKING = process.env.AGY_BRIDGE_THINKING !== "0"
 
 // Until `agy models` answers. Gemini only: agy's ACP server decides which other
@@ -909,6 +917,7 @@ function streamErrorOf(error) {
   if (error?.statusCode) out.status = error.statusCode
   else if (type === "invalid_request_error") out.status = 400
   if (error?.code) out.code = error.code
+  if (error?.noRetry) out.noRetry = true
   if (error?.resetAt) {
     out.reset_at = error.resetAt
     out.resets_at = Math.ceil(Date.parse(error.resetAt) / 1000)
@@ -1430,7 +1439,7 @@ class Turn {
     }
     for (const core of AGENT_ERROR_CORES) {
       const marker = text.lastIndexOf(core)
-      if (core === TOS_CORE && marker >= 0 && !(marker > 0 ? text[marker - 1] === "\n" : !this.textTail || this.textTail === "\n")) continue
+      if (marker >= 0 && !this.startsLine(text, marker)) continue
       if (marker >= 0 && !text.slice(marker + core.length).trim()) {
         const start = text[marker - 1] === "\n" ? marker - 1 : marker
         this.heldText = text.slice(start)
@@ -1438,12 +1447,19 @@ class Turn {
         return
       }
     }
+    const ending = this.noticeEnding(text)
+    if (ending >= 0) {
+      this.heldText = text.slice(ending)
+      this.emitText(text.slice(0, ending))
+      return
+    }
     for (let keep = Math.min(text.length, HOLD_MAX); keep > 0; keep--) {
       const tail = text.slice(-keep)
       const at = text.length - keep
       const lineStart = at > 0 ? text[at - 1] === "\n" : !this.textTail || this.textTail === "\n"
       if (AGENT_ERROR_MARKERS.some((marker) => marker.startsWith(tail)) ||
-        (lineStart && TOS_CORE.startsWith(tail)) ||
+        (lineStart && LINE_CORES.some(core => core.startsWith(tail))) ||
+        ENDING_CORES.some(core => ("\n" + core).startsWith(tail)) ||
         (keep > 1 && (RETRY_MARKER.startsWith(tail) || ATTEMPT_MARKER.startsWith(tail)))) {
         this.heldText = tail
         text = text.slice(0, -keep)
@@ -1451,6 +1467,17 @@ class Turn {
       }
     }
     this.emitText(text)
+  }
+
+  startsLine(text, at) {
+    return at > 0 ? text[at - 1] === "\n" : !this.textTail || this.textTail === "\n"
+  }
+
+  noticeEnding(text, core) {
+    if (!core) return Math.max(...ENDING_CORES.map(value => this.noticeEnding(text, value)))
+    const at = text.lastIndexOf(core)
+    if (at < 0 || !this.startsLine(text, at) || text.slice(at).trimEnd().includes("\n")) return -1
+    return at > 0 ? at - 1 : at
   }
 
   // Removes agy's retry banners, each with its leading and one trailing
@@ -1501,6 +1528,14 @@ class Turn {
       this.agentError = true
       this.agentErrorCore = core
       this.heldText = ""
+    } else {
+      const ending = ENDING_CORES.find(value => this.noticeEnding(this.heldText, value) >= 0)
+      if (ending) {
+        this.agentError = true
+        this.agentErrorCore = ending
+        this.terminalNotice = this.heldText.trim().replace(/^⚠ /, "")
+        this.heldText = ""
+      }
     }
   }
 
@@ -1726,7 +1761,8 @@ class Proc {
       "--log-file", this.logPath,
       "--ide-mcp-port", String(controlServer.address().port),
     ]
-    if (this.workDir) args.push("--add-dir", this.workDir)
+    // Home/ancestors load unrelated customizations into agy's tool budget.
+    if (this.workDir && !holdsHome(this.workDir)) args.push("--add-dir", this.workDir)
     try {
       const childEnv = { ...process.env }
       const inheritedPath = process.env.PATH || childEnv.Path || ""
@@ -2206,6 +2242,10 @@ class Proc {
         if (knownError?.code === "TOS_VIOLATION") throw knownError
         const failure = result?.stopReason !== "cancelled" && checkOutcome(Date.now())
         if (knownError && failure?.code === "AGY_TURN_FAILED") throw knownError
+        // The database can carry only PERMISSION_DENIED while the native
+        // notice explains verification. Preserve that actionable no-retry
+        // refusal, but never override explicit TOS evidence from the store.
+        if (knownError?.code === "VALIDATION_REQUIRED" && failure?.status === 403 && failure.code !== "TOS_VIOLATION") throw knownError
         if (failure) throw this.#outcomeError(failure)
         if (knownError) throw knownError
         turn.flushText()
@@ -2248,6 +2288,20 @@ class Proc {
   async #agentError(turn) {
     const core = turn.agentErrorCore
     if (isServiceSuspension(core) || isServiceSuspension(turn.attemptDetail)) return this.#formatAgentError(TOS_MESSAGE)
+    if (core === VERIFY_CORE) {
+      return Object.assign(new AgentTurnError(
+        "agy bridge: this Google account needs to be verified. Open the Antigravity app or run agy signed in to this account to complete verification before retrying.", "permission_error"),
+        { statusCode: 403, code: "VALIDATION_REQUIRED", noRetry: true, keepProcess: false })
+    }
+    if (QUOTA_CORES.includes(core)) {
+      return withRecovery(Object.assign(new AgentTurnError(
+        `agy bridge: Antigravity quota reached: ${turn.terminalNotice}`, "rate_limit_error"), { statusCode: 429 }),
+        recoveryTime(turn.terminalNotice, Date.now()))
+    }
+    if (core === BUSY_CORE) {
+      return Object.assign(new AgentTurnError(
+        `agy bridge: Antigravity has no capacity for this model now: ${turn.terminalNotice}`, "overloaded_error"), { statusCode: 503 })
+    }
     // A failed connection is in the reply's last attempt line, not the log's
     // executor error (#1136).
     const detail = await lastAgentError(this.logPath, turn.logOffset) || turn.attemptDetail ||
@@ -2271,6 +2325,8 @@ class Proc {
     }
     error.statusCode = error.kind === "invalid_request_error" ? 400 : failure.status
     error.code = failure.code
+    if (failure.noRetry) error.noRetry = true
+    if (failure.code === "VALIDATION_REQUIRED") error.keepProcess = false
     return withRecovery(error, failure.resetAt)
   }
 
@@ -2278,7 +2334,7 @@ class Proc {
     if (isServiceSuspension(detail)) {
       serviceStatus.mark()
       return Object.assign(new AgentTurnError(SUSPENSION_MESSAGE, "permission_error"), {
-        statusCode: 403, code: "TOS_VIOLATION", keepProcess: false,
+        statusCode: 403, code: "TOS_VIOLATION", keepProcess: false, noRetry: true,
       })
     }
     // The system prompt turned away, not a quota (cloak.mjs): a 400 the next
@@ -2362,8 +2418,8 @@ class Proc {
     const tool = this.tools.find((item) => item.name === name)
     if (!tool) throw new Error(`agy bridge: undeclared tool ${name}`)
     // agy consumes its internal toolSummary instead of forwarding it to MCP.
-    if (name === "run_command" && tool.inputSchema?.properties?.toolSummary && !Object.hasOwn(args, "toolSummary")) {
-      args = { ...args, toolSummary: "Run command" }
+    if (tool.inputSchema?.properties?.toolSummary && !Object.hasOwn(args, "toolSummary")) {
+      args = { ...args, toolSummary: name === "run_command" ? "Run command" : name }
     }
     const signature = stableJSON(args)
     const running = turn.calls.find((call) => call.deferred && !call.lateDelivered &&
@@ -4066,7 +4122,7 @@ function sessionBinding(opts) {
 }
 
 // The model is not part of the key: agy switches models inside a live session.
-function conversationKey(rawBody) {
+function conversationKey(rawBody, workDir = "") {
   const body = canonicalBody(rawBody)
   const system = historyKey([{ role: "system", content: compactIdentity(stripVolatileSystem(systemText(body))) }])
   const first = body.messages?.[0]
@@ -4077,7 +4133,7 @@ function conversationKey(rawBody) {
   // are stripped; user text is not.
   const firstText = first ? historyKey([first]) : ""
   const discriminator = requestScope(body)
-  const source = discriminator + "\n" + system + "\n===\n" + firstText
+  const source = discriminator + "\n" + system + "\n===\n" + firstText + (workDir ? "\n@@@\n" + workDir : "")
   return createHash("sha256").update(source).digest("hex")
 }
 function appendSchemaHint(node, hint) {
@@ -4230,7 +4286,7 @@ function normalizeTools(body) {
     }
     const inputSchema = ensureGeminiArrayItems(sanitizeInputSchema(expandToolSchema(rawSchema)))
     // agy adds its own required toolSummary; a duplicate invalidates the schema.
-    if (tool.name === "run_command" && Array.isArray(inputSchema.required)) {
+    if (Array.isArray(inputSchema.required)) {
       inputSchema.required = inputSchema.required.filter((key) => key !== "toolSummary")
     }
     tools.push({
@@ -5915,6 +5971,7 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
     return new Response(JSON.stringify({ type: "error", error: streamError }), {
       status,
       headers: { "Content-Type": "application/json", ...(streamError.code === "TOS_VIOLATION" ? { "X-Magpie-Sign-In": "expired" } : {}),
+        ...(streamError.noRetry ? NO_RETRY_HEADERS : {}),
         ...(streamError.reset_at && (status === 429 || status >= 500) ? {
           "Retry-After": String(Math.max(0, Math.ceil((Date.parse(streamError.reset_at) - Date.now()) / 1000))),
         } : {}) },
@@ -6149,12 +6206,12 @@ const createPlugin = async () => {
             const model = resolveAgyModel(await trace.measure("catalog", () => waitWithSignal(loadModelCatalog(agy), init.signal)), requestedModel, body)
             throwIfAborted(init.signal)
             const selection = { model: requestedModel, effort: requestedEffort(body) }
-            const convKey = conversationKey(body)
+            const callerWorkDir = namedWorkDirectory(body, init)
+            const convKey = conversationKey(body, callerWorkDir || "")
             trace.context({ conv: digest(convKey).slice(0, 12), explicit_session: !!(body.metadata?.session_id || body[TRANSPORT_SCOPE]?.[0]), identity_source: body[TRANSPORT_SCOPE]?.[0] ? "magpie_header" : body.metadata?.session_id ? "metadata" : "legacy", nonstream: body.stream === false })
             const trailing = trailingMessages(body)
             const isFresh = trailing.history.length === 0
             const resultBlocks = extractToolResults(body)
-            const callerWorkDir = namedWorkDirectory(body, init)
             const workDir = workDirectory(callerWorkDir)
             const instructions = sessionInstructions(body, callerWorkDir)
 
@@ -6374,15 +6431,16 @@ const createPlugin = async () => {
 // has not been verified; busy responses and existing 409s retain their semantics.
 // `extra` merges diagnostic fields (attempts, turn_id) into the error object.
 function jsonError(status, message, code, { extra, headers, noRetry = false } = {}) {
+  noRetry ||= code === "TOS_VIOLATION"
   return new Response(
     JSON.stringify({
       type: "error",
       error: { type: status === 403 ? "permission_error" : status === 400 ? "invalid_request_error" : "api_error",
         ...(status === 403 ? { status } : {}),
-        ...(code ? { code } : {}), message: String(message || "unknown error"), ...(extra ?? {}) },
+        ...(code ? { code } : {}), ...(noRetry ? { noRetry: true } : {}), message: String(message || "unknown error"), ...(extra ?? {}) },
     }),
     { status, headers: { "Content-Type": "application/json",
-      ...(status === 400 && noRetry ? NO_RETRY_HEADERS : {}), ...(headers ?? {}) } },
+      ...(noRetry ? NO_RETRY_HEADERS : {}), ...(headers ?? {}) } },
   )
 }
 

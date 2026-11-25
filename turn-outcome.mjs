@@ -8,6 +8,10 @@ import { readConversationStore } from "./step-usage.mjs"
 import { isServiceSuspension, TOS_MESSAGE } from "./service-status.mjs"
 
 const MAX_PAYLOAD = 16_384
+// T3 Code 072611f: do not join the message of one error to another error's
+// status, and accept native 1.5 status lines and HTTP status descriptions.
+const API_ERROR = /Error (\d{3}), Message: ((?:(?!, Status: |Error \d{3}, Message: ).)+), Status: ([A-Z_]+|\d{3}[^,\n]*)/s
+const STATUS_ERROR = /(?<![A-Z_])([A-Z_]+) \(code (\d{3})\): (\P{Cc}+)/u
 const SESSION_ID = /^[A-Za-z0-9_-]+$/
 const UNITS = { ns: 1e-6, us: 1e-3, "µs": 1e-3, "μs": 1e-3, ms: 1, s: 1000, m: 60_000, h: 3_600_000 }
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino
@@ -61,7 +65,8 @@ export function recoveryTime(text, now = Date.now()) {
         Number(timestamp.slice(17, 19)) < 60 && Number.isFinite(parsed) && parsed > now &&
         parsed <= 253402300799000) return new Date(parsed).toISOString()
   }
-  const ms = durationMs(valueOf(text, "quotaResetDelay")) ?? durationMs(valueOf(text, "retryDelay"))
+  const noticeDelay = /\bResets in\s+((?:\d+(?:\.\d+)?(?:ns|us|µs|μs|ms|s|m|h))+)(?!\.\d)(?=[\s.!?,)]|$)/.exec(text)?.[1]
+  const ms = durationMs(valueOf(text, "quotaResetDelay")) ?? durationMs(valueOf(text, "retryDelay")) ?? durationMs(noticeDelay)
   if (ms === null || !Number.isFinite(now + ms) || now + ms > 253402300799000) return null
   const target = new Date(now + ms)
   return target.getTime() > now ? target.toISOString() : null
@@ -74,20 +79,59 @@ function safeMessage(text) {
     .trim().slice(0, 2048)
 }
 
+// Parse only bounded native error-step bodies, never model/user messages.
+// Adapted from T3's balancedJsonObject. Successful objects are consumed once.
+function errorBodies(text) {
+  const bodies = []
+  const starts = /\{\s*"error"\s*:/g
+  let match
+  while ((match = starts.exec(text))) {
+    let depth = 0, quoted = false, escaped = false
+    for (let i = match.index; i < text.length; i++) {
+      const ch = text[i]
+      if (quoted) {
+        if (escaped) escaped = false
+        else if (ch === "\\") escaped = true
+        else if (ch === '"') quoted = false
+      } else if (ch === '"') quoted = true
+      else if (ch === "{") depth++
+      else if (ch === "}" && --depth === 0) {
+        try { bodies.push(JSON.parse(text.slice(match.index, i + 1)).error) } catch {}
+        starts.lastIndex = i + 1
+        break
+      }
+    }
+  }
+  return bodies.filter(error => error && typeof error === "object" && !Array.isArray(error))
+}
+
 export function parseErrorStep(payload, now = Date.now()) {
   if (!ArrayBuffer.isView(payload)) return null
   const text = new TextDecoder().decode(new Uint8Array(payload.buffer, payload.byteOffset, Math.min(payload.byteLength, MAX_PAYLOAD)))
-  const api = /\bError (\d{3}), Message: ([\s\S]*?), Status: ([A-Z_]+)/.exec(text)
+  const bodies = errorBodies(text)
+  const statusLine = STATUS_ERROR.exec(text)
+  const json = bodies.find(error => Number.isInteger(error.code) && error.code >= 400 && error.code <= 599)
+  const api = API_ERROR.exec(text) || (statusLine && [statusLine[0], statusLine[2], statusLine[3], statusLine[1]]) ||
+    (json && ["", String(json.code), typeof json.message === "string" ? json.message : "Antigravity refused this request.",
+      typeof json.status === "string" && /^[A-Z_]+$/.test(json.status) ? json.status : `HTTP_${json.code}`])
   const status = api && Number(api[1]) >= 400 && Number(api[1]) <= 599 ? Number(api[1]) : 502
   const reason = valueOf(text, "reason")
-  if (isServiceSuspension(text) || (status === 403 && reason === "TOS_VIOLATION")) {
+  if (isServiceSuspension(text) || bodies.some(error => isServiceSuspension(error)) || (status === 403 && reason === "TOS_VIOLATION")) {
     return { status: 403, code: "TOS_VIOLATION", message: TOS_MESSAGE }
+  }
+  if (bodies.some(error => error.code === 403 && error.status === "PERMISSION_DENIED" &&
+    Array.isArray(error.details) && error.details.some(info => info?.["@type"] === "type.googleapis.com/google.rpc.ErrorInfo" &&
+      info.domain === "cloudcode-pa.googleapis.com" && info.reason === "VALIDATION_REQUIRED"))) {
+    // Do not echo untrusted metadata/URLs or open a verification page for the user.
+    return { status: 403, code: "VALIDATION_REQUIRED", noRetry: true,
+      message: "This Google account needs to be verified. Open the Antigravity app or run agy signed in to this account to complete verification before retrying." }
   }
   const result = {
     status: reason === "QUOTA_EXHAUSTED" && !api ? 429 : status,
     code: reason === "QUOTA_EXHAUSTED" ? reason : api?.[3] || "AGY_TURN_FAILED",
     message: api ? safeMessage(api[2]) : "agy stopped this turn because of an error recorded in its session database.",
   }
+  if (result.status === 403) result.noRetry = true
   if (result.status === 429 || result.status >= 500) {
     const resetAt = recoveryTime(text, now)
     if (resetAt) result.resetAt = resetAt

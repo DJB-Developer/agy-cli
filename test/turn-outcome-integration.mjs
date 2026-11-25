@@ -229,3 +229,38 @@ test("unclassified database failure does not replace an already recognized CLI q
     assert.equal(reply.error.reset_at, new Date(kit.clock.now() + 42000).toISOString())
   })
 })
+
+test("verification notice retains no-retry advice beside a generic database 403, but TOS wins", async () => {
+  for (const tos of [false, true]) await withKit(async kit => {
+    kit.defaultPrompt = async agent => {
+      appendStep(dbOf(kit, agent), 17, `Error 403, Message: ${tos ? TOS_MESSAGE : "Permission denied."}, Status: PERMISSION_DENIED`)
+      await agent.text("⚠ Verification Required")
+      return { stopReason: "end_turn" }
+    }
+    const response = await kit.request(baseBody({ stream: false }))
+    const result = await response.json()
+    assert.equal(response.status, 403)
+    assert.equal(response.headers.get("x-should-retry"), "false")
+    assert.equal(result.error.code, tos ? "TOS_VIOLATION" : "VALIDATION_REQUIRED")
+  })
+})
+
+test("database-only structured verification is a no-retry 403 without permanently disabling the account", async () => {
+  await withKit(async kit => {
+    kit.defaultPrompt = async agent => {
+      appendStep(dbOf(kit, agent), 17, 'native error: ' + JSON.stringify({ error: { code: 403, status: "PERMISSION_DENIED", details: [{
+        "@type": "type.googleapis.com/google.rpc.ErrorInfo", domain: "cloudcode-pa.googleapis.com", reason: "VALIDATION_REQUIRED",
+      }] } }))
+      return { stopReason: "end_turn" }
+    }
+    const response = await kit.request(baseBody({ stream: false }))
+    assert.equal(response.status, 403)
+    assert.equal(response.headers.get("x-should-retry"), "false")
+    assert.equal(response.headers.get("X-Magpie-Sign-In"), null)
+    const result = await response.json()
+    assert.equal(result.error.code, "VALIDATION_REQUIRED")
+    assert.equal(kit.promptSerial, 1)
+    kit.defaultPrompt = async agent => { await agent.text("manually retried"); return { stopReason: "end_turn" } }
+    assert.equal((await kit.request(baseBody({ stream: false }))).status, 200)
+  })
+})

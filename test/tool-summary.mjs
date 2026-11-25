@@ -31,13 +31,13 @@ test("run_command avoids agy's toolSummary collision and restores the argument f
   assert.deepEqual(schema.required, ["CommandLine", "toolSummary"])
 })
 
-test("other tools retain their required summary and missing arguments are not fabricated", async () => {
+test("every tool avoids the injected summary collision and restores its declared summary", async () => {
   const schema = {
     type: "object", properties: { toolSummary: { type: "string" } }, required: ["toolSummary"],
   }
   const result = await callRunCommand(schema, {}, "other_command")
-  assert.deepEqual(result.schema.required, ["toolSummary"])
-  assert.deepEqual(result.call.input, {})
+  assert.deepEqual(result.schema.required, [])
+  assert.deepEqual(result.call.input, { toolSummary: "other_command" })
 })
 
 test("run_command keeps supplied summaries and does not add one to unrelated schemas", async () => {

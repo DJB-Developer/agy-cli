@@ -1,5 +1,15 @@
 import { spawn } from "node:child_process"
 import path from "node:path"
+import os from "node:os"
+
+// Adapted from magpie-community/plugins 22fd177 (MIT).
+// This is a workspace/customization guard, not a filesystem sandbox.
+export function holdsHome(dir, home = os.homedir(), platform = process.platform) {
+  if (!dir || !home) return false
+  const paths = platform === "win32" ? path.win32 : path.posix
+  const rel = paths.relative(paths.resolve(dir), paths.resolve(home))
+  return rel === "" || (rel !== ".." && !rel.startsWith(".." + paths.sep) && !paths.isAbsolute(rel))
+}
 
 export function agyCandidates(env, home, platform = process.platform) {
   const windows = platform === "win32"

@@ -5,6 +5,8 @@ import { execFileSync } from "node:child_process"
 
 // The fake agy, its wrapper and its log live in a temp folder of their own.
 const here = fs.mkdtempSync(path.join(os.tmpdir(), "fake-agy-bin-"))
+const projectDir = path.join(here, "project")
+fs.mkdirSync(projectDir)
 const suffix = `-${process.pid}`
 const fakeAgy = path.join(here, `fake-agy${suffix}.mjs`)
 const wrapper = path.join(here, `agy${suffix}${process.platform === "win32" ? ".cmd" : ""}`)
@@ -976,9 +978,10 @@ async function launchedModel(body) {
 }
 
 for (const [name, system, headers, expectedDir, named] of [
-  ["local prompt", `Working directory: ${os.tmpdir()}`, {}, path.resolve(os.tmpdir()), os.tmpdir()],
+  ["local prompt", `Working directory: ${projectDir}`, {}, path.resolve(projectDir), projectDir],
+  ["home folder prompt", `Working directory: ${os.homedir()}`, {}, null, os.homedir()],
   ["remote prompt", "<cwd>/remote-mac/project</cwd>", {}, null, "/remote-mac/project"],
-  ["header precedence", "Current working directory: /remote-mac/project", { "x-magpie-work-dir": encodeURIComponent(os.tmpdir()) }, path.resolve(os.tmpdir()), os.tmpdir()],
+  ["header precedence", "Current working directory: /remote-mac/project", { "x-magpie-work-dir": encodeURIComponent(projectDir) }, path.resolve(projectDir), projectDir],
   ["relative prompt", "Primary working directory: relative-project", {}, null, "relative-project"],
 ]) {
   const body = { model, system, messages: [{ role: "user", content: `environment ${name}` }] }

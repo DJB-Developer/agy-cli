@@ -153,3 +153,20 @@ A1–A16、U1–U6 逐项并入。两边都有、且 `acb8d84` 写法更新的�
 
 作者 @yetone。本仓适配到每账号运行时，保留服务停用检查；另补并发次级进程的同模型重复请求保护、
 双账号双模型工具回传隔离测试。未更换聊天传输或元数据查询方式。
+
+## 12. 2026-11-25 选择性同步（未发布）
+
+参考 magpie-community/plugins 的 MIT 实现，固定基线
+[`bbd3a2e76d7f2e765f0181786a60169b7acf860a`](https://github.com/magpie-community/plugins/tree/bbd3a2e76d7f2e765f0181786a60169b7acf860a/packages/agy-cli)：
+
+- `9720caa468a509e3063c3c96eabe59a817a93e5b`、`83a677177bc3ec8e72f2de24a81259749fa9fa6d`：原生封禁/验证结束提示与禁止重试标记。
+- `c18d87f7439cb9a62bbd93e338e7d06c428c1ade`、`8b47ce71a73d7bdc216c82d6a2f7abe407c12fdc`：繁忙/额度结束提示。繁忙提示逻辑上游注明源自 ifccod（MIT）。
+- `22fd1770a5c0bdd222aae5ab99f7d3ac4a16a351`、`28e0a3ea2a5dc394f20deebe2ac2331a28136f8c`：home/祖先目录不传入 add-dir、按调用方目录区分会话；适配本地运行时与测试。
+- `bbd3a2e76d7f2e765f0181786a60169b7acf860a`：所有工具的 toolSummary 去重与补回。
+
+原作者及贡献者包括 @yetone、@yetihan、@oli-bot、@ifccod；保留仓库 LICENSE 中的 MIT 版权及许可。
+
+`turn-outcome.mjs` 的错误格式、JSON 对象提取、验证拒绝及文字恢复时间参考
+[`pingdotgg/t3code@072611f65fc3b77f13909ce451e87c3e265d8b05` 的 AntigravityTurnOutcome.ts](https://github.com/pingdotgg/t3code/blob/072611f65fc3b77f13909ce451e87c3e265d8b05/apps/server/src/provider/acp/AntigravityTurnOutcome.ts)
+（MIT，Copyright (c) 2026 T3 Tools Inc.，许可见本文件前述 T3 条目）。
+本仓保留严格时间校验和按账号持久封禁；不复制身份回退、OAuth 后台续期、直接聊天 HTTP 或自动重放。

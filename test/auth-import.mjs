@@ -602,18 +602,19 @@ test("quota-detected TOS automatically turns off that Magpie account and keeps i
   })
 })
 
-test("TOS warning becomes a permission error, persists per account, and never becomes a successful reply", async () => {
+for (const prefix of ["", "PERMISSION_DENIED (code 403): "]) test(`TOS warning ${prefix}persists per account and never becomes a successful reply`, async () => {
   await withKit({}, async kit => {
     const [a, b] = await Promise.all([add(kit, "suspended"), add(kit, "healthy")])
     const requestA = await client(kit, authOf(a))
     const requestB = await client(kit, authOf(b))
     kit.defaultPrompt = async agent => {
-      const warning = "\n⚠ " + TOS_MESSAGE + "\n"
+      const warning = "\n⚠ " + prefix + TOS_MESSAGE + "\n"
       for (const char of warning) await agent.text(char)
       return { stopReason: "end_turn" }
     }
     const response = await requestA(baseBody({ stream: false }))
     assert.equal(response.status, 403, "CLI suspension must not be a successful assistant answer")
+    assert.equal(response.headers.get("x-should-retry"), "false")
     const error = (await response.json()).error
     assert.equal(error.type, "permission_error")
     assert.equal(error.code, "TOS_VIOLATION")
