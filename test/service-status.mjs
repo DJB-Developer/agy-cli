@@ -35,26 +35,19 @@ test("classify explicit TOS denial, not generic permissions, region or quota err
   }
 })
 
-test("late quota success cannot clear suspension, including across a new runtime", async t => {
+test("local usage reads preserve persisted suspension across a new runtime", async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-service-test-"))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const file = path.join(dir, "service-status.json")
   const serviceStatus = createServiceStatus(file)
-  let release, started
-  const entered = new Promise(resolve => { started = resolve })
-  const read = createUsageReader(() => "/fake/agy", {
-    signIn: async () => ({ state: "present", fp: "test", canRenew: true }), serviceStatus,
-    queryUsage: async () => { started(); await new Promise(resolve => { release = resolve }); return { windows: [{ used: 0 }], plan: "Pro" } },
-  })
-  const pending = read()
-  await entered
+  const read = createUsageReader({ serviceStatus })
+  assert.equal((await read()).signIn, "kept")
   serviceStatus.mark()
-  release()
-  const result = await pending
+  const result = await read()
   assert.equal(result.signIn, "expired")
   assert.equal(result.plan, undefined)
   assert.deepEqual(result.windows, [])
-  assert.equal(createServiceStatus(file).get(), true)
-  assert.equal((await read()).signIn, "expired")
+  const restored = createUsageReader({ serviceStatus: createServiceStatus(file) })
+  assert.equal((await restored()).signIn, "expired")
   if (process.platform !== "win32") assert.equal(fs.statSync(file).mode & 0o777, 0o600)
 })

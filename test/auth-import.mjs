@@ -27,18 +27,10 @@ function setAccess(kit, name, { access = `access-${name}`, expiry = "2099-01-01T
   saved.token.expiry = expiry
   fs.writeFileSync(file, JSON.stringify(saved))
 }
-const summary = (remaining = 0.8) => ({ groups: [
-  { displayName: "Gemini Models", buckets: [{ bucketId: "gemini-weekly", window: "weekly", remainingFraction: remaining }] },
-  { displayName: "Claude and GPT models", buckets: [{ bucketId: "3p-5h", window: "5h", remainingFraction: 0 }] },
-] })
 async function withKit(options, fn) {
   let unexpectedHttp = 0
   const kit = await createBridgeKit({
     fetch: async () => { unexpectedHttp++; throw Error("Unexpected external HTTP") },
-    // Keep the old transport healthy for reverse checks: failures must prove
-    // that quota reads still spawned CLI, not merely that its version was absent.
-    onSpawn: (_file, args) => args.includes("--version") ? { stdout: "1.5.9\n" }
-      : args.includes("/usage") ? { stdout: JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: summary() } }) } : 0,
     ...options,
   })
   try { await fn(kit); assert.equal(unexpectedHttp, 0, "tests must not make unmocked HTTP requests") }
@@ -65,69 +57,6 @@ for (const platform of ["linux", "darwin", "win32"]) {
     })
   })
 }
-
-test("Magpie uses HTTP quota and optional HTTP plans without spawning CLI queries or blocking ACP chat", async () => {
-  const calls = []
-  let mode = "ok", planSignal
-  await withKit({
-    env: { AGY_BRIDGE_STORED_SIGNIN: "" },
-    fetch: async (url, init) => {
-      calls.push({ url, token: init.headers.Authorization })
-      assert.equal(init.headers["User-Agent"], undefined, "do not send the unverified Hub identity")
-      if (url.endsWith(":retrieveUserQuotaSummary")) return Response.json(summary())
-      if (url.endsWith(":fetchAvailableModels")) return Response.json({ models: {} })
-      assert.equal(url, "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
-      assert.deepEqual(JSON.parse(init.body), { metadata: { ideType: "ANTIGRAVITY" } })
-      if (mode === "network") throw Error("private network error")
-      if (mode === "invalid") return new Response("invalid json")
-      if (mode === "timeout") { planSignal = init.signal; return new Promise(() => {}) }
-      if (typeof mode === "number") return new Response("private upstream error", { status: mode })
-      return Response.json({ paidTier: { id: init.headers.Authorization === "Bearer access-a" ? "g1-pro-tier" : "g1-ultra-tier" } })
-    },
-  }, async kit => {
-    const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
-    setAccess(kit, "a"); setAccess(kit, "b")
-    assert.equal(calls.length, 0, "import must not perform HTTP metadata probes")
-    await Promise.all([kit.plugin.provider.models({}, { auth: authOf(a) }), kit.plugin.provider.models({}, { auth: authOf(b) })])
-    await kit.plugin.provider.warming?.()
-    const reads = kit.otherSpawns.length
-    const readA = () => kit.plugin.auth.usage(async () => authOf(a))
-    const [usageA, usageB, duplicateA] = await Promise.all([readA(), kit.plugin.auth.usage(async () => authOf(b)), readA()])
-    assert.equal(usageA.plan, "Google AI Pro", usageA.error)
-    assert.equal(usageB.plan, "Google AI Ultra", usageB.error)
-    assert.equal(duplicateA.plan, usageA.plan)
-    const planCalls = () => calls.filter(call => call.url.endsWith(":loadCodeAssist"))
-    assert.equal(planCalls().length, 2, "one plan query per account, including concurrent callers")
-    const keys = calls.map(call => `${call.token} ${call.url}`)
-    assert.equal(new Set(keys).size, keys.length, "concurrent callers share the whole metadata query")
-    assert.deepEqual(new Set(calls.map(call => call.token)), new Set(["Bearer access-a", "Bearer access-b"]))
-    assert.equal(kit.otherSpawns.length, reads, "HTTP metadata must not spawn --version or /usage")
-    assert.deepEqual(usageA.windows.map(w => w.used), [20, 100])
-    assert.ok(usageA.windows.every(w => !w.aside && w.models.length), JSON.stringify(usageA.windows))
-    assert.ok(usageA.windows[0].models.every(id => id.startsWith("gemini-")))
-    assert.ok(usageA.windows[1].models.every(id => /^(claude|gpt)-/.test(id)))
-    for (mode of [401, 403, 429, 500, "network", "invalid", "timeout"]) {
-      kit.clock.advance(10 * 60_000)
-      const failed = await readA()
-      assert.equal(failed.plan, undefined, `omit stale plan on ${mode}`)
-      assert.deepEqual(failed.windows, usageA.windows)
-      assert.equal(failed.signIn, "kept")
-      assert.equal(failed.error, undefined)
-      assert.equal(kit.otherSpawns.length, reads)
-    }
-    assert.equal(planSignal.aborted, true)
-    mode = "ok"
-    kit.clock.advance(10 * 60_000)
-    assert.equal((await readA()).plan, "Google AI Pro", "plan failure must not trigger auth backoff")
-    const before = calls.length
-    kit.defaultPrompt = async agent => { await agent.text("CLI reply"); return { stopReason: "end_turn" } }
-    const request = await client(kit, authOf(a))
-    const reply = await readSse(await request(baseBody()))
-    assert.equal(reply.content[0].text, "CLI reply")
-    assert.ok(kit.acpSpawns.some(spawn => nameOf(spawn.args) === "a" && spawn.args.includes("acp")))
-    assert.equal(calls.length, before, "chat must not call HTTP metadata or inference endpoints")
-  })
-})
 
 test("failed and duplicate imports leave existing accounts and live requests untouched", async () => {
   await withKit({}, async kit => {
@@ -301,13 +230,6 @@ test("tool-result images steer within each named account's session without cross
 
 test("models and usage are scoped to host-selected auth and conflicting API environment cannot override it", async () => {
   await withKit({ env: { AGY_BRIDGE_STORED_SIGNIN: "", GEMINI_API_KEY: "global-key", AGY_ADC_AUTH: "1", WSL_INTEROP: "real-wsl" },
-    fetch: async (url, init) => {
-      assert.ok(["Bearer access-a", "Bearer access-b"].includes(init.headers.Authorization))
-      if (url.endsWith(":loadCodeAssist")) return Response.json({})
-      if (url.endsWith(":fetchAvailableModels")) return Response.json({ models: {} })
-      assert.ok(url.endsWith(":retrieveUserQuotaSummary"))
-      return Response.json(summary(init.headers.Authorization === "Bearer access-a" ? 0.8 : 0.3))
-    },
   }, async kit => {
     const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
     setAccess(kit, "a"); setAccess(kit, "b")
@@ -324,12 +246,12 @@ test("models and usage are scoped to host-selected auth and conflicting API envi
     const [usageA, usageB] = await Promise.all([
       kit.plugin.auth.usage(async () => authOf(a)), kit.plugin.auth.usage(async () => authOf(b)),
     ])
-    assert.equal(usageA.windows[0]?.used, 20, usageA.error)
-    assert.equal(usageB.windows[0]?.used, 70, usageB.error)
-    assert.equal(usageA.windows[0].aside, false)
-    assert.equal(usageB.windows[0].aside, false)
-    assert.deepEqual(usageA.windows[0].models, ["gemini-3.8-flash-a-high", "gemini-3.8-flash-a-low", "gemini-3.8-flash-a"])
-    assert.deepEqual(usageB.windows[0].models, ["gemini-3.8-flash-b-high", "gemini-3.8-flash-b-low", "gemini-3.8-flash-b"])
+    for (const usage of [usageA, usageB]) {
+      assert.deepEqual(usage.windows, [])
+      assert.equal(usage.plan, undefined)
+      assert.equal(usage.signIn, "kept")
+      assert.match(usage.error, /unavailable/)
+    }
     assert.equal(kit.modelsSpawns.length, queries, "usage must not start another model listing")
     assert.ok(kit.modelsSpawns.every(s => s.env.WSL_INTEROP === "real-wsl" && !s.env.GEMINI_API_KEY))
   })
@@ -501,60 +423,8 @@ test("a late browser close cannot delete a new import after its error cleanup", 
   })
 })
 
-test("Magpie's named-account HTTP quota hook exposes the original error with credentials removed", async () => {
-  const calls = []
-  await withKit({ fetch: async url => {
-    calls.push(url)
-    if (url.endsWith(":loadCodeAssist")) return Response.json({ paidTier: { id: "g1-pro-tier" } })
-    return Response.json({ error: { code: 403, message: "Your current account is not eligible: country association unavailable", refresh_token: "private-account-token" } }, { status: 403 })
-  } }, async kit => {
-    const saved = await add(kit, "quota-ui")
-    setAccess(kit, "quota-ui")
-    const count = kit.otherSpawns.length
-    const result = await kit.plugin.auth.usage(async () => authOf(saved))
-    assert.equal(result.signIn, "kept")
-    assert.match(result.error, /HTTP.*redacted/i)
-    assert.match(result.error, /country association unavailable/)
-    assert.doesNotMatch(result.error, /private-account-token/)
-    assert.equal(result.plan, "Google AI Pro", "quota errors must not discard a successfully queried plan")
-    assert.ok(calls.length > 0)
-    assert.equal(kit.otherSpawns.length, count)
-    assert.equal(fs.existsSync(path.join(rootOf(kit), "quota-ui", "bridge-state", "service-status.json")), false)
-  })
-})
-
-for (const failure of [401, 403, 429, "expired"]) {
-  test(`HTTP quota ${failure} does not poison CLI authentication or infer a service ban`, async () => {
-    let calls = 0
-    await withKit({ fetch: async url => {
-      calls++
-      if (url.endsWith(":loadCodeAssist")) return Response.json({})
-      return Response.json({ error: { message: "Metadata not available" } }, { status: failure })
-    } }, async kit => {
-      const saved = await add(kit, "recoverable")
-      setAccess(kit, "recoverable", { expiry: failure === "expired" ? "2000-01-01T00:00:00Z" : "2099-01-01T00:00:00Z" })
-      const before = kit.otherSpawns.length
-      const result = await kit.plugin.auth.usage(async () => authOf(saved))
-      assert.equal(result.signIn, "kept", result.error)
-      assert.ok(result.error)
-      assert.deepEqual(result.windows, [])
-      assert.equal(kit.otherSpawns.length, before, "metadata failures cannot launch hidden CLI prompts")
-      if (failure === "expired") assert.equal(calls, 0, "expired credentials must not be sent to HTTP")
-      else assert.ok(calls > 0)
-      const httpBeforeChat = calls
-      const request = await client(kit, authOf(saved))
-      kit.defaultPrompt = async agent => { await agent.text("CLI still usable"); return { stopReason: "end_turn" } }
-      const reply = await readSse(await request(baseBody()))
-      assert.equal(reply.error, null)
-      assert.equal(reply.content[0].text, "CLI still usable")
-      assert.equal(calls, httpBeforeChat)
-      assert.equal(fs.existsSync(path.join(rootOf(kit), "recoverable", "bridge-state", "service-status.json")), false)
-    })
-  })
-}
-
 const TOS_MESSAGE = "This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product."
-test("quota-detected TOS automatically turns off that Magpie account and keeps its credentials", async () => {
+test("ACP-detected TOS automatically turns off that Magpie account and keeps its credentials", async () => {
   const calls = []
   await withKit({
     env: { MAGPIE_WEB_KEY: "test-only-admin-key-123456" },
@@ -571,11 +441,12 @@ test("quota-detected TOS automatically turns off that Magpie account and keeps i
       }
       return req
     },
-    fetch: async url => url.endsWith(":loadCodeAssist") ? Response.json({})
-      : new Response(TOS_MESSAGE, { status: 403 }),
   }, async kit => {
     const [a, b] = await Promise.all([add(kit, "blocked"), add(kit, "healthy")])
-    setAccess(kit, "blocked")
+    const firstRequest = await client(kit, authOf(a))
+    kit.defaultPrompt = async agent => { await agent.text("\n⚠ " + TOS_MESSAGE + "\n"); return { stopReason: "end_turn" } }
+    const failed = await readSse(await firstRequest(baseBody()))
+    assert.equal(failed.error?.code, "TOS_VIOLATION")
     const read = () => kit.plugin.auth.usage(async () => authOf(a))
     const usage = await read()
     assert.equal(usage.signIn, "expired")
@@ -721,23 +592,6 @@ test("quoting the TOS warning within an explanation is ordinary answer text", as
   }
 })
 
-test("explicit HTTP quota suspension overrides another endpoint and a successful plan", async () => {
-  await withKit({
-    fetch: async url => url.endsWith(":loadCodeAssist") ? Response.json({ paidTier: { id: "g1-pro-tier" } })
-      : url.startsWith("https://daily-cloudcode-pa.googleapis.com/") ? Response.json(summary())
-      : new Response(TOS_MESSAGE, { status: 403 }),
-  }, async kit => {
-    const a = await add(kit, "a")
-    setAccess(kit, "a")
-    const usage = await kit.plugin.auth.usage(async () => authOf(a))
-    assert.equal(usage.signIn, "expired")
-    assert.match(usage.error, /TOS_VIOLATION/)
-    const request = await client(kit, authOf(a))
-    assert.equal((await request(baseBody())).status, 403)
-    assert.equal(kit.acpSpawns.length, 0)
-  })
-})
-
 test("structured suspension in ACP error data blocks the account during session setup", async () => {
   await withKit({ sessionNewError: { code: -32603, message: "Upstream error", data: { error: {
     code: 403, status: "PERMISSION_DENIED", details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "TOS_VIOLATION" }],
@@ -786,58 +640,6 @@ test("concurrent model openings keep each profile's CLI and tool results separat
       for (let j = 0; j < done.length; j++) if (j !== i) assert.ok(!text.includes(`private-result-${j}`), text)
     }
     assert.equal(entered, 4, "tool continuation must reuse its original CLI turn")
-  })
-})
-
-test("quota refresh observes explicit plan HTTP TOS suspension even when HTTP quota succeeds", async () => {
-  const httpCalls = []
-  await withKit({
-    env: { AGY_BRIDGE_STORED_SIGNIN: "" },
-    fetch: async (url, init) => {
-      httpCalls.push({ url, token: init.headers.Authorization })
-      if (url.endsWith(":retrieveUserQuotaSummary")) return Response.json(summary())
-      if (url.endsWith(":fetchAvailableModels")) return Response.json({ models: {} })
-      assert.equal(url, "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
-      if (init.headers.Authorization === "Bearer access-a") return Response.json({ error: {
-        code: 403, status: "PERMISSION_DENIED", message: "Service disabled",
-        details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "TOS_VIOLATION" }],
-        refresh_token: "must-not-reach-status-or-ui",
-      } }, { status: 403 })
-      return Response.json({ paidTier: { id: "g1-pro-tier" } })
-    },
-  }, async kit => {
-    const [a, b] = await Promise.all([add(kit, "a"), add(kit, "b")])
-    setAccess(kit, "a"); setAccess(kit, "b")
-    const readA = () => kit.plugin.auth.usage(async () => authOf(a))
-    const before = kit.otherSpawns.length
-    const [suspended, healthy, duplicate] = await Promise.all([readA(), kit.plugin.auth.usage(async () => authOf(b)), readA()])
-    const plans = httpCalls.filter(call => call.url.endsWith(":loadCodeAssist"))
-    assert.equal(plans.length, 2, "both accounts must actually reach the metadata endpoint")
-    assert.equal(suspended.signIn, "expired", "quota success must not hide an explicit plan suspension")
-    assert.match(suspended.error, /403.*TOS_VIOLATION/)
-    assert.doesNotMatch(suspended.error, /must-not-reach/)
-    assert.equal(duplicate.error, suspended.error)
-    assert.equal(suspended.plan, undefined)
-    assert.equal(healthy.signIn, "kept")
-    assert.equal(healthy.plan, "Google AI Pro")
-    assert.equal(healthy.windows[0].used, 20)
-    assert.equal(kit.otherSpawns.length, before)
-    const keys = httpCalls.map(call => `${call.token} ${call.url}`)
-    assert.equal(new Set(keys).size, keys.length, "coalesce concurrent refreshes")
-    assert.equal(kit.acpSpawns.length, 0, "status refresh must not send an inference probe")
-    const persisted = fs.readFileSync(path.join(rootOf(kit), "a", "bridge-state", "service-status.json"), "utf8")
-    assert.equal(JSON.parse(persisted).reason, "TOS_VIOLATION")
-    assert.doesNotMatch(persisted, /access-a|refresh_token|must-not-reach/)
-    const httpBefore = httpCalls.length
-    assert.equal((await readA()).signIn, "expired")
-    const requestA = await client(kit, authOf(a))
-    assert.equal((await requestA(baseBody())).status, 403)
-    assert.equal(httpCalls.length, httpBefore)
-    assert.equal(kit.otherSpawns.length, before)
-    kit.defaultPrompt = async agent => { await agent.text("healthy CLI reply"); return { stopReason: "end_turn" } }
-    const requestB = await client(kit, authOf(b))
-    assert.equal((await readSse(await requestB(baseBody()))).content[0].text, "healthy CLI reply")
-    assert.equal(httpCalls.length, httpBefore, "chat remains CLI-only")
   })
 })
 

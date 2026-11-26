@@ -7,7 +7,7 @@ import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { createHttpUsageReader } from "./quota-http.mjs"
+import { createUsageReader } from "./usage.mjs"
 import { createServiceStatus, isServiceSuspension, SUSPENSION_MESSAGE, TOS_MESSAGE } from "./service-status.mjs"
 import { createMagpieQuarantine } from "./quarantine.mjs"
 import { backgroundBlocked as defaultBackgroundBlocked, cannotSignIn, forgetStoredSignIn as defaultForgetStoredSignIn, isDead, parseRefreshToken, storedSignInNow as defaultStoredSignInNow } from "./signin.mjs"
@@ -6078,24 +6078,10 @@ function instrumentFetch(handler) {
   }
 }
 
-let disposeUsage = () => {}
 const createPlugin = async () => {
-  const readUsage = createHttpUsageReader({
-    serviceStatus,
-    // Read this account's current/saved catalog without starting extra CLI
-    // queries inside Magpie's bounded usage call. Include raw effort IDs and
-    // the aliases exposed by provider.models, so either request form is scoped.
-    getModels: () => {
-      // Filesystem lookup only: restore the saved catalog without launching agy.
-      useAgyPath(findAgy())
-      const catalog = catalogOf(cachedModelCatalog).routing
-      return [...catalog.rawIds, ...catalog.models.map(model => model.id)]
-    },
-    ...(account.dir ? {
-      signIn: () => accountSignIn(account), env: accountEnv(process.env, account), geminiDir: account.dir,
-    } : {}),
-  })
-  disposeUsage = () => readUsage.dispose()
+  // Keep the host's status hook so saved TOS suspensions remain visible.
+  // Unknown limits are not exhausted limits and must not trigger sign-out.
+  const readUsage = createUsageReader({ serviceStatus })
   return {
     auth: {
       provider: PROVIDER_ID,
@@ -6447,7 +6433,6 @@ function jsonError(status, message, code, { extra, headers, noRetry = false } = 
 // On Windows child.kill() ends agy alone and leaves the cmd.exe and nc it
 // started, so one taskkill /T ends every tree before the workspaces go.
 function reapOnExit() {
-  disposeUsage()
   quarantine.dispose()
   const windows = process.platform === "win32"
   const pids = []

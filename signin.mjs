@@ -323,23 +323,6 @@ export async function readStoredSignIn({ geminiDir, platform = process.platform,
   return s.state === "present" ? parseStored(s.raw, now) : s
 }
 
-// Metadata queries reuse only the access token agy has already stored. Never
-// refresh or write credentials here, and never fall back from a named profile
-// to the computer's default account. Keep secrets out of sign-in status objects.
-export async function readAccessToken({ geminiDir, platform = process.platform, exec = run, now = Date.now(), env = process.env, home = os.homedir() } = {}) {
-  if (env.AGY_BRIDGE_STORED_SIGNIN === "skip" || ENV_SIGN_INS.some(name => env[name])) return ""
-  try {
-    const s = geminiDir
-      ? { state: "present", raw: await fs.readFile(path.join(geminiDir, "antigravity-cli", "antigravity-oauth-token"), "utf8") }
-      : await credentialStore(platform, env, home, exec).read()
-    if (s.state !== "present") return ""
-    const status = parseStored(s.raw, now)
-    if (status.state !== "present" || status.expired) return ""
-    const access = storedValue(s.raw)?.token?.access_token
-    return typeof access === "string" && /^\S+$/.test(access) ? access : ""
-  } catch { return "" }
-}
-
 // cannotSignIn is why a stored sign-in can't serve agy without a new
 // Google sign-in, or "" when it may.
 export function cannotSignIn(s) {

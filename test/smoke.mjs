@@ -700,8 +700,8 @@ const model = "agy-cli/gemini-test"
 const legacyModel = "agy-cli/gemini-test-low"
 
 {
-  // Only metadata HTTP is mocked. All later chat tests still launch the real
-  // fake-CLI subprocess/ACP transport. No host credential or network is used.
+  // A populated fake credential must never trigger metadata HTTP. Later chat
+  // tests still launch the fake CLI subprocess and exercise ACP transport.
   const originalFetch = globalThis.fetch
   const originalAccounts = process.env.AGY_BRIDGE_ACCOUNTS_DIR
   const originalSignIn = process.env.AGY_BRIDGE_STORED_SIGNIN
@@ -717,14 +717,7 @@ const legacyModel = "agy-cli/gemini-test-low"
   const calls = []
   const before = logs().length
   let usage
-  globalThis.fetch = async (url, init) => {
-    if (!/^https:\/\/(?:daily-)?cloudcode-pa\.googleapis\.com\/v1internal:/.test(url)) throw Error("Unexpected metadata destination")
-    calls.push({ url, auth: init.headers.Authorization })
-    if (url.endsWith("loadCodeAssist") || url.endsWith("fetchAvailableModels")) return Response.json({})
-    return Response.json({ groups: [{ displayName: "Gemini Models", buckets: [{
-      bucketId: "gemini-weekly", window: "weekly", remainingFraction: 0.6, resetTime: "2026-10-27T00:00:00Z",
-    }] }] })
-  }
+  globalThis.fetch = async (url) => { calls.push(url); throw Error("Unexpected metadata HTTP") }
   try { usage = await plugin.auth.usage(async () => ({ type: "api", key: "agy:smoke" }), {}) }
   finally {
     globalThis.fetch = originalFetch
@@ -733,16 +726,11 @@ const legacyModel = "agy-cli/gemini-test-low"
     if (originalSignIn === undefined) delete process.env.AGY_BRIDGE_STORED_SIGNIN
     else process.env.AGY_BRIDGE_STORED_SIGNIN = originalSignIn
   }
-  check("auth.usage exposes measured HTTP quota", usage.windows?.[0]?.used === 40 && usage.windows[0].name === "Gemini · 7 days")
-  check("auth.usage preserves explicit cadence and reset", usage.windows?.[0]?.span === 604800 && usage.windows[0].resetsAt === "2026-10-27T00:00:00.000Z")
-  check("auth.usage participates in routing and keeps bridge auth", usage.windows?.[0]?.aside === false && usage.signIn === "kept")
-  const quotaModels = usage.windows?.[0]?.models ?? []
-  check("auth.usage scopes Gemini quota to base and effort IDs even before catalog refresh",
-    ["gemini-3.8-flash", "gemini-3.8-flash-high", "gemini-3.8-flash-low"].every(id => quotaModels.includes(id)) &&
-    quotaModels.every(id => id.startsWith("gemini-")))
-  check("auth.usage does not invent Google account identity", !usage.user && !usage.plan)
+  check("auth.usage reports unavailable quota without invented windows", usage.windows?.length === 0 && /unavailable/.test(usage.error))
+  check("auth.usage keeps bridge auth", usage.signIn === "kept")
+  check("auth.usage does not invent Google account identity or plan", !usage.user && !usage.plan)
   check("auth.usage never launches CLI or creates a usage workspace", logs().length === before)
-  check("auth.usage queries HTTP with only selected profile access", calls.length > 0 && calls.every(call => call.auth === "Bearer fake-smoke-access"))
+  check("auth.usage never queries vendor HTTP", calls.length === 0)
 }
 
 {

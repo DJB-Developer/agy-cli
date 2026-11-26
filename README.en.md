@@ -47,8 +47,7 @@ channel: Antigravity's models over ACP. The differences:
 - **Tool calls**: Antigravity ACP ends the turn with the call as the reply's
   `tool_calls`. This plugin feeds the client's result back into the same agy
   turn (see "Tool bridge" below).
-- **Usage**: this plugin reads HTTP model-group and per-model quotas; Antigravity ACP reads
-  the quota each reply carries.
+- **Usage**: since 0.2.18, subscription quota and plan queries are disabled. Per-turn token accounting from ACP and local conversation records is retained.
 
 ## Tool bridge
 
@@ -99,8 +98,7 @@ MCP server. The control port listens on loopback only, with a token per process.
   (SillyTavern presets, "continue"/"impersonate", bot frameworks) are served
   instead of rejected; the session ledger stays aligned across turns. See
   "Assistant prefill" below.
-- **Usage and routing**: Magpie shows the agy subscription usage windows and uses
-  measured quotas for their model groups. Unknown groups or readings remain display-only.
+- **Usage and routing**: per-turn tokens remain available. Subscription windows are empty, not exhausted. Magpie still owns routing, but the plugin no longer supplies quota-based model-group limits.
 
 ## Assistant prefill
 
@@ -131,7 +129,7 @@ turn); the models a client gets remain agy's decision.
   a terminal once to sign in. Text and tool calls have been verified on 1.4.12
   and 1.5.0; image input needs 1.5.0.
 - A Magpie build with OpenCode-style provider plugin support.
-- agy older than 1.4.12 is refused for sessions (see "Tool bridge"). HTTP quota queries never execute `/usage`.
+- agy older than 1.4.12 is refused for sessions (see "Tool bridge"). Quota refresh is local status only, with no HTTP or CLI `/usage` query.
 - **Auto-update**: the agy processes the plugin starts get
   `AGY_CLI_DISABLE_AUTO_UPDATE=true` by default, so the processes in the pool
   don't update one binary under each other. agy runs you start yourself are not
@@ -148,28 +146,13 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to 0.2.15 on Magpie's Plugins page. Existing accounts remain usable; add further accounts as needed.
+If already installed, update this GitHub plugin to **0.2.18** and reload it.
+Accounts, credentials and suspension records remain intact; no reimport is needed.
+Refresh each account's quota so the host receives empty windows. If old values or quota cooldowns
+remain visible, refresh provider state and inspect the host cache; do not treat old values as current limits.
+Internal HTTP quota/plan queries are removed, with no fallback to CLI `/usage`.
+See [CHANGELOG.md](CHANGELOG.md) for historical release notes.
 
-0.2.9 restores CLI `/usage` quotas with optional HTTP plan lookup, retaining
-model-group routing and plan ID recognition. Plan failures do not affect quota,
-sign-in or ACP chat. Existing accounts need no reimport.
-
-0.2.7 ports community 0.1.49's resume fix: saved sessions are checked against
-the instructions actually sent to the CLI. After prompt rewrites change, affected
-old sessions rebuild from client history instead of resuming stale instructions
-that keep failing with 429. Instructions requiring no rewrite can still resume.
-Checks remain isolated per account and still reject a different Minimal Agent mode.
-
-0.2.6 ports the six community agy-cli fixes from 0.1.43 through 0.1.48:
-network/credit/429 error handling, tool-loop memory cleanup, tool images sent
-as ACP prompt images, oversized tool-description trimming, and prompt compatibility.
-Account isolation, model-group quota routing, plan lookup, and the Minimal Agent
-UI switch are retained; chat still uses `agy acp`. Oversized catalogs trim prose
-while retaining tool names and argument constraints. If the schemas alone exceed
-the budget, the CLI can still drop tools. A saved session containing tool-result
-images may rebuild its CLI session once after upgrading because its history hash
-changes, replaying the history supplied by the client. Other sessions are unaffected
-by that hash change.
 The marketplace and npm commands below install the upstream community version, without this repository's changes.
 
 From the Magpie community plugins: find "Antigravity (local agy CLI)" on
@@ -204,7 +187,7 @@ code back into Magpie. Links wait 15 minutes.
 - The existing `agy` default account from 0.1.43 keeps working after upgrading.
   **Use the existing CLI account (legacy default)** registers that login again.
 - Each named account owns its CLI credentials, process pool, tool calls, resumable
-  sessions, model catalog and usage reader. Magpie stores an `agy:<name>` reference;
+  sessions, model catalog and local status reader. Magpie stores an `agy:<name>` reference;
   agy refreshes the actual token.
 - Names use 1–64 letters, digits, underscores or hyphens and are normalized to
   lowercase. Reserved names such as `default` are rejected. Existing names cannot
@@ -234,7 +217,7 @@ The [official image](https://github.com/yetone/magpie/blob/main/Dockerfile) sets
 No D-Bus or GNOME Keyring installation is needed. Do not put tokens in Compose.
 
 Verified with native agy 1.5.9 in a non-root Linux container without network access:
-`models`, ACP and quota queries read the selected profile for both accounts rather than
+`models` and ACP read the selected profile for both accounts rather than
 using the default credential. This used dummy tokens to verify storage isolation,
 not real model calls.
 
@@ -257,52 +240,28 @@ not real model calls.
   construction has unit tests; end-to-end runs on real Windows hardware are still
   pending.
 
-## Usage quota
+## Quota and plans (0.2.18)
 
 ```sh
 magpie quota agy-cli --json
 magpie quota refresh agy-cli --json
 ```
 
-Since 0.2.17, the plugin uses **HTTP quotas and HTTP plans; chat remains on official `agy acp`**.
-This replaces the CLI `/usage` reader from 0.2.9–0.2.16; release-specific notes below are historical.
+**Subscription quota and plan queries are disabled; chat still uses official `agy acp`.**
+This follows [T3 Code PR #43026](https://github.com/pingdotgg/t3code/pull/43026): its maintainer reports
+Google's warning that external clients should use ACP and internal API calls can flag accounts.
+That warning does not establish why any particular account was suspended, or guarantee this release is ban-proof.
 
-- Query `retrieveUserQuotaSummary`, supplementing uncovered catalog models with `fetchAvailableModels`
-  when necessary. Follow T3 Code's consumer daily/prod endpoint preference; do not sum duplicate buckets.
-- Independently query `loadCodeAssist` for plans. Prefer paid tier, then current tier, retaining Free,
-  Pro, Ultra, Ultra Lite and unknown tier IDs. Either metadata result can succeed without the other.
-- Named accounts read only their own CLI credentials. Concurrent reads coalesce; credential changes
-  and runtime disposal fence late results and suspension signals. Manual refresh does not reuse a
-  completed successful response.
-- Reuse only valid CLI-stored access tokens. Never refresh OAuth tokens, write credentials, onboard,
-  or send a keepalive prompt. Without a valid access token, limits are temporarily unavailable;
-  refresh after a real CLI chat renews it, or sign in again if CLI authentication requires it.
-  A metadata HTTP 401 must not mark a renewable CLI login dead.
-- Do not copy a fixed Hub User-Agent. Requests use the runtime's fetch network configuration,
-  bounded deadlines/body sizes, and restricted redirects. HTTP proxy support depends on the host
-  runtime; working CLI networking alone does not establish working HTTP metadata networking.
+- Removes direct HTTP `retrieveUserQuotaSummary`, `fetchAvailableModels` and `loadCodeAssist` requests.
+- Refresh returns `windows: []`, an unavailable explanation and `signIn: kept`, with no plan. Unknown limits are neither 0% nor 100%, and are not a sign-out.
+- No access-token extraction, background OAuth refresh, keepalive/inference probes or CLI `/usage` fallback.
+- Per-turn token reporting and read-only local conversation accounting remain; these are not subscription balances.
+- Account selection, concurrency, session isolation and actual chat errors remain intact; queried quota-based model-group windows are no longer supplied.
+- Existing TOS records still return the reason and `signIn: expired`, and may notify local Magpie to disable the account. That loopback management call is not a Google quota request.
+- The absence of a local suspension record does not prove chat eligibility. Refresh neither probes for new bans nor clears existing ones.
 
-### Model-scoped routing
-
-Measured windows have exact catalog model allowlists, including exposed aliases and effort variants.
-Gemini, specialized pools, and shared Claude/GPT allowances stay separate. More specific groups take
-precedence; unknown independent pools never borrow the generic Gemini allowance. Per-model fallback
-readings only cover confirmed model/alias matches, never a whole family inferred from one model.
-Five-hour and weekly limits remain separate constraints. Unknown/missing readings are not 0% or 100%;
-windows without reliable model membership are display-only, never global routing restrictions.
-
-HTTP quota reads spawn no agy process and are not on the chat path. Existing session affinity,
-routing policy and process pools are unchanged. Reload the plugin and refresh account quotas.
-
-### Errors and suspension
-
-HTTP 401, ordinary 403, 429, transport failures and missing readings affect metadata only. A quota
-endpoint's 429 does not establish exhausted chat quota. Explicit 403 / TOS_VIOLATION still persists
-suspension, blocks later CLI chat and uses the existing Magpie auto-disable option. Successful reads,
-new tokens and reattaching an account do not automatically clear a suspension. Blocked accounts do
-not keep querying metadata. Errors shown in Magpie are redacted; raw tokens, authorization headers
-and entire upstream bodies are not logged. Readable quotas/plans do not prove chat eligibility;
-no extra chat is sent to probe it.
+Rolling back to 0.2.16 alone does not remove all internal HTTP: that version still queries plans.
+Reload the plugin and refresh host state after upgrading.
 
 ## Request diagnostics and session isolation (0.2.16)
 
@@ -363,7 +322,6 @@ next HTTP request may still return its tool results. This work does not change a
 | `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60 s / 5 min / 30 min | Limits for process startup, agy silence, and waiting on a client tool result |
 | `AGY_BRIDGE_DETACHED_EVICT_MS` | 30000 | How long a suspended tool turn whose client disconnected may keep its pool slot |
 | `AGY_BRIDGE_MAX_PROMPT_BYTES` | 114688 (112 KiB) | Byte budget for the replayed history prompt |
-| `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | Total time budget for a usage query, capped at 18000 |
 | `AGY_BRIDGE_STORED_SIGNIN` | unset | `skip` stops the plugin from reading agy's stored sign-in |
 | `AGY_BRIDGE_MCP_TRACE` | unset | Writes MCP channel traffic to the given file; for debugging only |
 | `AGY_CLI_DISABLE_AUTO_UPDATE` | `true` for the plugin's agy processes | agy's own variable. When you set it, agy gets your value; see "Requirements" |
@@ -425,8 +383,7 @@ off unless you turn it on.
   `agy` in a terminal to sign in there.
 - **HTTP 503**: the pool is full. Raise `AGY_BRIDGE_MAX_PROCS` and the Providers
   page Concurrency, or reduce the number of simultaneous sessions.
-- **Usage shows "Limits not available" or a version error**: that window has no
-  measurable data. For a version error, upgrade agy to 1.1.11 or later.
+- **Limits unavailable or plans missing**: expected in 0.2.18 after internal API removal. Repeated refresh/sign-in will not restore this feature; ACP chat and per-turn token accounting remain.
 - **Image requests return HTTP 400**: the running agy does not advertise image
   support (1.5.0 or later is needed). Only inline base64 is accepted; image URLs
   and binary documents such as PDFs are rejected.
@@ -463,10 +420,9 @@ list of changes are in [NOTICE.md](NOTICE.md).
 
 Explicit CLI service-disabled/TOS wording or structured 403 PERMISSION_DENIED with
 TOS_VIOLATION marks only that profile suspended. Detection covers terminal warning
-chunks, retry lines, ACP errors, current-turn logs and CLI quota failures. Generic
-403s, region restrictions, expired credentials, quota limits and ordinary HTTP plan
-failures do not mark a suspension. Since 0.2.12, explicit metadata suspension 403s
-can also mark the account. Chat remains on `agy acp`.
+chunks, retry lines, ACP errors, current-turn logs and database errors. Generic
+403s, region restrictions, expired credentials and quota limits do not mark a suspension.
+0.2.18 removes network quota/plan checks. Chat remains on `agy acp`.
 
 Whole responses return HTTP 403. Streams emit `permission_error` with numeric
 `status: 403`, `code: TOS_VIOLATION` and the suspension reason, rather than successful
@@ -484,8 +440,8 @@ the host may label this as an expired sign-in, while the reason identifies suspe
 Token refresh, quota refresh and restart do not clear the mark. Persistence failure
 is logged and the current runtime stays blocked.
 
-Quota and plan success cannot prove inference eligibility. Detection requires an
-explicit CLI or metadata suspension signal; no extra inference probes are sent. Manually turn off any account
+The absence of a local suspension record does not prove inference eligibility. Detection requires an
+explicit CLI suspension signal during actual chat; no extra inference probes are sent. Manually turn off any account
 already known to be suspended until a signal has been observed. After a successful
 appeal, stop Magpie/the plugin, remove only that profile's `service-status.json`,
 restart and refresh usage, then re-enable the account in Magpie if needed.
@@ -503,24 +459,14 @@ not replace explicit user and session identities in multi-user chat applications
 Under tool-budget pressure, ordinary property description fragments are dropped
 so tool purposes and complex parameter contracts retain more room. Catalogs that
 fit remain unchanged; tool names and schema structure are preserved. CLI chat,
-CLI quota, optional HTTP plans, model-group routing, the minimal-agent UI option
-and persistent TOS suspension detection are retained.
+the minimal-agent UI option and persistent TOS suspension detection are retained.
 
 
-## Account state during quota refresh (0.2.12)
+## Account state during quota refresh (historical)
 
-After successful CLI quota, the existing HTTP plan request also checks explicit
-service-suspension 403 responses: structured TOS_VIOLATION or the complete service
-disabled message. A positive signal persists the account mark, shows the reason in
-usage, and blocks later chat on that profile even when CLI quota still works.
-Other profiles remain usable. No extra HTTP or inference request is added.
-The existing 1.5-second metadata deadline and 64 KiB body limit apply; late results
-after timeout/cancellation cannot change status. Ordinary plan failures stay optional.
-
-This is a lightweight check, not proof of inference access: if only the chat endpoint
-refuses an account, quota/plan refresh may not expose it. Successful metadata queries
-do not display a verified chat status or clear a persisted suspension. CLI eligibility
-and region errors retain their reasons without being labelled TOS bans.
+0.2.12–0.2.17 used HTTP metadata to detect new suspension signals. 0.2.18 removes that path.
+Refresh now reports only locally recorded suspension. Explicit TOS errors from actual CLI chat
+still persist and quarantine the account; recovery after an appeal remains manual.
 
 ## Automatic routing quarantine (0.2.13)
 
@@ -530,7 +476,7 @@ the existing `POST http://127.0.0.1:3430/api/login/off` asynchronously using the
 container's existing `MAGPIE_WEB_KEY`. This is the same account toggle as the UI,
 not credential deletion or a direct edit to Magpie files. Magpie continues to own
 account selection, session affinity, concurrency, quota routing and attribution.
-Chat and quotas still use agy CLI; plans still use HTTP.
+Chat still uses agy CLI; quota refresh reports local state without querying Google.
 
 This targets `magpie web` on port 3430 with a fixed web key, including the inspected
 v0.1.3078 API. Requests only go to loopback, bypass vendor proxies, never follow
@@ -555,7 +501,7 @@ only local blocking, not automatic changes to Magpie's enabled-account list.
 - Mark temporary static/probing model lists as fallback so Magpie preserves saved model selections. Catalog state remains account-local.
 - Emit explicit status 400 for recognized request-content rejections (including HTTP 400 for non-streaming replies). Ordinary quota errors remain 429; TOS errors retain 403, `TOS_VIOLATION`, and automatic account quarantine.
 
-This release does not adopt upstream's single-account replacement login, system-prompt relocation, or CLI installer. Multi-account isolation, model-group quota routing, HTTP plan lookup, and UI options remain intact. Chat and quota queries still use agy CLI; Magpie 0.1.4246's installer hook is not required.
+That historical fix did not adopt upstream single-account replacement login, prompt relocation or CLI installation. Magpie 0.1.4246 is not required. Version 0.2.18 separately removes quota and plan queries.
 
 
 ## Per-prompt database errors and recovery hints (0.2.15)
@@ -568,4 +514,4 @@ In addition to existing ACP, warning and log handling, the bridge reads only the
 - Explicit TOS denial retains 403/`TOS_VIOLATION`, persistent account blocking and automatic quarantine, without an automatic recovery date. Generic 403 is not a permanent TOS ban; recognized request rejection remains 400.
 - Output is not buffered until completion. A late database error cannot retract already-streamed text/tool calls and does not transparently replay tools.
 
-Chat and quota still use agy CLI; existing HTTP plan lookup, model-group routing, multi-account isolation and UI options remain unchanged. Update and reload the plugin; no credential migration or container changes are required.
+Chat still uses agy CLI. Version 0.2.18 removes quota and plan queries but retains per-prompt database error detection. Reload after upgrading; no credential migration or container changes are required.

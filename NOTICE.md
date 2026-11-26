@@ -25,10 +25,14 @@
 仅检查本轮最后的错误步骤、读取恢复提示、验证会话文件身份。
 上游为 MIT，Copyright (c) 2026 T3 Tools Inc.；许可正文与版权保留于 LICENSE。
 本仓适配 CLI 的 `antigravity-cli/conversations` 路径、Bun/Node 只读 SQLite、多账号封禁和 Magpie 错误协议，0.2.15 当时未采用 T3 Code 的 HTTP 额度查询。
-当前 HTTP 额度改造参考 `pingdotgg/t3code@634ee43deb6d5fc0feae77153d33df1e97ffb303`
+0.2.17 的历史 HTTP 额度改造参考 `pingdotgg/t3code@634ee43deb6d5fc0feae77153d33df1e97ffb303`
 的 `apps/server/src/provider/antigravityUsageLimits.ts`（MIT，Copyright (c) 2026 T3 Tools Inc.）。
 适配到 Magpie 的精确模型组路由、账号隔离和明确封禁检测；不复制其固定 Hub 身份或旧 ACP token 刷新分支。
 本仓不因参考该实现而声称获得 Google 对模型网关用途的授权。
+0.2.18 同步 `pingdotgg/t3code@96423cb5e2614eeb7a033cc7b755795d88a9158a`
+（[PR #43026](https://github.com/pingdotgg/t3code/pull/43026)，@juliusmarminge）的内部 API 移除方向：
+删除 HTTP 额度和本仓既有套餐查询，不提取 access token，不回退到 CLI `/usage`；保留本地 token 计量、ACP 聊天与明确封禁停用。
+维护者转述的 Google 警告不是本仓对任何具体封禁原因的证明，也不构成防封保证。
 下文保留上游的历史来源记录；其中包名、版本和仓库描述属于上游记录。
 
 本包（`@magpie-community/opencode-agy-cli-auth`，版本 0.1.0）源自 Antigravity 桥接插件
