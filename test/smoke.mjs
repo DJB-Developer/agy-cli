@@ -894,7 +894,7 @@ async function launchedModel(body) {
   const user = lastOf("user")
   check("ACP session uses the isolated agent", ["tools: []", "inheritMcp: false", "inheritCustomizations: false"].every(line => init.agentConfig.includes(line)), init.agentConfig)
   check("agy keeps its own prompt components by default", !init.agentConfig.includes("excludeDefaultComponents"), init.agentConfig)
-  check("ACP client names itself, not an editor", init.clientInfo?.name === "opencode-agy-cli-auth" && init.clientInfo?.version === JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version, JSON.stringify(init.clientInfo))
+  check("ACP client uses the pinned t3-code name and version", init.clientInfo?.name === "t3-code" && init.clientInfo?.version === "0.1.12", JSON.stringify(init.clientInfo))
   check("client system prompt is appended to the session instructions", init.systemAppend?.includes("SYSTEM-PROMPT-MARKER"))
   check("fresh prompt carries only the user text", user.text === "hello world", JSON.stringify(user.text))
   check("client tools are served through the ide-tools port", !!init.idePort && !logs().some(event => event.type === "ncExit"))

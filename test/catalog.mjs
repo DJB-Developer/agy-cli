@@ -137,10 +137,12 @@ test("会话开放的型号才列出：不等请求，探测会话就列出 Clau
     assert.equal(after["gemini-3.8-flash"], undefined, "会话没开放的 Gemini 也不应列出")
     assert.equal(after["mystery-model"], undefined)
     assert.ok(after["gemini-4-argon"])
-    // 探测只开会话、不发 prompt，用插件自己的名字，进程跑完就关。
+    // 探测只开会话、不发 prompt，使用指定的 ACP 名称和版本，进程跑完就关。
     assert.equal(kit.acpLog.filter(entry => entry.method === "session/prompt").length, 0, "探测不应发 prompt")
     assert.equal(kit.acpLog.filter(entry => entry.method === "session/new").length, 1)
-    assert.equal(kit.acpLog.find(entry => entry.method === "initialize")?.params?.clientInfo?.name, "opencode-agy-cli-auth")
+    const info = kit.acpLog.find(entry => entry.method === "initialize")?.params?.clientInfo
+    assert.equal(info?.name, "t3-code")
+    assert.equal(info?.version, "0.1.12")
     assert.deepEqual(kit.acpSpawns.map(spawn => spawn.args), [["acp"]])
     assert.equal(kit.children.size, 0, "探测的 agy acp 应已退出")
     // 已知开放什么之后不再探测。

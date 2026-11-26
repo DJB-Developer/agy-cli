@@ -81,15 +81,10 @@ function agyTooOld(version) {
   }
   return null
 }
-// agy is told who is connecting: this plugin, by its own package name.
-const CLIENT_INFO = (() => {
-  try {
-    const pkg = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
-    return { name: String(pkg.name).replace(/^@[^/]+\//, ""), version: String(pkg.version) }
-  } catch {
-    return { name: "opencode-agy-cli-auth", version: "0.0.0" }
-  }
-})()
+// ACP client identity override, pinned to T3's server package at
+// pingdotgg/t3code@5db3ecd1e3e95bc15a6e1ada807424ab2db4fc23 (2026-11-26).
+// This does not change the package identity or imply T3 affiliation.
+const CLIENT_INFO = { name: "t3-code", version: "0.1.12" }
 const AGENT_NAME = "magpie-bridge"
 const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
@@ -1824,7 +1819,7 @@ class Proc {
   async #handshake(signal) {
     const init = await this.measure("initialize", () => this.conn.request("initialize", {
       protocolVersion: 1,
-      // The plugin's own name. agy decides which models it offers this client,
+      // The configured client label. agy decides which models it offers this client,
       // and the catalog follows what the session advertises.
       clientInfo: CLIENT_INFO,
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },

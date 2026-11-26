@@ -20,9 +20,11 @@ them to a local `agy acp` process, and converts the output back into a streamed
 response.
 
 - The work is done by the real agy CLI over the ACP channel it ships with. The
-  ACP handshake's `clientInfo` is the plugin's own package name and version
-  (`opencode-agy-cli-auth`), not Zed or any other editor, and the plugin does
-  not call Google's internal endpoints directly.
+  ACP handshake uses `clientInfo.name: t3-code` and version `0.1.12`, pinned to
+  the T3 server version checked on 2026-11-26 (no automatic synchronization).
+  The npm package name and version are unchanged. This does not imply T3 Code affiliation,
+  authorization, or reduced suspension risk. The plugin does not call Google's
+  internal endpoints directly.
 - Tools that belong to the client, such as file reads, writes and shell commands,
   are exposed to the model over MCP. The client runs them and the results flow
   back into the same agy conversation, so the model sees ordinary native tool
@@ -146,7 +148,7 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to **0.2.18** and reload it.
+If already installed, update this GitHub plugin to **0.2.19** and reload it.
 Accounts, credentials and suspension records remain intact; no reimport is needed.
 Refresh each account's quota so the host receives empty windows. If old values or quota cooldowns
 remain visible, refresh provider state and inspect the host cache; do not treat old values as current limits.
