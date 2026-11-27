@@ -16,7 +16,7 @@ import { startLogin } from "./login.mjs"
 import { ensureGeminiArrayItems } from "./array-items.mjs"
 import { expandToolSchema } from "./tool-schema.mjs"
 import { fitTools } from "./tool-budget.mjs"
-import { hint, outgoing, turnsAway } from "./cloak.mjs"
+import { DEFAULT_SLASH_COMMANDS, defuseSlashCommands, restoreSlashCommands, hint, outgoing, turnsAway } from "./cloak.mjs"
 import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import { watchPromptOutcome, recoveryTime } from "./turn-outcome.mjs"
 import { createRequestTrace, waitWithSignal, throwIfAborted } from "./request-lifecycle.mjs"
@@ -61,15 +61,13 @@ const backgroundBlocked = async opts => {
 const forgetStoredSignIn = opts => { if (!account.dir) defaultForgetStoredSignIn(opts) }
 
 const PROVIDER_ID = "agy-cli"
-// Client tools reach the session through a private `nc` placed first on agy's
-// PATH: agy dials `--ide-mcp-port` by running `nc 127.0.0.1 <port>`. That is
-// how agy works, not a documented interface, and it was checked on 1.4.12 and
-// 1.5.0. An older agy is refused with a clear message; a version agy doesn't
-// report is not known to be older, so the session goes ahead.
-const MIN_AGY_VERSION = "1.4.12"
+// Align the model-access version gate with pingdotgg/t3code#43087.
+// Compare numeric triplets, including the CLI/server prefixes; unknown versions
+// stay allowed. This is a support floor, not a claim that every newer build was tested.
+const MIN_AGY_VERSION = "1.5.1"
 function agyTooOld(version) {
   const parse = value => {
-    const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(value ?? "").trim())
+    const match = /^(?:v|agy_acp_server_)?(\d+)\.(\d+)\.(\d+)/.exec(String(value ?? "").trim())
     return match ? match.slice(1).map(Number) : null
   }
   const have = parse(version)
@@ -77,7 +75,7 @@ function agyTooOld(version) {
   const need = parse(MIN_AGY_VERSION)
   for (let i = 0; i < 3; i++) {
     if (have[i] > need[i]) return null
-    if (have[i] < need[i]) return `agy ${version} is older than ${MIN_AGY_VERSION}, the oldest version this plugin was checked on. Update agy.`
+    if (have[i] < need[i]) return `agy ${version} is older than ${MIN_AGY_VERSION}, the minimum supported version. Update agy.`
   }
   return null
 }
@@ -756,17 +754,38 @@ function normalizeEffort(value) {
   return EFFORT_ORDER.includes(direct) ? direct : ""
 }
 
-function requestedEffort(body) {
+function requestHeader(fetchInput, init, name) {
+  const headers = new Headers(init?.headers ?? (fetchInput instanceof Request ? fetchInput.headers : undefined) ?? {})
+  return headers.get(name)?.trim() || ""
+}
+
+// The level the request names. magpie says the effort the client asked for in
+// X-Magpie-Effort (said): its Anthropic body carries only a thinking budget,
+// held under max_tokens, or no thinking at all when max_tokens is small, so a
+// level read from the budget put reasoning_effort "high" at max_tokens 4000 on
+// -low, and "low" at max_tokens 1500 on the family's default high
+// (plugins#1540). What magpie says comes first; the budget is the last guess.
+function namedEffort(body, said = "") {
   const forced = normalizeEffort(process.env.AGY_BRIDGE_EFFORT)
   if (forced) return forced
   const thinking = body.thinking?.type
   if (thinking === "disabled") return ""
+  const told = normalizeEffort(said)
+  if (told) return told
   const generic = [body.reasoning_effort, body.reasoningEffort, body.reasoning?.effort,
     body.generationConfig?.thinkingConfig?.thinkingLevel].map(normalizeEffort).find(Boolean)
   if (generic) return generic
   if (thinking !== "enabled" && thinking !== "adaptive") return ""
-  const direct = normalizeEffort(body.output_config?.effort)
-  if (direct) return direct
+  return normalizeEffort(body.output_config?.effort)
+}
+
+function requestedEffort(body, said = "") {
+  return namedEffort(body, said) || budgetEffort(body)
+}
+
+function budgetEffort(body) {
+  const thinking = body.thinking?.type
+  if (thinking !== "enabled" && thinking !== "adaptive") return ""
   const budget = Number(body.thinking?.budget_tokens)
   if (!Number.isFinite(budget) || budget <= 0) return ""
   if (budget <= 4096) return "low"
@@ -829,12 +848,12 @@ function resolveCatalogAlias(catalog, model) {
   return { id: model, inlineEffort: "" }
 }
 
-function resolveAgyModel(listed, model, body) {
+function resolveAgyModel(listed, model, body, said = "") {
   const catalog = listed.routing ?? listed
   const { id: resolvedId, inlineEffort } = resolveCatalogAlias(catalog, model)
   const family = catalog.routes.get(resolvedId)
   if (!family) return resolvedId
-  const requested = requestedEffort(body) || inlineEffort
+  const requested = namedEffort(body, said) || inlineEffort || budgetEffort(body)
   const effort = requested ? closestEffort(requested, family.efforts) : family.defaultEffort
   return family.byEffort.get(effort)
 }
@@ -1827,7 +1846,9 @@ class Proc {
     throwIfAborted(signal)
     this.agentVersion = init?.agentInfo?.version ?? null
     const tooOld = agyTooOld(this.agentVersion)
-    if (tooOld) throw new Error(tooOld)
+    if (tooOld) throw Object.assign(new Error(tooOld), {
+      statusCode: 400, code: "AGY_VERSION_UNSUPPORTED", noRetry: true,
+    })
     const capabilities = init?.agentCapabilities ?? {}
     this.supportsImages = capabilities.promptCapabilities?.image === true ||
       capabilities.prompt_capabilities?.image === true
@@ -2021,7 +2042,17 @@ class Proc {
   }
 
   #onNotification(method, params) {
-    if (method !== "session/update" || params?.sessionId !== this.sessionId) return
+    if (method !== "session/update") return
+    if (params?.update?.sessionUpdate === "available_commands_update" &&
+      (!this.sessionId || params?.sessionId === this.sessionId) &&
+      Array.isArray(params.update.availableCommands)) {
+      this.slashCommands ??= new Set(DEFAULT_SLASH_COMMANDS)
+      for (const cmd of params.update.availableCommands) {
+        if (typeof cmd?.name === "string" && cmd.name) this.slashCommands.add(cmd.name)
+      }
+      return
+    }
+    if (params?.sessionId !== this.sessionId) return
     if (params.update?.sessionUpdate === "config_option_update" && Array.isArray(params.update.configOptions)) {
       this.configOptions = params.update.configOptions
       this.currentSelectionKey = null
@@ -2208,7 +2239,9 @@ class Proc {
           if (serviceStatus.get()) throw this.#formatAgentError(TOS_MESSAGE)
           result = await this.conn.request("session/prompt", {
             sessionId: this.sessionId,
-            prompt: promptParts.length ? promptParts : [{ type: "text", text: "" }],
+            prompt: (promptParts.length ? promptParts : [{ type: "text", text: "" }]).map(part =>
+              part?.type === "text" && typeof part.text === "string"
+                ? { ...part, text: defuseSlashCommands(part.text, this.slashCommands) } : part),
           })
         } catch (error) {
           // Optional database evidence must never downgrade a positive ban
@@ -2410,6 +2443,7 @@ class Proc {
     const name = message.name
     let args = message.arguments ?? {}
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("agy bridge: invalid tool arguments")
+    args = restoreSlashCommands(args, this.slashCommands)
     const tool = this.tools.find((item) => item.name === name)
     if (!tool) throw new Error(`agy bridge: undeclared tool ${name}`)
     // agy consumes its internal toolSummary instead of forwarding it to MCP.
@@ -4140,6 +4174,30 @@ function appendSchemaHint(node, hint) {
   }
 }
 
+function plainSchemaMap(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+}
+
+// agy rejects every extra key on an object whose properties map is missing
+// or empty when additionalProperties is left out (plugins#1332). JSON Schema
+// allows those keys. An explicit additionalProperties, a restrictive
+// unevaluatedProperties, a non-empty properties map, and a non-empty
+// patternProperties map stay as declared.
+function emptyObjectIsOpen(node) {
+  const resolved = typeof node.type === "string"
+    ? node.type
+    : Array.isArray(node.type)
+      ? node.type.find((item) => item !== "null") || null
+      : null
+  const implicitObject = node.type === undefined && plainSchemaMap(node.properties)
+  if (resolved !== "object" && !implicitObject) return false
+  if (node.additionalProperties !== undefined) return false
+  if (node.unevaluatedProperties !== undefined && node.unevaluatedProperties !== true) return false
+  if (plainSchemaMap(node.patternProperties) && Object.keys(node.patternProperties).length > 0) return false
+  if (node.properties !== undefined && !plainSchemaMap(node.properties)) return false
+  if (plainSchemaMap(node.properties) && Object.keys(node.properties).length > 0) return false
+  return true
+}
 
 // Sanitize JSON Schema constructs that agy's ACP -> Google Code Assist translator
 // converts into invalid Schema protos (e.g. union types leaving stale array/object
@@ -4258,6 +4316,9 @@ function sanitizeInputSchema(schema) {
   // ECMA-262. Translate or drop those patterns here; tool-call arguments in
   // the response are plain JSON and do not need a reverse transform.
   sanitizePatternFields(out)
+  // After patterns: a map whose keys were all dropped is no longer a
+  // patternProperties object. Say the remaining empty object is open.
+  if (emptyObjectIsOpen(out)) out.additionalProperties = true
   return out
 }
 
@@ -6184,9 +6245,10 @@ const createPlugin = async () => {
             // derives a key, instructions or history from the body.
             const layout = requestLayout(body)
             body = { ...canonicalBody(body), model: requestedModel }
-            const model = resolveAgyModel(await trace.measure("catalog", () => waitWithSignal(loadModelCatalog(agy), init.signal)), requestedModel, body)
+            const saidEffort = requestHeader(fetchInput, init, "x-magpie-effort")
+            const model = resolveAgyModel(await trace.measure("catalog", () => waitWithSignal(loadModelCatalog(agy), init.signal)), requestedModel, body, saidEffort)
             throwIfAborted(init.signal)
-            const selection = { model: requestedModel, effort: requestedEffort(body) }
+            const selection = { model: requestedModel, effort: requestedEffort(body, saidEffort) }
             const callerWorkDir = namedWorkDirectory(body, init)
             const convKey = conversationKey(body, callerWorkDir || "")
             trace.context({ conv: digest(convKey).slice(0, 12), explicit_session: !!(body.metadata?.session_id || body[TRANSPORT_SCOPE]?.[0]), identity_source: body[TRANSPORT_SCOPE]?.[0] ? "magpie_header" : body.metadata?.session_id ? "metadata" : "legacy", nonstream: body.stream === false })

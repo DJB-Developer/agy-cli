@@ -323,7 +323,7 @@ test("#1064 agyPath 变了，旧 agy 开放的型号不再列出，新 agy 重�
   })
 })
 
-test("握手报出的 agy 版本低于 1.4.12 时拒绝会话并说明原因", async () => {
+test("握手报出的 agy 版本低于 1.5.1 时拒绝会话并说明原因", async () => {
   await withKit({ agentVersion: "1.4.11" }, async (kit) => {
     kit.defaultPrompt = async (agent) => {
       await agent.text("ok")
@@ -331,7 +331,7 @@ test("握手报出的 agy 版本低于 1.4.12 时拒绝会话并说明原因", a
     }
     const response = await kit.request(baseBody({ model: "agy-cli/gemini-4-argon", tools: [], messages: [{ role: "user", content: "hi" }] }))
     const text = response.status === 200 ? JSON.stringify((await readSse(response)).error) : await response.text()
-    assert.match(text, /agy 1\.4\.11 is older than 1\.4\.12/)
+    assert.match(text, /agy 1\.4\.11 is older than 1\.5\.1/)
     assert.equal(kit.acpLog.filter(entry => entry.method === "session/new").length, 0, "旧版本不应开会话")
   })
 })

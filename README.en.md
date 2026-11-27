@@ -57,9 +57,12 @@ agy reaches `--ide-mcp-port` by running `nc 127.0.0.1 <port>`. The plugin puts
 a private `nc` first on agy's PATH, which connects that line to the plugin's own
 MCP server. The control port listens on loopback only, with a token per process.
 
-- This rests on how agy dials, not on an interface agy promises. It was checked
-  on 1.4.12 and 1.5.0. On an agy older than 1.4.12 the plugin refuses the session
-  and says to update.
+- The [official ACP docs](https://antigravity.google/docs/ide/extensions/acp/#flags)
+  document `--ide-mcp-port` and the requirement for `nc` on PATH. The private
+  `nc` is this plugin's bridge implementation, not an endorsement by Google.
+- The development version requires a known agy version of **1.5.1 or later**,
+  matching T3 Code #43087's version gate. Chat and model probes check after
+  `initialize`; older runtimes cannot create/resume a session or receive a prompt.
 - The private `nc` applies only to the agy processes the plugin starts, but for
   those it stands in for every `nc` agy runs.
 - Every client tool is listed with `_meta: {"antigravity/alwaysLoad": true}`.
@@ -79,8 +82,8 @@ MCP server. The control port listens on loopback only, with a token per process.
   history.
 - **Streaming with thought summaries**: summaries come back as `thinking` blocks.
   Set `AGY_BRIDGE_THINKING=0` to turn them off.
-- **Image input**: inline base64 PNG, JPEG, GIF and WebP. This needs agy 1.5.0 or
-  newer, because the ACP server has to advertise image support. An image a tool
+- **Image input**: inline base64 PNG, JPEG, GIF and WebP. In addition to meeting
+  the 1.5.1 minimum, the ACP server must advertise image support. An image a tool
   returns (a screenshot from `read`) goes to agy as a prompt image too: over MCP,
   agy would save it to a file the model can't open.
 - **Tool calls**: parallel and consecutive calls both work. A tool that runs past
@@ -126,19 +129,32 @@ turn); the models a client gets remain agy's decision.
 
 ## Requirements
 
-- The Antigravity CLI (`agy`) with the `acp` subcommand. Signing in from Magpie
-  needs agy 1.5.0 or later (`agy acp --login`); with an older one, run `agy` in
-  a terminal once to sign in. Text and tool calls have been verified on 1.4.12
-  and 1.5.0; image input needs 1.5.0.
+- The Antigravity CLI (`agy`) **1.5.1 or later**, with the `acp` subcommand.
+  Magpie sign-in uses `agy acp --login`. This is a support floor, not a claim
+  that every newer build has been tested.
 - A Magpie build with OpenCode-style provider plugin support.
-- agy older than 1.4.12 is refused for sessions (see "Tool bridge"). Quota refresh is local status only, with no HTTP or CLI `/usage` query.
+- Version checks accept `v` / `agy_acp_server_` prefixes, trim whitespace and
+  compare numeric triplets only. Missing/unparseable versions are allowed to
+  try, not considered verified. Prerelease/build suffixes are not ordered separately.
+- Known versions below 1.5.1 produce HTTP 400 / `AGY_VERSION_UNSUPPORTED`, an
+  update message and `noRetry` for chat, without expiring sign-in or recording a
+  suspension. Model probes stop their process; cached/fallback models may still
+  appear, but chat remains subject to the version gate.
+- Quota refresh is local status only, with no HTTP or CLI `/usage` query.
 - **Auto-update**: the agy processes the plugin starts get
   `AGY_CLI_DISABLE_AUTO_UPDATE=true` by default, so the processes in the pool
   don't update one binary under each other. agy runs you start yourself are not
   affected and update as usual. If you set `AGY_CLI_DISABLE_AUTO_UPDATE`
   yourself (`false` included), the plugin passes your value on as written. If
   you use agy only through this plugin, run `agy` in a terminal now and then so
-  it updates: an old version stands out too.
+  it updates; a version below the support floor must be upgraded first.
+
+This selectively aligns the version gate from
+[T3 Code #43087](https://github.com/pingdotgg/t3code/pull/43087), retaining the
+`t3-code / 0.1.12` identity override for now. It does not fully adopt that PR's
+principle that each client identifies as itself. It does not copy T3's managed
+installer/remote compatibility manifest or add network version probes, and
+does not guarantee protection against account suspension.
 
 ## Install
 
@@ -149,6 +165,7 @@ magpie plugin add github:DJB-Developer/agy-cli
 ```
 
 If already installed, update this GitHub plugin to **0.2.19** and reload it.
+The 1.5.1 floor described above is an unreleased development change, not part of 0.2.19.
 Accounts, credentials and suspension records remain intact; no reimport is needed.
 Refresh each account's quota so the host receives empty windows. If old values or quota cooldowns
 remain visible, refresh provider state and inspect the host cache; do not treat old values as current limits.
@@ -386,8 +403,10 @@ off unless you turn it on.
 - **HTTP 503**: the pool is full. Raise `AGY_BRIDGE_MAX_PROCS` and the Providers
   page Concurrency, or reduce the number of simultaneous sessions.
 - **Limits unavailable or plans missing**: expected in 0.2.18 after internal API removal. Repeated refresh/sign-in will not restore this feature; ACP chat and per-turn token accounting remain.
+- **HTTP 400 / `AGY_VERSION_UNSUPPORTED`**: update agy to 1.5.1 or later first;
+  retrying or signing in again cannot fix an incompatible version.
 - **Image requests return HTTP 400**: the running agy does not advertise image
-  support (1.5.0 or later is needed). Only inline base64 is accepted; image URLs
+  support (meeting the version floor is not sufficient). Only inline base64 is accepted; image URLs
   and binary documents such as PDFs are rejected.
 - **A reply contains "Agent execution terminated due to error."**: that is agy's
   in-band error marker. The plugin reads the real cause from agy's log and ends

@@ -278,8 +278,14 @@ class FakeAgy {
       // What agy offers this client in the session; unset, the session names none.
       if (this.kit.offeredModels) models.availableModels = (typeof this.kit.offeredModels === "function" ? this.kit.offeredModels(this.child.args) : this.kit.offeredModels).map(([modelId, name]) => ({ modelId, name }))
       // A real signed-in agy takes ~3s to open a session (#1064).
-      if (this.kit.sessionNewDelayMs) setTimeout(() => this.respond(id, { sessionId: this.sessionId, models }), this.kit.sessionNewDelayMs)
-      else this.respond(id, { sessionId: this.sessionId, models })
+      const sendNew = () => {
+        this.respond(id, { sessionId: this.sessionId, models })
+        if (Array.isArray(this.kit.availableCommands)) this.update({
+          sessionUpdate: "available_commands_update", availableCommands: this.kit.availableCommands,
+        })
+      }
+      if (this.kit.sessionNewDelayMs) setTimeout(sendNew, this.kit.sessionNewDelayMs)
+      else sendNew()
     } else if (method === "session/set_model") {
       this.kit.setModels.push(params.modelId)
       this.respond(id, {})
@@ -441,6 +447,7 @@ export async function createBridgeKit(options = {}) {
     prompts: [],
     promptSerial: 0,
     defaultPrompt: null,
+    availableCommands: options.availableCommands ?? null,
     sessionSerial: 0,
     initialAgyModel: options.initialAgyModel ?? "gemini-3.8-flash-low",
     offeredModels: options.offeredModels ?? null,
@@ -449,7 +456,7 @@ export async function createBridgeKit(options = {}) {
     sessionNewDelayMs: options.sessionNewDelayMs ?? 0,
     sessionResume: options.sessionResume ?? false,
     sessionResumeError: options.sessionResumeError ?? null,
-    agentVersion: options.agentVersion ?? "1.5.0",
+    agentVersion: options.agentVersion ?? "1.5.1",
     setModels: [],
     acpLog: [],
     controlHandler: null,
@@ -491,7 +498,7 @@ export async function createBridgeKit(options = {}) {
     if (args[0] === "models" || args.at(-1) === "models") return spawnModels(kit, file, args, opts)
     if (args[0] === "acp") {
       const child = new FakeChild(kit, file, args)
-      kit.acpSpawns.push({ file, args, env: opts.env })
+      kit.acpSpawns.push({ file, args, cwd: opts.cwd, env: opts.env })
       if (args.includes("--login") && options.onLogin) options.onLogin({ child, file, args, opts })
       else new FakeAgy(kit, child, opts)
       return child

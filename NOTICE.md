@@ -33,6 +33,10 @@
 （[PR #43026](https://github.com/pingdotgg/t3code/pull/43026)，@juliusmarminge）的内部 API 移除方向：
 删除 HTTP 额度和本仓既有套餐查询，不提取 access token，不回退到 CLI `/usage`；保留本地 token 计量、ACP 聊天与明确封禁停用。
 维护者转述的 Google 警告不是本仓对任何具体封禁原因的证明，也不构成防封保证。
+当前开发版选择性适配 `pingdotgg/t3code@5e37e6db563e0cb45d5f975241c923440397411c`
+（[PR #43087](https://github.com/pingdotgg/t3code/pull/43087)，@gabrielelpidio）的最低版本 1.5.1、
+版本前缀解析及会话创建前拒绝行为；保留 T3 Tools Inc. 的 MIT 版权与许可。
+按用户要求暂留 `t3-code / 0.1.12` 标识覆盖，不表示完整采纳上游的“使用自身身份”原则或获得授权。
 下文保留上游的历史来源记录；其中包名、版本和仓库描述属于上游记录。
 
 本包（`@magpie-community/opencode-agy-cli-auth`，版本 0.1.0）源自 Antigravity 桥接插件
@@ -174,3 +178,13 @@ A1–A16、U1–U6 逐项并入。两边都有、且 `acb8d84` 写法更新的�
 [`pingdotgg/t3code@072611f65fc3b77f13909ce451e87c3e265d8b05` 的 AntigravityTurnOutcome.ts](https://github.com/pingdotgg/t3code/blob/072611f65fc3b77f13909ce451e87c3e265d8b05/apps/server/src/provider/acp/AntigravityTurnOutcome.ts)
 （MIT，Copyright (c) 2026 T3 Tools Inc.，许可见本文件前述 T3 条目）。
 本仓保留严格时间校验和按账号持久封禁；不复制身份回退、OAuth 后台续期、直接聊天 HTTP 或自动重放。
+
+## 13. 2026-11-27 选择性同步（未发布）
+
+以下代码和测试取自或适配 magpie-community/plugins 的 MIT 实现，保留原 MIT 许可：
+
+- [24d86c5ef39203b952387d1bd9d09df643da6dd7](https://github.com/magpie-community/plugins/commit/24d86c5ef39203b952387d1bd9d09df643da6dd7)：开放空 object schema，@eisen0419。
+- [a911229](https://github.com/magpie-community/plugins/commit/a911229)：Magpie 显式 effort 传递，@yetone。
+- [cef88244874cb819fb03e2e723bad03daeadd87a](https://github.com/magpie-community/plugins/commit/cef88244874cb819fb03e2e723bad03daeadd87a)：斜杠命令词防误触及工具参数恢复，@yetone、@huangzhenhao90。
+
+本仓仅适配自身已有 ACP prompt 路径，不包含上游新增的 search/image/video 执行器。

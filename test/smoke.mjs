@@ -53,9 +53,10 @@ import readline from "node:readline"
 const argv = process.argv.slice(2)
 const log = value => fs.appendFileSync(process.env.FAKE_AGY_LOG, JSON.stringify(value) + "\n")
 const send = value => process.stdout.write(JSON.stringify(value) + "\n")
+const agentVersion = process.env.FAKE_AGY_VERSION ?? "1.5.1"
 
 if (argv.includes("--version")) {
-  process.stdout.write("1.5.0\n")
+  process.stdout.write(agentVersion + "\n")
   process.exit(0)
 }
 if (argv.includes("/usage")) {
@@ -453,6 +454,7 @@ async function handle(message) {
   switch (message.method) {
     case "initialize":
       clientInfo = params.clientInfo
+      log({ type: "initialize", pid: process.pid, cwd: process.cwd(), clientInfo, version: agentVersion })
       return {
         protocolVersion: 1,
         agentCapabilities: {
@@ -461,7 +463,7 @@ async function handle(message) {
           sessionCapabilities: { resume: {}, close: {} },
           ...(process.env.FAKE_AGY_APPEND === "0" ? {} : { _meta: { antigravity: { systemPrompt: { append: true } } } }),
         },
-        agentInfo: { name: "Antigravity ACP Server", version: process.env.FAKE_AGY_IMAGES === "omit" ? "1.4.12" : "1.5.0" },
+        agentInfo: { name: "Antigravity ACP Server", version: agentVersion },
         authMethods: [],
       }
     case "session/new":
@@ -812,6 +814,34 @@ const legacyModel = "agy-cli/gemini-test-low"
   fs.rmSync(signedOut, { force: true })
 }
 
+{
+  // Exercise the real subprocess/stdio boundary as well as the in-memory ACP
+  // fixture. A rejected initialize must leave neither a session nor a process.
+  await plugin.provider.warming?.()
+  const savedVersion = process.env.FAKE_AGY_VERSION
+  try {
+    process.env.FAKE_AGY_VERSION = "agy_acp_server_1.5.0"
+    for (const stream of [true, false]) {
+      const before = logs().length
+      const response = await callFetch({ model, stream, messages: [{ role: "user", content: "unsupported runtime " + stream }] })
+      const result = await response.json()
+      const entries = logs().slice(before)
+      const init = entries.find(event => event.type === "initialize")
+      check(`old runtime returns a setup error (stream=${stream})`, response.status === 400 && result.error?.code === "AGY_VERSION_UNSUPPORTED" && /Update agy/.test(result.error?.message ?? ""))
+      check(`old runtime disables automatic retry (stream=${stream})`, response.headers.get("x-should-retry") === "false" && result.error?.noRetry === true)
+      check(`old runtime only initializes (stream=${stream})`, entries.filter(event => event.type === "initialize").length === 1 && !entries.some(event => event.type === "init" || event.type === "user"))
+      check(`old runtime keeps the pinned identity (stream=${stream})`, init?.clientInfo?.name === "t3-code" && init.clientInfo.version === "0.1.12")
+      check(`old runtime removes its workspace (stream=${stream})`, !!init && !fs.existsSync(init.cwd))
+      let running = false
+      if (init) { try { process.kill(init.pid, 0); running = true } catch {} }
+      check(`old runtime exits its process (stream=${stream})`, !!init && !running)
+    }
+  } finally {
+    if (savedVersion === undefined) delete process.env.FAKE_AGY_VERSION
+    else process.env.FAKE_AGY_VERSION = savedVersion
+  }
+}
+
 async function launchedModel(body) {
   const response = await callFetch(body)
   await readSSE(response)
@@ -825,6 +855,13 @@ async function launchedModel(body) {
   check("high thinking budget selects high", await launchedModel({ model, thinking: { type: "enabled", budget_tokens: 24000 }, messages: [{ role: "user", content: "MODEL high effort" }] }) === "gemini-test-high")
   check("output effort without thinking keeps the default", await launchedModel({ model, output_config: { effort: "low" }, messages: [{ role: "user", content: "MODEL title request" }] }) === "gemini-test-high")
   check("legacy effort ids pass through unchanged", await launchedModel({ model: legacyModel, thinking: { type: "enabled", budget_tokens: 10000 }, messages: [{ role: "user", content: "MODEL legacy id" }] }) === "gemini-test-low")
+  // plugins#1540: magpie says the client's effort in X-Magpie-Effort; its
+  // Anthropic body has only a budget held under max_tokens, or no thinking.
+  const told = async (effort, body) => { await readSSE(await callFetch(body, { "X-Magpie-Effort": effort })); return lastOf("user")?.model }
+  check("magpie's effort header beats a thinking budget held under max_tokens", await told("high", { model, thinking: { type: "enabled", budget_tokens: 3000 }, messages: [{ role: "user", content: "MODEL told high" }] }) === "gemini-test-high")
+  check("magpie's effort header counts with no thinking in the body", await told("low", { model, messages: [{ role: "user", content: "MODEL told low" }] }) === "gemini-test-low")
+  check("a level in an alias's id beats one guessed from a thinking budget", await launchedModel({ model: "agy-cli/gemini-3.5-pro-medium", thinking: { type: "enabled", budget_tokens: 30000 }, messages: [{ role: "user", content: "MODEL alias medium" }] }) === "gemini-test-medium")
+  check("thinking turned off still beats magpie's effort header", await told("low", { model, thinking: { type: "disabled" }, messages: [{ role: "user", content: "MODEL told off" }] }) === "gemini-test-high")
   check("single-effort model requests pass through unchanged", await launchedModel({ model: "agy-cli/claude-test-medium", thinking: { type: "enabled", budget_tokens: 4096 }, messages: [{ role: "user", content: "MODEL singleton" }] }) === "claude-test-medium")
   check("modern sessions select models and levels through ACP config options", logs().some(event => event.type === "setConfig" && event.configId === "model") && logs().some(event => event.type === "setConfig" && event.configId === "thought_level" && event.value === "low"))
   const offered = await plugin.provider.models()
@@ -2271,13 +2308,13 @@ for (const location of ["inline", "system", "developer", "user"]) {
   check("request-path permissive items have a fixed depth of 8",
     bareDepth === 8,
     String(bareDepth))
-  check("request-path expandToolSchema resolves $defs/$ref, lifts root oneOf object unions, preserves boolean additionalProperties, and leaves schema-less ToolSearch empty",
+  check("request-path expandToolSchema resolves $defs/$ref, lifts root oneOf object unions, preserves boolean additionalProperties, and leaves schema-less ToolSearch with no declared properties",
     initRefUnion?.inputSchema?.$defs === undefined &&
     initRefUnion?.inputSchema?.oneOf === undefined &&
     initRefUnion?.inputSchema?.additionalProperties === false &&
     JSON.stringify(initRefUnion?.inputSchema?.properties?.method?.enum) === JSON.stringify(["click", "screenshot"]) &&
     JSON.stringify(initRefUnion?.inputSchema?.properties?.params?.required) === JSON.stringify(["x", "y"]) &&
-    JSON.stringify(initToolSearch?.inputSchema) === JSON.stringify({ type: "object", properties: {} }) &&
+    JSON.stringify(initToolSearch?.inputSchema) === JSON.stringify({ type: "object", properties: {}, additionalProperties: true }) &&
     !/gemini/i.test(JSON.stringify(initRefUnion?.inputSchema || {})),
     JSON.stringify({ refUnion: initRefUnion?.inputSchema, toolSearch: initToolSearch?.inputSchema }))
 

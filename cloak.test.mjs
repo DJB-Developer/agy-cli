@@ -66,3 +66,71 @@ test("DeepSeek Harness's @-path paragraph goes reworded, the rest as written (#1
 test("outgoing applies every declared system-text replacement", () => {
   for (const [from, to] of REWORDED) expect(outgoing(from)).toBe(to)
 })
+
+import { DEFAULT_SLASH_COMMANDS, defuseSlashCommands, restoreSlashCommands } from "./cloak.mjs"
+// agy's own rule (cloak.mjs): the text split at Go's unicode.IsSpace, a
+// word that is "/" and a command name
+const GO_SPACE = /[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/
+const agyRuns = (text, commands = DEFAULT_SLASH_COMMANDS) =>
+  text.split(GO_SPACE).filter((w) => w.startsWith("/") && commands.includes(w.slice(1))).map((w) => w.slice(1))
+const J = "⁠"
+
+test("defuseSlashCommands leaves agy no command to run, and touches nothing agy wouldn't run", () => {
+  expect(DEFAULT_SLASH_COMMANDS).toEqual([
+    "goal", "compact", "schedule", "browser", "plan", "grill-me", "teamwork", "learn", "boost",
+    "agy-customizations", "antigravity-guide", "run-workflow", "swarm",
+  ])
+  // Cindy's (Pi) system prompt line, as plugins#1294 quotes it
+  const cindy = "when the user directly invokes /learn or /skill:learn in Pi"
+  expect(agyRuns(cindy)).toEqual(["learn"])
+  expect(defuseSlashCommands(cindy)).toBe(cindy.replace(" /learn ", ` /${J}learn `))
+  expect(agyRuns(defuseSlashCommands(cindy))).toEqual([])
+
+  const raw = [
+    "/plan",
+    "/grill-me",
+    "Check /learn /plan /grill-me together\t/goal\r\n/swarm\f/boost",
+    "```sh\n/compact\n```",
+    "Path /path/to/learn and URL https://example.com/learn and /learning and /learn-more and /skill:learn",
+    "Punctuation /learn. /learn, `/learn` <tag>/learn</tag> (/plan) x/plan //plan /Learn /PLAN",
+    "No-break\u00a0/learn and /learn\u00a0x, vertical\v/learn and /learn\vx",
+    "Wide\u3000/plan\u3000x, next line\u0085/goal now, BOM\ufeff/learn, joiner\u2060/learn",
+  ].join("\n")
+  const out = defuseSlashCommands(raw)
+  expect(agyRuns(raw)).toEqual([
+    "plan", "grill-me", "learn", "plan", "grill-me", "goal", "swarm", "boost", "compact", "learn", "learn", "learn", "learn", "plan", "goal",
+  ])
+  expect(agyRuns(out)).toEqual([])
+  // each change is a joiner after a "/" agy would have read as a command
+  expect(out.replaceAll(`/${J}`, "/")).toBe(raw)
+  expect(out.split(`/${J}`).length - 1).toBe(15)
+  expect(out).toContain(`Check /${J}learn /${J}plan /${J}grill-me together\t/${J}goal\r\n/${J}swarm\f/${J}boost`)
+  expect(out).toContain(`\`\`\`sh\n/${J}compact\n\`\`\``)
+  expect(out).toContain("Path /path/to/learn and URL https://example.com/learn and /learning and /learn-more and /skill:learn")
+  expect(out).toContain("Punctuation /learn. /learn, `/learn` <tag>/learn</tag> (/plan) x/plan //plan /Learn /PLAN")
+  expect(out).toContain(`No-break\u00a0/${J}learn and /${J}learn\u00a0x, vertical\v/${J}learn and /${J}learn\vx`)
+  expect(out).toContain(`Wide\u3000/${J}plan\u3000x, next line\u0085/${J}goal now, BOM\ufeff/learn, joiner\u2060/learn`)
+  // already defused text stays as it is
+  expect(defuseSlashCommands(out)).toBe(out)
+  // a session's own commands, with regexp characters in a name
+  expect(defuseSlashCommands("run /foo.bar now, not /fooxbar", ["foo.bar"])).toBe(`run /${J}foo.bar now, not /fooxbar`)
+  expect(defuseSlashCommands("run /learn now", [])).toBe("run /learn now")
+  expect(defuseSlashCommands("run /learn now", undefined)).toBe(`run /${J}learn now`)
+})
+
+test("restoreSlashCommands gives a tool call's arguments back as the prompt's own text had them", () => {
+  const file = "Use /plan to start.\n/learn\nSee /path/to/plan"
+  const copied = defuseSlashCommands(file)
+  expect(copied).not.toBe(file)
+  const args = { file_path: "/repo/README.md", old_string: copied, edits: [{ text: `cd /${J}plan` }], n: 2, ok: true, none: null }
+  const back = restoreSlashCommands(args)
+  expect(back).toEqual({ file_path: "/repo/README.md", old_string: file, edits: [{ text: "cd /plan" }], n: 2, ok: true, none: null })
+  expect(args.old_string).toBe(copied)
+  // nothing to restore: the very same object
+  const plain = { command: "ls /plan", list: ["/learn"] }
+  expect(restoreSlashCommands(plain)).toBe(plain)
+  // a joiner anywhere else is the model's own
+  const other = { text: `a${J}b /${J}learning x/${J}plan` }
+  expect(restoreSlashCommands(other)).toBe(other)
+  expect(restoreSlashCommands({ c: `/${J}custom` }, ["custom"])).toEqual({ c: "/custom" })
+})

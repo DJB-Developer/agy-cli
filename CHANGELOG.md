@@ -1,3 +1,28 @@
+## Unreleased - 2026-11-27
+
+### Magpie 上游选择性同步（核对至 0.1.156）
+
+- 同步 `24d86c5`：空/缺失 properties 的开放 object 显式声明 `additionalProperties: true`，避免工具参数被 agy 当作多余字段拒绝；保留显式关闭、字典 schema、patternProperties 和 unevaluatedProperties 约束。
+- 同步 `a911229`：读取 `X-Magpie-Effort`，避免宿主裁剪 thinking budget 后误选低思考档；模型名的档位优先于预算推断，显式 disabled 与环境覆盖语义保持不变。
+- 适配 `cef8824`：发给 ACP 的文本中，完整斜杠命令词不再误触发原生 `/learn`、`/plan` 等；纳入会话通告的自定义命令，工具参数恢复原始文字，路径/URL/大小写变体不改变。不引入上游其他身份提示词改写。
+- 保留已有未提交的 1.5.1 门槛改动、多账号隔离和 TOS 持久停用；没有恢复 usage HTTP/TUI 查询，没有整包替换上游账号层。未修改版本号、提交或发布。
+- 验证：macOS Bun 完整入口 38 pass / 0 fail，独立假 CLI smoke 368 checks，Node 定向回归 35/35；不使用真实账号。同步范围和剩余差异见 `reports/upstream-sync-20261127.md`。
+
+### 选择性对齐 T3 Code agy 兼容性
+
+- 参考已合并的 [PR #43087](https://github.com/pingdotgg/t3code/pull/43087) / `5e37e6db563e0cb45d5f975241c923440397411c`（@gabrielelpidio），把已知最低 agy 版本从 1.4.12 提高到 **1.5.1**；聊天和模型探测都在 ACP `initialize` 后、创建/恢复会话前检查。
+- 版本解析接受 `v`、`agy_acp_server_` 前缀并去除首尾空白，只比较数字三元组；未知/缺失版本仍可尝试，不单独排序预发行后缀。这是版本门槛，不是所有新版均已验证的保证。
+- 聊天版本不兼容返回 HTTP 400 / `AGY_VERSION_UNSUPPORTED`、明确升级说明和 `noRetry` / `x-should-retry: false`；清理进程和工作目录，不误报登录失效、不写入账号封禁，也不自动降级或更换客户端身份。
+- 按用户选择暂时保留 `t3-code / 0.1.12`。未完整采纳该 PR 的“每个客户端使用自身身份”原则；最终上游补丁没有修改 model manifest，本仓也不引入远程 manifest 或额外版本 HTTP 查询。
+- 保持 #43026 / 本仓 0.2.18 的内部额度/套餐 API 移除，不恢复 CLI `/usage`；模型目录仍可展示缓存或兜底，但不绕过聊天版本门槛。
+- 更新中英文要求、排错和来源说明；不更改账号凭据、工具桥接、提示词配置、正常会话复用或 TOS 停用规则。不声称能降低封号风险。
+
+### 验证
+
+- 新增兼容性集成测试先红后绿；最终新增 **38 项**覆盖旧版、版本前缀/空白/尾缀、未知版本、模型探测、流式/非流式错误、升级后恢复与降级后拒绝续接。保留正常会话的工作目录正向检查，并通过容器内跳过目录清理的变异确认清理断言会失败。
+- 禁用外网、临时 HOME 的 Linux Node 24 全套 **442/442**，模拟 CLI 子进程 smoke **364 项检查**，RE2/array-items 独立脚本及 npm 打包清单检查通过。未调用真实 agy 账号，未运行本轮 Bun 全套或原生 Windows/macOS 验证。
+- 本轮未修改包版本，未提交、push、创建 GitHub Release 或发布 npm。
+
 ## 0.2.19 - 2026-11-26
 
 ### ACP 客户端标识
