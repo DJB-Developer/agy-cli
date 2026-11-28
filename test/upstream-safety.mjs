@@ -9,8 +9,8 @@ const notices = [
   { text: `⚠ PERMISSION_DENIED (code 403): ${TOS_MESSAGE}`, status: 403, code: "TOS_VIOLATION", noRetry: true },
   { text: `⚠ ${TOS_MESSAGE}`, status: 403, code: "TOS_VIOLATION", noRetry: true },
   { text: "⚠ Verification Required", status: 403, code: "VALIDATION_REQUIRED", noRetry: true },
-  { text: "⚠ Individual quota reached. Resets in 1h2m3.5s.", status: 429, reset: 3723500 },
-  { text: "⚠ Third-party quota reached. Please switch to Gemini models. Resets in 1h2m3.5s.", status: 429, reset: 3723500 },
+  { text: "⚠ Individual quota reached. Resets in 1h2m3.5s.", status: 429, code: "QUOTA_EXHAUSTED", reset: 3723500 },
+  { text: "⚠ Third-party quota reached. Please switch to Gemini models. Resets in 1h2m3.5s.", status: 429, code: "QUOTA_EXHAUSTED", reset: 3723500 },
   { text: "⚠ Our servers are experiencing high traffic right now, please try again in a minute. (UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-high on the server)", status: 503 },
 ]
 async function withKit(fn) {
@@ -42,8 +42,12 @@ for (const notice of notices) for (const stream of [true, false]) for (const spl
         assert.equal(next.status, 403)
         assert.equal(next.headers.get("x-should-retry"), "false")
         assert.equal(kit.promptSerial, 1, "persistent ban blocks another prompt")
+      } else if (notice.code === "QUOTA_EXHAUSTED") {
+        assert.equal(next.status, 429, "known quota blocks only until its reset")
+        kit.clock.advance(notice.reset)
+        assert.equal((await kit.request(baseBody({ tools: [], stream: false }))).status, 200)
       } else {
-        assert.equal(next.status, 200, "verification, quota and capacity must not persist a TOS ban")
+        assert.equal(next.status, 200, "verification and capacity must not persist a TOS ban")
       }
     })
   })

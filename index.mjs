@@ -7,7 +7,7 @@ import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { createUsageReader } from "./usage.mjs"
+import { createUsageReader, createQuotaCooldown } from "./usage.mjs"
 import { createServiceStatus, isServiceSuspension, SUSPENSION_MESSAGE, TOS_MESSAGE } from "./service-status.mjs"
 import { createMagpieQuarantine } from "./quarantine.mjs"
 import { backgroundBlocked as defaultBackgroundBlocked, cannotSignIn, forgetStoredSignIn as defaultForgetStoredSignIn, isDead, parseRefreshToken, storedSignInNow as defaultStoredSignInNow } from "./signin.mjs"
@@ -18,11 +18,11 @@ import { expandToolSchema } from "./tool-schema.mjs"
 import { fitTools } from "./tool-budget.mjs"
 import { DEFAULT_SLASH_COMMANDS, defuseSlashCommands, restoreSlashCommands, hint, outgoing, turnsAway } from "./cloak.mjs"
 import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
-import { watchPromptOutcome, recoveryTime } from "./turn-outcome.mjs"
+import { watchPromptOutcome, recoveryTime, parseErrorStep } from "./turn-outcome.mjs"
 import { createRequestTrace, waitWithSignal, throwIfAborted } from "./request-lifecycle.mjs"
 
 import { DEFAULT_ACCOUNT, accountEnv, accountArgs, accountSignIn, accountName, resolveAccount,
-  accountResult, reserveAccount, writeAccountToken, publishAccount, discardAccount } from "./accounts.mjs"
+  accountsRoot, accountResult, reserveAccount, writeAccountToken, publishAccount, discardAccount } from "./accounts.mjs"
 
 const runtimeCleanups = new Set()
 export const IMAGE_FOLLOWS = "[The image this tool returned is attached to the next message.]"
@@ -41,6 +41,8 @@ const minimalAgent = () => readMinimalAgentOption
 // sessions, model catalogs and control sockets. No request can see another
 // profile's live session, even when its history or tool IDs are identical.
 function createAccountRuntime(account = DEFAULT_ACCOUNT) {
+const quotaCooldown = createQuotaCooldown()
+const quotaRequests = new WeakMap()
 const quarantine = createMagpieQuarantine({ user: account.name,
   enabled: () => readAutoDisableOption !== null && readAutoDisableOption() !== false })
 const serviceStatus = createServiceStatus(path.join(path.dirname(sessionStateFile()), "service-status.json"), {
@@ -58,7 +60,7 @@ const backgroundBlocked = async opts => {
   const signIn = accountSignIn(account)
   return cannotSignIn(signIn) || (isDead(signIn) ? "agy's sign-in no longer works" : "")
 }
-const forgetStoredSignIn = opts => { if (!account.dir) defaultForgetStoredSignIn(opts) }
+const forgetStoredSignIn = opts => { quotaCooldown.clear(); if (!account.dir) defaultForgetStoredSignIn(opts) }
 
 const PROVIDER_ID = "agy-cli"
 // Align the model-access version gate with pingdotgg/t3code#43087.
@@ -639,6 +641,39 @@ function saveCatalog(agyPath, change) {
   } catch {}
 }
 
+// Adapt upstream's cross-account alias guard to our per-profile cache files.
+// Read catalogs only: never probe another account or open its credentials.
+function anotherAccountLists(agyPath, model) {
+  const base = model.replace(/-\d{8}$/, "").replace(/-(?:minimal|low|medium|high|xhigh|max)$/i, "")
+  const files = []
+  const root = accountsRoot()
+  try {
+    for (const entry of fs.readdirSync(root, { withFileTypes: true }).slice(0, 256)) {
+      if (!entry.isDirectory()) continue
+      const dir = path.join(root, entry.name)
+      if (dir === account.dir) continue
+      try {
+        if (fs.readFileSync(path.join(dir, ".ready"), "utf8") !== "1\n") continue
+        files.push(path.join(dir, "bridge-state", "models.json"))
+      } catch {}
+    }
+  } catch {}
+  if (account.dir) files.push(process.env.AGY_BRIDGE_STATE_FILE
+    ? path.join(path.dirname(process.env.AGY_BRIDGE_STATE_FILE), "models.json")
+    : path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "magpie-agy-bridge", "models.json"))
+  for (const file of files) {
+    try {
+      const data = JSON.parse(fs.readFileSync(file, "utf8"))
+      const entry = data?.version === 1 ? data.byAgy?.[agyPath] : null
+      if (!Number.isFinite(entry?.at) || entry.at > Date.now() || Date.now() - entry.at > SAVED_CATALOG_MAX_AGE_MS) continue
+      const rows = entry.offered?.length ? entry.offered : entry.list
+      if (Array.isArray(rows) && rows.some(row => validModelRow(row) &&
+        row.id.replace(/-(?:minimal|low|medium|high|xhigh|max)$/i, "") === base)) return true
+    } catch {}
+  }
+  return false
+}
+
 function startingModelCatalog(agyPath) {
   const saved = readSavedCatalog(agyPath)
   if (!saved) return fallbackModelCatalog(agyPath)
@@ -937,6 +972,20 @@ function streamErrorOf(error) {
     out.resets_at = Math.ceil(Date.parse(error.resetAt) / 1000)
   }
   return out
+}
+
+function quotaError(entry) {
+  return withRecovery(Object.assign(new AgentTurnError("agy bridge: quota exhausted for this model (observed from an earlier request)", "rate_limit_error"),
+    { statusCode: 429, code: "QUOTA_EXHAUSTED" }), entry.resetAt)
+}
+
+function quotaResponse(entry, body) {
+  const error = quotaError(entry)
+  return jsonError(429, error.message, error.code, {
+    extra: { reset_at: entry.resetAt, resets_at: Math.ceil(Date.parse(entry.resetAt) / 1000) },
+    headers: { "Retry-After": String(Math.max(1, Math.ceil((Date.parse(entry.resetAt) - Date.now()) / 1000))) },
+    noRetry: extractToolResults(body).length > 0,
+  })
 }
 
 function withRecovery(error, resetAt) {
@@ -1239,6 +1288,7 @@ class Turn {
     this.clientProgressAt = this.lastProgressAt
     this.deadlineAt = null
     this.baseHistory = trailingMessages({ messages }).history.map((message) => ({ ...message }))
+    this.hasSubmittedToolResults = extractToolResults({ messages }).length > 0
     this.events = []
     this.waiters = []
     this.calls = []
@@ -1400,6 +1450,7 @@ class Turn {
 
   push(event) {
     if (this.finalized) return
+    if ((event.type === "text" || event.type === "thinking") && event.text) this.hasVisibleOutput = true
     const waiter = this.waiters.shift()
     if (waiter) waiter.resolve(event)
     else this.events.push(event)
@@ -2200,6 +2251,8 @@ class Proc {
   }
 
   async #runTurn(turn, content, model, selection) {
+    const quotaTicket = quotaRequests.get(selection)?.ticket ?? quotaCooldown.generation()
+    const quotaRevision = quotaRequests.get(selection)?.revision ?? quotaCooldown.revision()
     try {
       turn.arm()
       if (model) await this.measure("model_selection", () => this.#setModel(model, selection))
@@ -2221,6 +2274,8 @@ class Proc {
           turn.complete({ stopReason: "cancelled" })
           return
         }
+        const cooling = quotaCooldown.get(model, quotaTicket)
+        if (cooling) throw quotaError(cooling)
         turn.arm()
         unpark(this.convKey)
         this.hasSentFirstTurn = true
@@ -2235,6 +2290,7 @@ class Proc {
         turn.promptInFlight = true
         this.trace?.mark("prompt_dispatch_ms")
         let result
+        const retryWatch = this.#watchRetries(turn)
         try {
           if (serviceStatus.get()) throw this.#formatAgentError(TOS_MESSAGE)
           result = await this.conn.request("session/prompt", {
@@ -2252,6 +2308,7 @@ class Proc {
           throw error
         } finally {
           turn.promptInFlight = false
+          clearInterval(retryWatch)
         }
         usage = turn.recordPromptUsage(promptNumber, result?.usage)
         if (turn.cancelRequested) {
@@ -2270,6 +2327,7 @@ class Proc {
         if (knownError?.code === "TOS_VIOLATION") throw knownError
         const failure = result?.stopReason !== "cancelled" && checkOutcome(Date.now())
         if (knownError && failure?.code === "AGY_TURN_FAILED") throw knownError
+        if (knownError?.code === "QUOTA_EXHAUSTED" && failure?.status === 429 && failure.code !== "QUOTA_EXHAUSTED") throw knownError
         // The database can carry only PERMISSION_DENIED while the native
         // notice explains verification. Preserve that actionable no-retry
         // refusal, but never override explicit TOS evidence from the store.
@@ -2281,6 +2339,7 @@ class Proc {
         // deliver its real result in a follow-up prompt of the same response.
         const late = turn.calls.filter((call) => call.deferred && !call.lateDelivered)
         if (!late.length) {
+          if (result?.stopReason !== "cancelled" && result?.stopReason !== "refusal") quotaCooldown.succeeded(model, quotaRevision, quotaTicket)
           turn.complete({ ...(result ?? {}), usage })
           return
         }
@@ -2295,6 +2354,23 @@ class Proc {
       if (turn.cancelRequested && !this.dead) {
         turn.complete({ stopReason: "cancelled" })
         return
+      }
+      // Only explicit provider errors qualify; ordinary output/429/503 never
+      // become a cached quota lock. Prefer TOS/verification evidence above.
+      if (error.acpError && !error.code) {
+        const native = error.acpError
+        const notice = /^(?:⚠\s*)?(?:Individual|Third-party) quota reached\.[^\r\n]*$/.test(native.message || "")
+        const parsed = parseErrorStep(new TextEncoder().encode(JSON.stringify({ error: native })))
+        if ((notice && (native.code == null || native.code < 0 || native.code === 429) && parsed?.status !== 403) ||
+          parsed?.status === 429 && parsed.code === "QUOTA_EXHAUSTED") {
+          error = withRecovery(Object.assign(new AgentTurnError("agy bridge: explicit quota exhaustion", "rate_limit_error"),
+            { statusCode: 429, code: "QUOTA_EXHAUSTED" }), parsed?.resetAt || recoveryTime(native.message || ""))
+        }
+      }
+      if (error.code === "QUOTA_EXHAUSTED" && error.statusCode === 429) {
+        quotaCooldown.observe(model, [selection?.model], error, quotaTicket)
+        // A new account must not replay already-visible text or tool effects.
+        if (turn.hasVisibleOutput || turn.calls.length || turn.hasSubmittedToolResults) error.noRetry = true
       }
       if (error instanceof AgentTurnError && error.keepProcess && !this.dead && !turn.calls.length) {
         // agy kept the session; a retry of the same request continues in it.
@@ -2323,7 +2399,7 @@ class Proc {
     }
     if (QUOTA_CORES.includes(core)) {
       return withRecovery(Object.assign(new AgentTurnError(
-        `agy bridge: Antigravity quota reached: ${turn.terminalNotice}`, "rate_limit_error"), { statusCode: 429 }),
+        `agy bridge: Antigravity quota reached: ${turn.terminalNotice}`, "rate_limit_error"), { statusCode: 429, code: "QUOTA_EXHAUSTED" }),
         recoveryTime(turn.terminalNotice, Date.now()))
     }
     if (core === BUSY_CORE) {
@@ -2411,9 +2487,31 @@ class Proc {
   // A try Antigravity answered with the bare 429 ends the turn now, with the
   // same error as agy's own 429 ending, instead of after agy's retries: the
   // process goes, as on a timeout, since agy is still retrying in it.
+  #watchRetries(turn) {
+    let reading = false
+    let cursor = { offset: turn.logOffset, identity: null }
+    const timer = setInterval(async () => {
+      if (reading || turn.done || turn.cancelRequested || this.turn !== turn) return
+      reading = true
+      try {
+        const read = await retryLogLines(this.logPath, cursor)
+        cursor = read.cursor
+        if (turn.done || turn.cancelRequested || this.turn !== turn || !turn.promptInFlight) return
+        const detail = retryErrorDetails(read.text)
+        // A positive suspension signal always wins over an ambiguous 429.
+        const refusal = detail.find(isServiceSuspension) || detail.find(refused429)
+        if (refusal) this.refuseTurn(turn, refusal)
+      } finally { reading = false }
+    }, positiveTimeout(process.env.AGY_BRIDGE_CAPACITY_POLL_MS, 500))
+    timer.unref?.()
+    return timer
+  }
+
   refuseTurn(turn, detail) {
-    if (this.turn !== turn || turn.done) return
-    turn.fail(this.#formatAgentError(detail))
+    if (this.turn !== turn || turn.done || turn.cancelRequested) return
+    const error = this.#formatAgentError(detail)
+    if (turn.hasVisibleOutput || turn.calls.length || turn.hasSubmittedToolResults) error.noRetry = true
+    turn.fail(error)
     dropFromPool(this)
     this.stop().catch(() => {})
   }
@@ -2800,6 +2898,37 @@ async function fileSize(file) {
   try { return (await fs.promises.stat(file)).size } catch { return 0 }
 }
 
+// Only complete new lines from this prompt; never replay an old file after
+// rotation/truncation. A changed file is skipped conservatively.
+async function retryLogLines(file, cursor) {
+  try {
+    const handle = await fs.promises.open(file, "r")
+    try {
+      const stat = await handle.stat()
+      const identity = `${stat.dev}:${stat.ino}`
+      if (cursor.identity && cursor.identity !== identity || stat.size < cursor.offset) {
+        return { text: "", cursor: { offset: stat.size, identity } }
+      }
+      const start = Math.max(cursor.offset, stat.size - LOG_TAIL_BYTES)
+      const buffer = Buffer.alloc(stat.size - start)
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, start)
+      const data = buffer.subarray(0, bytesRead)
+      const last = data.lastIndexOf(10)
+      if (last < 0) return { text: "", cursor: { ...cursor, identity } }
+      // If bounded reading clipped a line, don't interpret its suffix.
+      const first = start > cursor.offset ? data.indexOf(10) + 1 : 0
+      return { text: data.subarray(first, last + 1).toString("utf8"), cursor: { offset: start + last + 1, identity } }
+    } finally { await handle.close() }
+  } catch { return { text: "", cursor } }
+}
+
+function retryErrorDetails(text) {
+  return text.split("\n").flatMap(line => {
+    const match = /\] (?:Run|CallWithRetry): attempt \d+ failed \((.+)\), retrying in /.exec(line)
+    return match ? [match[1]] : []
+  })
+}
+
 // agy writes the real upstream error only to its log; read what this turn added.
 async function lastAgentError(file, offset) {
   let text = ""
@@ -2977,6 +3106,11 @@ function park(proc) {
 
 function takeParked(convKey, opts) {
   loadParked()
+  // An older host may park this conversation after our initial index load.
+  for (const entry of readStateFile().filter(validEntry)) {
+    if (entry.key !== convKey || unparked.has(convKey)) continue
+    if (!parked.has(convKey) || parked.get(convKey).at < entry.at) parked.set(convKey, entry)
+  }
   const entry = parked.get(convKey)
   if (!entry) return null
   parked.delete(convKey)
@@ -6137,7 +6271,7 @@ function instrumentFetch(handler) {
 const createPlugin = async () => {
   // Keep the host's status hook so saved TOS suspensions remain visible.
   // Unknown limits are not exhausted limits and must not trigger sign-out.
-  const readUsage = createUsageReader({ serviceStatus })
+  const readUsage = createUsageReader({ serviceStatus, cooldown: quotaCooldown })
   return {
     auth: {
       provider: PROVIDER_ID,
@@ -6220,7 +6354,10 @@ const createPlugin = async () => {
             // nothing stored to sign agy in with: agy would only start its
             // own Google sign-in, so the account is told to sign in again
             // (from the last read; a request doesn't wait for a new one)
-            const notSignedIn = cannotSignIn(storedSignInNow())
+            const stored = storedSignInNow()
+            const quotaTicket = quotaCooldown.sync(account.dir || stored?.fp || stored?.state || "unknown")
+            const quotaRevision = quotaCooldown.revision()
+            const notSignedIn = cannotSignIn(stored)
             if (notSignedIn) {
               return jsonError(401, `${notSignedIn}: sign in again in magpie, or run \`agy\` in a terminal`, undefined,
                 { headers: { "X-Magpie-Sign-In": "expired" } })
@@ -6245,10 +6382,24 @@ const createPlugin = async () => {
             // derives a key, instructions or history from the body.
             const layout = requestLayout(body)
             body = { ...canonicalBody(body), model: requestedModel }
+            // Before catalog discovery or acquiring a process. Retry errors
+            // retain the original absolute reset; repeated reads never extend it.
+            const knownCooldown = quotaCooldown.get(requestedModel)
+            const carryingToolResults = extractToolResults(body).length > 0
+            if (knownCooldown && !carryingToolResults) return quotaResponse(knownCooldown, body)
             const saidEffort = requestHeader(fetchInput, init, "x-magpie-effort")
-            const model = resolveAgyModel(await trace.measure("catalog", () => waitWithSignal(loadModelCatalog(agy), init.signal)), requestedModel, body, saidEffort)
+            const listed = await trace.measure("catalog", () => waitWithSignal(loadModelCatalog(agy), init.signal))
+            const model = resolveAgyModel(listed, requestedModel, body, saidEffort)
+            const alias = resolveCatalogAlias(listed.routing ?? listed, requestedModel).id
+            // Existing tool results belong to their original session, not a new route.
+            if (!carryingToolResults && alias !== requestedModel && !requestedModel.startsWith(alias + "-") && anotherAccountLists(agy, requestedModel)) {
+              return jsonError(400, `agy bridge: model ${requestedModel} is unavailable to this agy account; another signed-in agy account lists it`)
+            }
             throwIfAborted(init.signal)
+            const resolvedCooldown = quotaCooldown.get(model)
+            if (resolvedCooldown && !carryingToolResults) return quotaResponse(resolvedCooldown, body)
             const selection = { model: requestedModel, effort: requestedEffort(body, saidEffort) }
+            quotaRequests.set(selection, { ticket: quotaTicket, revision: quotaRevision })
             const callerWorkDir = namedWorkDirectory(body, init)
             const convKey = conversationKey(body, callerWorkDir || "")
             trace.context({ conv: digest(convKey).slice(0, 12), explicit_session: !!(body.metadata?.session_id || body[TRANSPORT_SCOPE]?.[0]), identity_source: body[TRANSPORT_SCOPE]?.[0] ? "magpie_header" : body.metadata?.session_id ? "metadata" : "legacy", nonstream: body.stream === false })

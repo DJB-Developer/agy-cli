@@ -24,6 +24,12 @@ for (const stream of [true, false]) {
       const reply = stream ? await readSse(response) : await response.json()
       assert.equal(reply.error?.type, "rate_limit_error")
       assert.equal(reply.error.status, 429)
+      assert.equal(reply.error.code, "QUOTA_EXHAUSTED")
+      const observed = await kit.plugin.auth.usage()
+      assert.equal(observed.windows[0].used, 100)
+      assert.equal(observed.error, undefined)
+      assert.equal((await kit.request(baseBody({ stream: false }))).status, 429)
+      assert.equal(kit.promptSerial, 1)
       assert.equal(reply.error.reset_at, new Date(kit.clock.now() + 3723500).toISOString())
       assert.match(reply.error.message, /resets at .* UTC\+0\./)
       if (!stream) {

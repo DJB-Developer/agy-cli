@@ -17,11 +17,13 @@ function run(args, timeout) {
 for (const [name, mocks] of [
   ["p0-lifecycle.mjs", false],
   ["upstream-safety.mjs", false],
+  ["upstream-sync.mjs", false],
   ["request-lifecycle.mjs", false],
   ["platform.mjs", true],
   ["compat.mjs", true],
   ["prefill.mjs", false],
   ["usage.mjs", false],
+  ["quota-cooldown.mjs", false],
   ["usage-no-network.mjs", false],
   ["signin.mjs", false],
   ["service-status.mjs", false],

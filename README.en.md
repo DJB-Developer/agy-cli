@@ -156,6 +156,22 @@ principle that each client identifies as itself. It does not copy T3's managed
 installer/remote compatibility manifest or add network version probes, and
 does not guarantee protection against account suspension.
 
+## Error-driven quota cooldown (development)
+
+No remaining-quota queries, `/usage`, TUI fallback or background probes. Only explicit
+`Individual quota reached`, `Third-party quota reached` or `QUOTA_EXHAUSTED` failures
+from real requests create observations. Generic 429s, capacity 503s, verification and
+TOS failures are kept separate.
+
+- A provider reset time cools only the failed model and its effort variants in the selected account, not an inferred account-wide pool.
+- `auth.usage` exposes model-scoped windows. `used: 100` means observed exhaustion, not a polled percentage. Valid observations have no usage-read error attached.
+- New requests during cooldown return 429 / `QUOTA_EXHAUSTED`, a fixed `reset_at` and `Retry-After`. Already-running tool results can still be delivered. Magpie owns routing; the plugin never rotates accounts or replays requests.
+- Without a reset time, show an unknown-reset observation, not an indefinite routing lock. A later successful normal request clears it.
+- Expiry means unknown, not full allowance. State is per-runtime memory only and returns to unknown after reload. No timers or probes are created. Changed legacy sign-in fingerprints invalidate observations and reject late old-identity results.
+- Quota failures after text/thinking output or involving tool results carry `noRetry`. Persistent TOS suspension remains independent.
+
+Unreleased; package version remains 0.2.19. Reload plugin source containing this change to use it.
+
 ## Install
 
 Install this repository's version, including multiple accounts, refresh-token import and Linux / Docker support:
