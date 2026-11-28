@@ -60,7 +60,7 @@ MCP server. The control port listens on loopback only, with a token per process.
 - The [official ACP docs](https://antigravity.google/docs/ide/extensions/acp/#flags)
   document `--ide-mcp-port` and the requirement for `nc` on PATH. The private
   `nc` is this plugin's bridge implementation, not an endorsement by Google.
-- The development version requires a known agy version of **1.5.1 or later**,
+- Version 0.2.20 and later require a known agy version of **1.5.1 or later**,
   matching T3 Code #43087's version gate. Chat and model probes check after
   `initialize`; older runtimes cannot create/resume a session or receive a prompt.
 - The private `nc` applies only to the agy processes the plugin starts, but for
@@ -156,7 +156,7 @@ principle that each client identifies as itself. It does not copy T3's managed
 installer/remote compatibility manifest or add network version probes, and
 does not guarantee protection against account suspension.
 
-## Error-driven quota cooldown (development)
+## Error-driven quota cooldown (since 0.2.20)
 
 No remaining-quota queries, `/usage`, TUI fallback or background probes. Only explicit
 `Individual quota reached`, `Third-party quota reached` or `QUOTA_EXHAUSTED` failures
@@ -170,7 +170,7 @@ TOS failures are kept separate.
 - Expiry means unknown, not full allowance. State is per-runtime memory only and returns to unknown after reload. No timers or probes are created. Changed legacy sign-in fingerprints invalidate observations and reject late old-identity results.
 - Quota failures after text/thinking output or involving tool results carry `noRetry`. Persistent TOS suspension remains independent.
 
-Unreleased; package version remains 0.2.19. Reload plugin source containing this change to use it.
+Update to 0.2.20 and reload the plugin to enable this behavior.
 
 ## Install
 
@@ -180,10 +180,9 @@ Install this repository's version, including multiple accounts, refresh-token im
 magpie plugin add github:DJB-Developer/agy-cli
 ```
 
-If already installed, update this GitHub plugin to **0.2.19** and reload it.
-The 1.5.1 floor described above is an unreleased development change, not part of 0.2.19.
+If already installed, update this GitHub plugin to **0.2.20** and reload it.
 Accounts, credentials and suspension records remain intact; no reimport is needed.
-Refresh each account's quota so the host receives empty windows. If old values or quota cooldowns
+Refresh each account's quota status so the host receives locally observed windows (empty until exhaustion is observed). If old values or quota cooldowns
 remain visible, refresh provider state and inspect the host cache; do not treat old values as current limits.
 Internal HTTP quota/plan queries are removed, with no fallback to CLI `/usage`.
 See [CHANGELOG.md](CHANGELOG.md) for historical release notes.
